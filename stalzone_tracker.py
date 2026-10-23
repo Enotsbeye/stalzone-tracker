@@ -61,6 +61,16 @@ CONFIG = {
     ],
     # True — вдобавок к списку проверять ВСЕ артефакты из базы игры (~100 шт.).
     "all_artifacts": False,
+    # Какие категории проверять целиком: artefact, armor, weapon, parts, tools.
+    "auto_categories": [],
+
+    # Особо редкие находки — отдельный звук и сообщение. Редкие: артефакты с качеством
+    # от rare_quality (0 обычный … 4 исключительный, 5 легендарный), снаряжение ранга «Легенда»
+    # и предметы из rare_items. Для них свой порог прибыли.
+    "rare_enabled": True,
+    "rare_quality": 4,
+    "rare_items": [],
+    "rare_min_profit": 5000,
 
     # Когда сообщать о лоте:
     "discount": 0.15,       # дешевле рынка минимум на 15%
@@ -155,6 +165,53 @@ def load_artifacts(region):
     return sorted(arts, key=lambda a: a[1].lower())
 
 
+# Категории предметов. Запчасти и инструменты в базе игры лежат вместе с прочими материалами,
+# их отличаем по названию («Дешевые запчасти», «Продвинутые инструменты» …).
+CATEGORY_NAMES = {
+    "artefact": "Артефакты", "armor": "Броня", "weapon": "Оружие", "parts": "Запчасти", "tools": "Инструменты",
+    "attachment": "Обвесы", "misc": "Материалы", "supply": "Расходники", "bullet": "Патроны",
+    "containers": "Контейнеры", "backpacks": "Рюкзаки", "grenade": "Гранаты", "other": "Прочее",
+}
+AUTO_CATEGORIES = ("artefact", "armor", "weapon", "parts", "tools")   # можно отслеживать целиком
+CATEGORY_IN_LINE = {"artefact": "все артефакты", "armor": "вся броня", "weapon": "всё оружие",
+                    "parts": "все запчасти", "tools": "все инструменты"}
+RANK_NAMES = {"RANK_NEWBIE": "Новичок", "RANK_STALKER": "Сталкер", "RANK_VETERAN": "Ветеран",
+              "RANK_MASTER": "Мастер", "RANK_LEGEND": "Легенда"}
+NOT_TRADED = ("PERSONAL_ON_GET", "PERSONAL_DROP_ON_GET")   # личные сразу — на аукцион не попадают
+
+
+def item_category(it, ru=None):
+    cat = str(it.get("data", "")).split("/")[2] if str(it.get("data", "")).count("/") >= 3 else "other"
+    name = (ru or "").lower()
+    if cat in ("other", "misc") and "запчаст" in name:
+        return "parts"
+    if cat in ("other", "misc") and "инструмент" in name:
+        return "tools"
+    return {"medicine": "supply", "device": "other", "weapon_modules": "attachment"}.get(cat, cat)
+
+
+def load_catalog(region):
+    """Все предметы: [{id, name, cat, rank, trade}] — для поиска по категориям и «категорий целиком»."""
+    out = []
+    for it in _listing(region):
+        item_id, ru = _id_and_name(it)
+        if not ru:
+            continue
+        cat = item_category(it, ru)
+        out.append({"id": item_id, "name": ru, "cat": cat if cat in CATEGORY_NAMES else "other",
+                    "rank": str(it.get("color") or "DEFAULT"),
+                    "trade": (it.get("status") or {}).get("state") not in NOT_TRADED})
+    return out
+
+
+def auto_categories(cfg):
+    """Какие категории проверять целиком (старая галочка «все артефакты» тоже считается)."""
+    cats = [c for c in (cfg.get("auto_categories") or []) if c in AUTO_CATEGORIES]
+    if cfg.get("all_artifacts") and "artefact" not in cats:
+        cats.insert(0, "artefact")
+    return cats
+
+
 def db_line(stats):
     """«База сделок: 12 345 сделок по 40 предметам за 3,2 дн., 4,1 МБ»."""
     if not stats.get("sales"):
@@ -164,30 +221,34 @@ def db_line(stats):
             f"{str(stats['mb']).replace('.', ',')} МБ")
 
 
-def watching_line(items, auto):
-    """«Слежу за: …» — без сотни названий, если включены все артефакты."""
+def watching_line(items, auto, cats=("artefact",)):
+    """«Слежу за: …» — без сотен названий, если включены категории целиком."""
     own = [name for item_id, name in items if item_id not in auto]
     text = "Слежу за: " + (", ".join(own) if own else "—")
     if auto:
-        text += f" + все артефакты ({len(auto)} шт.)"
+        what = ", ".join(CATEGORY_IN_LINE.get(c, c) for c in cats) or "все артефакты"
+        text += f" + {what} ({len(auto)} шт.)"
     return text
 
 
 def watch_items(cfg, names):
-    """Что проверять: список из настроек + (если включено) все артефакты.
-    Возвращает (предметы [(id, название)], id артефактов, добавленных автоматически)."""
+    """Что проверять: список из настроек + (если включено) категории целиком.
+    Возвращает (предметы [(id, название)], id предметов, добавленных автоматически)."""
     items, have = [], set()
     for item_id, name in resolve_watch(cfg["watch"], names):
         if item_id not in have:
             have.add(item_id)
             items.append((item_id, name))
     auto = set()
-    if cfg.get("all_artifacts"):
-        for item_id, name in load_artifacts(cfg["region"]):
-            if item_id not in have:
-                have.add(item_id)
-                auto.add(item_id)
-                items.append((item_id, name))
+    cats = auto_categories(cfg)
+    if cats:
+        catalog = sorted(load_catalog(cfg["region"]), key=lambda e: (cats.index(e["cat"]) if e["cat"] in cats else 99,
+                                                                    e["name"].lower()))
+        for entry in catalog:
+            if entry["cat"] in cats and entry["trade"] and entry["id"] not in have:
+                have.add(entry["id"])
+                auto.add(entry["id"])
+                items.append((entry["id"], entry["name"]))
     return items, auto
 
 
@@ -661,7 +722,8 @@ def history_window(sales, hours, now=None):
 GRADES = "_grades"      # в рынке артефакта: сделки по точным качеству и заточке
 FALLBACK = "_fallback"  # рынок за LONG_DAYS — если за обычное окно сделок мало
 WINDOW = "_window_h"    # за сколько часов посчитан рынок
-SPECIAL_KEYS = (GRADES, FALLBACK, WINDOW)
+PAIRS = "_pairs"        # сами сделки обычного предмета (цена_за_шт, штук) — для шанса продажи
+SPECIAL_KEYS = (GRADES, FALLBACK, WINDOW, PAIRS)
 
 
 def market_prices(sales, min_sales, hours=48, total=True, window=None):
@@ -689,6 +751,8 @@ def market_prices(sales, min_sales, hours=48, total=True, window=None):
             result[b] = (weighted_median(pairs), len(pairs), per_day)
     if result:
         result[WINDOW] = window
+        if None in result:
+            result[PAIRS] = groups[None]
         if grades:
             result[GRADES] = {"pairs": grades, "window": window, "min_sales": min_sales}
     return result
@@ -765,6 +829,96 @@ def comparable_floor(lot, lots, total=True):
         unit = raw / amount if total else raw
         best = unit if best is None else min(best, unit)
     return best
+
+
+def _pairs_for_one(market, additional):
+    grade = grade_of(additional)
+    if grade is None:
+        return (market.get(PAIRS), market.get(WINDOW)) if None in market and market.get(PAIRS) else None
+    info = market.get(GRADES)
+    if not info:
+        return None
+    q, p = grade
+    pairs = [x for (gq, gp), lst in info["pairs"].items() if gq == q and p - 4 <= gp <= p for x in lst]
+    return (pairs, info["window"]) if len(pairs) >= info["min_sales"] else None
+
+
+def deal_pairs(market, additional):
+    """Сделки, по которым оценён лот: ([(цена_за_шт, штук)], окно_в_часах) — тот же отбор, что в market_for."""
+    found = _pairs_for_one(market, additional)
+    if found is None and market.get(FALLBACK):
+        found = _pairs_for_one(market[FALLBACK], additional)
+    return found
+
+
+def competitors(lot, lots, price, total=True, spread=0.05):
+    """Сколько других таких же или лучших лотов висит почти по той же цене (до +5%) — делят покупателей."""
+    grade = grade_of(lot.get("additional"))
+    n = 0
+    for other in lots:
+        if other is lot:
+            continue
+        amount, raw = int(_num(other.get("amount"))), _num(other.get("buyoutPrice"))
+        if amount <= 0 or raw <= 0:
+            continue
+        og = grade_of(other.get("additional"))
+        if grade is None:
+            if og is not None:
+                continue
+        elif og is None or og[0] < grade[0] or og[1] < grade[1]:
+            continue
+        if (raw / amount if total else raw) <= price * (1 + spread):
+            n += 1
+    return n
+
+
+CHANCE_HOURS = 24   # шанс продать за сутки
+
+
+def poisson_at_least(lam, k):
+    """Вероятность, что за время придёт хотя бы k покупателей, если в среднем их lam."""
+    if lam <= 0:
+        return 0.0
+    term = math.exp(-lam)
+    below = term
+    for i in range(1, k):
+        term *= lam / i
+        below += term
+    return max(0.0, 1.0 - below)
+
+
+def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, hours=CHANCE_HOURS):
+    """Примерный шанс продать лот за hours часов по цене price за штуку. Своя формула, не знание:
+    покупатели приходят случайно (пуассоновский поток) с частотой прошлых сделок этой корзины,
+      × доля сделок, где платили не меньше price (дороже рынка — меньше покупателей),
+      ÷ (1 + 0,25 × конкурентов почти по той же цене),
+      × поправка на тренд (рынок падает на 10% — ×0,8),
+      × поправка на «давно висит» (лот час и больше никто не купил даже со скидкой — спрос слабый).
+    Чтобы продать amount штук, нужно ~amount / (обычный размер сделки) покупателей.
+    Возвращает {chance 0…1, hours — ожидаемое время продажи, …} или None."""
+    if not pairs or price <= 0 or amount <= 0:
+        return None
+    window_h = max(float(window_h or 0), 1.0)
+    per_day = len(pairs) / window_h * 24                      # сделок в сутки
+    share = sum(1 for unit, _ in pairs if unit >= price * 0.995) / len(pairs)
+    share = max(share, 0.05)                                  # хоть кто-то купит и дороже рынка
+    size = max(1.0, statistics.median(a for _, a in pairs))   # обычный размер одной сделки
+    need = min(50, max(1, math.ceil(amount / size - 1e-9)))   # сколько покупателей нужно
+    comp_f = 1 / (1 + 0.25 * min(int(comp or 0), 12))
+    trend_f = 1.0 if trend is None else min(1.2, max(0.5, 1 + float(trend) / 50))
+    stale_f = 1.0
+    if age is not None and age > STALE_MINUTES:
+        stale_f = 0.55 if age > 3 * STALE_MINUTES else 0.75
+    rate = per_day * share * comp_f * trend_f * stale_f       # покупателей в сутки — именно для этого лота
+    lam = rate * hours / 24
+    chance = min(0.97, max(0.01, poisson_at_least(lam, need)))
+    return {"chance": chance, "hours": need / rate * 24 if rate > 0 else None, "per_day": per_day,
+            "share": share, "size": size, "need": need, "comp": int(comp or 0),
+            "trend_f": trend_f, "stale_f": stale_f}
+
+
+def chance_label(c):
+    return "высокий" if c >= 0.7 else "средний" if c >= 0.4 else "низкий"
 
 
 def resale_price(lot, lots, m, total=True):
@@ -1044,6 +1198,13 @@ class MarketDB:
                         "additional": {"qlt": qlt, "ptn": ptn} if qlt >= 0 else {}})
         return out
 
+    def find_sale(self, region, item_id, amount, price, since_ts):
+        """Была ли сделка ровно на такой лот (штук и цена за весь лот) после since_ts — значит, его купили."""
+        row = self.con.execute(
+            "SELECT 1 FROM sales WHERE region = ? AND item_id = ? AND amount = ? AND ABS(price - ?) < 0.5 "
+            "AND ts >= ? LIMIT 1", (region, item_id, int(amount), float(price), float(since_ts))).fetchone()
+        return row is not None
+
     def window_hours(self, region, item_id, hours):
         """Сколько часов из последних hours покрыто непрерывной историей."""
         now = time.time()
@@ -1095,7 +1256,8 @@ class Scanner:
         self.mismatched = set()  # о каких предметах уже предупредили: цены лотов и сделок не сходятся
         self.skipped = set()     # предметы, которых API не знает (ответ 400/404)
         self.priced, self.unpriced = set(), set()  # для сводки по автодобавленным
-        self.extra_logged = False
+        self.quiet_label = "Все артефакты"
+        self.fields_logged = set()   # какие наборы полей лотов уже описали в журнале
 
     def summary(self):
         """Строка-сводка по автодобавленным артефактам (или None, если их нет)."""
@@ -1103,7 +1265,7 @@ class Scanner:
             return None
         checked = len(self.priced) + len(self.unpriced)
         period = f"{LONG_DAYS} дн. в твоей базе" if self.db is not None else f"{self.cfg['history_hours']} ч"
-        text = (f"Все артефакты: рыночная цена есть у {len(self.priced)} из {checked} — остальные "
+        text = (f"{self.quiet_label}: рыночная цена есть у {len(self.priced)} из {checked} — остальные "
                 f"почти не продавались (за {period}), их лоты пропускаю")
         unknown = len(self.skipped & self.quiet)
         if unknown:
@@ -1213,13 +1375,13 @@ class Scanner:
             raw = self.api.lots_all(cfg["region"], item_id)
         lots = {lot_key(item_id, lot): lot for lot in raw}  # все лоты: по ним видна реальная цена продажи
         lot_list = list(lots.values())
-        if not self.extra_logged:  # какие поля API присылает у артефактов — пригодится для точности
-            keys = sorted({k for lot in lot_list if bucket_of(lot.get("additional")) is not None
-                           for k in lot["additional"]})
-            if keys:
-                self.extra_logged = True
-                log.info("Артефакты: в данных лотов есть поля %s — сейчас учитываю качество (qlt) "
-                         "и заточку (ptn)", ", ".join(map(str, keys)))
+        if len(self.fields_logged) < 6:  # какие поля API присылает у лотов — пригодится для точности
+            keys = tuple(sorted({str(k) for lot in lot_list if isinstance(lot.get("additional"), dict)
+                                 for k in lot["additional"]}))
+            if keys and keys not in self.fields_logged:
+                self.fields_logged.add(keys)
+                log.info("%s: в данных лотов есть поля %s — сейчас учитываю качество (qlt) "
+                         "и заточку (ptn)", name, ", ".join(keys))
         total_lots = self.fmt.total("lots", lot_list, "buyoutPrice", name)
         if item_id not in self.described and not quiet:
             self.described.add(item_id)
@@ -1230,13 +1392,21 @@ class Scanner:
                 self.mismatched.add(item_id)
                 log.warning("%s", mismatch_warning(name, factor))
             return lots, [], []
-        deals = find_deals(lots.values(), market, cfg, total_lots)
+        # find_min_profit — порог пониже для особо редких (обычные находки приложение отсеет само)
+        find_cfg = dict(cfg, min_profit=cfg["find_min_profit"]) if cfg.get("find_min_profit") is not None else cfg
+        deals = find_deals(lots.values(), market, find_cfg, total_lots)
         bids = find_bid_deals(lots.values(), market, cfg, total=total_lots) if cfg.get("bids") else []
         if self.db is not None and (deals or bids):  # тренд: как цена изменилась за сутки
             history = self.db.sales(cfg["region"], item_id, time.time() - LONG_DAYS * 86400)
             for d in deals + bids:
                 d["trend"] = price_trend(history, d["lot"].get("additional"),
                                          self.total_hist.get(item_id, True), cfg["min_sales"])
+        for d in deals + bids:   # шанс продать по цене перепродажи
+            found = deal_pairs(market, d["lot"].get("additional"))
+            if found:
+                comp = competitors(d["lot"], lot_list, d["market"], total_lots)
+                d["chance"] = sale_chance(d["market"], d["amount"], found[0], found[1], comp, d.get("trend"),
+                                          d.get("age") if "unit" in d else None)
         return lots, deals, bids
 
 
@@ -1742,6 +1912,32 @@ def selftest():
     finally:
         db.close()
         shutil.rmtree(tmp, ignore_errors=True)
+    # --- шанс продажи: больше сделок — выше; конкуренты, падение рынка, «давно висит», большой лот — ниже ---
+    pairs = [(100.0, 1)] * 40                       # 40 сделок за 48 ч по 100
+    base = sale_chance(100, 1, pairs, 48)
+    assert 0.9 < base["chance"] <= 0.97 and base["need"] == 1 and base["hours"] < 3
+    rare = sale_chance(100, 1, pairs[:5], 168)       # 5 сделок за неделю
+    assert rare["chance"] < 0.6 < base["chance"]
+    assert sale_chance(100, 1, pairs[:5], 168, comp=4)["chance"] < rare["chance"]
+    assert sale_chance(100, 1, pairs[:5], 168, trend=-20)["chance"] < rare["chance"]
+    assert sale_chance(100, 1, pairs[:5], 168, age=200)["chance"] < sale_chance(100, 1, pairs[:5], 168, age=90)["chance"]
+    assert sale_chance(130, 1, [(100.0, 1)] * 20 + [(140.0, 1)] * 5, 48)["share"] == 5 / 25
+    big = sale_chance(100, 50, [(100.0, 5)] * 10, 48)   # 50 шт, а покупают по 5 и 5 раз в сутки
+    assert big["need"] == 10 and big["chance"] < 0.2
+    assert sale_chance(100, 1, [], 48) is None and chance_label(0.75) == "высокий"
+    assert abs(poisson_at_least(2.0, 1) - (1 - math.exp(-2))) < 1e-12
+    lot_a = {"amount": 1, "buyoutPrice": 100}
+    near = [lot_a, {"amount": 1, "buyoutPrice": 103}, {"amount": 1, "buyoutPrice": 120},
+            {"amount": 1, "buyoutPrice": 101, "additional": {"qlt": 3}}]
+    assert competitors(lot_a, near, 100) == 1         # 120 — дорого, артефакт другой корзины — не конкурент
+    m = market_prices([{"amount": 1, "price": 100, "time": iso(now - timedelta(hours=i))} for i in range(6)], 5)
+    assert deal_pairs(m, None)[0] == [(100.0, 1)] * 6 and PAIRS not in range_keys(m)
+    # --- категории ---
+    assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"
+    assert item_category({"data": "/items/other/x.json"}, "Стандартные инструменты") == "tools"
+    assert item_category({"data": "/items/armor/x.json"}, "Броня") == "armor"
+    assert auto_categories({"all_artifacts": True, "auto_categories": ["armor", "x"]}) == ["artefact", "armor"]
+    assert "вся броня" in watching_line([("a", "A"), ("b", "B")], {"b"}, ["armor"])
     print("Самопроверка пройдена: поиск, формат цен, вход в API, «все артефакты» и база сделок работают.")
 
 

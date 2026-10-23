@@ -1,8 +1,10 @@
 name: Сборка выпуска
 
-# Запускается, когда на GitHub публикуют выпуск (Releases → Draft a new release → тег вида v1.7 → Publish).
-# Собирает STALZONE-Tracker.exe на Windows и прикладывает к выпуску вместе с исходниками.
-# Программа у всех сама найдёт новый выпуск и предложит обновиться.
+# Запускается, когда в этом (закрытом) репозитории публикуют выпуск: Releases → Draft a new release →
+# тег вида v1.8 → Publish. Собирает STALZONE-Tracker.exe на Windows, прикладывает к этому выпуску
+# и выкладывает такой же выпуск — только .exe, без кода — в открытый Enotsbeye/stalzone-tracker-releases.
+# Оттуда программа у всех сама находит обновления. Нужен секрет RELEASES_TOKEN — токен с правом
+# Contents: Read and write на открытый репозиторий.
 on:
   release:
     types: [published]
@@ -44,7 +46,7 @@ jobs:
           python-version: "3.12"
 
       - name: Модули
-        run: python -m pip install --upgrade pip requests pywebview pyinstaller
+        run: python -m pip install --upgrade pip requests pywebview cryptography pyinstaller
 
       - name: Самопроверка
         run: python stalzone_tracker.py --selftest
@@ -56,7 +58,7 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path stalzone_app.py, stalzone_tracker.py, stalzone.ico, build_exe.bat, README.txt -DestinationPath stalzone_source.zip
 
-      - name: Файлы к выпуску
+      - name: Файлы к выпуску (здесь, вместе с исходниками)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
@@ -64,3 +66,24 @@ jobs:
           files: |
             dist/STALZONE-Tracker.exe
             stalzone_source.zip
+
+      - name: Токен для открытого репозитория на месте
+        shell: bash
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          if [ -z "$RELEASES_TOKEN" ]; then
+            echo "::error::Нет секрета RELEASES_TOKEN — без него .exe не выложить в stalzone-tracker-releases"
+            exit 1
+          fi
+
+      - name: Выпуск в открытом репозитории (только .exe)
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: Enotsbeye/stalzone-tracker-releases
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: ${{ env.TAG }}
+          name: STALZONE Трекер ${{ env.TAG }}
+          body_path: release_notes.md
+          make_latest: "true"
+          files: dist/STALZONE-Tracker.exe

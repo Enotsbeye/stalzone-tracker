@@ -25,7 +25,7 @@ if not defined PYEXE goto fail
 echo Использую Python: %PYEXE%
 echo.
 echo [1/3] Проверяю модули...
-"%PYEXE%" -m pip install --disable-pip-version-check -q requests pywebview pyinstaller
+"%PYEXE%" -m pip install --disable-pip-version-check -q requests pywebview cryptography pyinstaller
 if errorlevel 1 goto fail
 echo [2/3] Проверяю логику трекера...
 "%PYEXE%" stalzone_tracker.py --selftest >"%TEMP%\stalzone-selftest.txt" 2>&1
