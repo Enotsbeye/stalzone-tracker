@@ -21,5 +21,6 @@
 
 `pip install requests pywebview`, затем `python stalzone_app.py`.
 Самопроверка: `python stalzone_tracker.py --selftest`.
-Выпуск: поднять `APP_VERSION` в `stalzone_app.py`, обновить `release_notes.md`, запушить тег `vX.Y` —
-GitHub Actions соберёт .exe и выложит выпуск.
+Выпуск: поднять `APP_VERSION` в `stalzone_app.py`, обновить `release_notes.md`, запушить в `main`,
+затем на GitHub: Releases → Draft a new release → тег `vX.Y` → Publish release.
+GitHub Actions сам соберёт `STALZONE-Tracker.exe`, приложит его к выпуску и возьмёт текст из `release_notes.md`.
