@@ -50,7 +50,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -282,7 +282,17 @@ def parse_version(text):
     return tuple(int(n) for n in re.findall(r"\d+", str(text or ""))[:4])
 
 
+def clean_env():
+    """Окружение для запуска новой копии программы. Собранная PyInstaller программа хранит в переменных
+    _PYI_* путь к своей временной папке; новая версия по тому же пути, унаследовав их, ищет свои файлы
+    в папке старой (а её уже удалили) и падает: «Failed to load Python DLL». Поэтому чистим."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("_PYI_", "_MEIPASS"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def _spawn_detached(cmd, **kw):
+    kw.setdefault("env", clean_env())
     """Запустить процесс, который переживёт закрытие этой программы."""
     if os.name != "nt":
         return subprocess.Popen(cmd, close_fds=True, start_new_session=True, **kw)
@@ -414,6 +424,13 @@ class Updater:
         script = "\r\n".join([
             "@echo off",
             "chcp 65001 >nul",
+            # новая версия должна запуститься как отдельная программа, а не как часть старой
+            'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
+            'set "_PYI_APPLICATION_HOME_DIR="',
+            'set "_PYI_ARCHIVE_FILE="',
+            'set "_PYI_PARENT_PROCESS_LEVEL="',
+            'set "_PYI_SPLASH_IPC="',
+            'set "_MEIPASS2="',
             f'set "OLD={sys.executable}"',
             f'set "NEW={new_exe}"',
             "for /l %%i in (1,1,90) do (",
