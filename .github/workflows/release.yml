@@ -67,17 +67,21 @@ jobs:
             dist/STALZONE-Tracker.exe
             stalzone_source.zip
 
-      - name: Токен для открытого репозитория на месте
+      - name: Есть ли токен для открытого репозитория
+        id: tok
         shell: bash
         env:
           RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
         run: |
           if [ -z "$RELEASES_TOKEN" ]; then
-            echo "::error::Нет секрета RELEASES_TOKEN — без него .exe не выложить в stalzone-tracker-releases"
-            exit 1
+            echo "::warning::Нет секрета RELEASES_TOKEN — .exe выложен только здесь, в stalzone-tracker-releases не попал"
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Выпуск в открытом репозитории (только .exe)
+        if: steps.tok.outputs.has == 'true'
         uses: softprops/action-gh-release@v2
         with:
           repository: Enotsbeye/stalzone-tracker-releases
