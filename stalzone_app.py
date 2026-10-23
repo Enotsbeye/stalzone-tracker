@@ -797,7 +797,6 @@ class Worker(threading.Thread):
             while not self.stop_event.is_set():
                 started = time.time()
                 fresh_ages, found = [], [0]
-                self.lot_lists = {}
 
                 def on_progress(i, item_id, name):
                     self.emit("progress", {"text": f"Проверяю {name}", "done": i, "total": len(items)})
@@ -1048,6 +1047,9 @@ class State:
                 "target": d["market"], "expected": d["market"] * d["amount"] * (1 - self.cfg["fee"]) - paid,
                 "bought_at": time.time(), "status": "holding", "sold_price": None, "sold_at": None})
             d["bought"] = pid
+            w = self.worker
+            if w and w.is_alive():      # трекер уже работает — пусть сразу следит и за этой покупкой
+                w.holdings.append(dict(self.purchases[0]))
         self.add_log(f"Отметил покупку: {d['name']} за {eng.fmt_rub(paid)}")
         self.save_purchases()
         self.save_deals()
@@ -1189,7 +1191,8 @@ class State:
                 return
             self.status.update(running=True, starting=True, error=None)
             tracked = [{"lot_key": d["lot_key"], "item_id": d["item_id"], "amount": d["amount"],
-                        "price": d["cost"], "since": self._ts(d.get("listed"), 0), "ends": self._ts(d.get("ends"), None)}
+                        "price": self._lot_price(d), "since": self._ts(d.get("listed"), 0),
+                        "ends": self._ts(d.get("ends"), None)}
                        for d in self.deals if d.get("kind") == "buyout" and d.get("lot_key") and not d.get("fate")]
             holdings = [dict(p) for p in self.purchases if p.get("status") != "sold"]
             self.worker = Worker(dict(self.cfg), self.emit, self.api_factory,
@@ -1197,6 +1200,14 @@ class State:
                                  tracked=tracked, holdings=holdings)
             self.worker.start()
         self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else ""))
+
+    @staticmethod
+    def _lot_price(d):
+        """Цена выкупа лота как её отдаёт API (она же в ключе лота) — с ней сверяем историю сделок."""
+        try:
+            return float(str(d["lot_key"]).rsplit("|", 1)[1])
+        except (KeyError, IndexError, ValueError):
+            return float(d.get("cost") or 0)
 
     @staticmethod
     def _ts(iso, default):
