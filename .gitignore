@@ -1,0 +1,12 @@
+__pycache__/
+build/
+dist/
+*.spec
+# личные данные — их никогда не кладём в репозиторий
+settings.json
+seen_lots.json
+deals.json
+journal.log
+market.db*
+api_token.json
+listing_*.json
