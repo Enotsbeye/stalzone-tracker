@@ -29,6 +29,7 @@ import statistics
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -364,6 +365,10 @@ class Api:
         self._next_slot = 0.0               # когда можно отправить следующий запрос
         self._resets = []           # моменты сброса лимита из ответов API — по ним узнаём его окно
         self.paced = False
+        self.base_gap = None        # темп, когда ключ API использует только эта программа
+        self._mine = deque()        # когда эта программа отправляла запросы — чтобы видеть чужие
+        self.sharing = False        # ключ сейчас использует ещё кто-то (друг с кодом доступа)
+        self._votes = 0             # сколько ответов подряд говорят «делить» (+) или «не делить» (−)
         self.bearer = None          # токен от EXBO — только в памяти
         self.oauth_tried = False
         remove_old_token_file()
@@ -446,6 +451,9 @@ class Api:
             now = time.time()
             slot = max(now, self._next_slot)
             self._next_slot = slot + self.min_gap
+            self._mine.append(slot)
+            while self._mine and self._mine[0] < now - 120:
+                self._mine.popleft()
         if slot > now:
             time.sleep(slot - now)
 
@@ -495,6 +503,7 @@ class Api:
                 raise ApiError(r.status_code, f"API ответил {r.status_code}" + (f" ({why})" if why else "")
                                + f" на запрос {path}")
             self._adapt_pace(r)
+            self._share_pace(r)
             try:
                 return r.json()
             except ValueError:
@@ -520,11 +529,53 @@ class Api:
             self._resets = self._resets[-4:] + [reset]
             if len(self._resets) >= 2 and 55 <= self._resets[-1] - self._resets[-2] <= 65 and limit >= 100:
                 self.min_gap = max(0.15, 60 / (limit * RATE_SHARE))
+                self.base_gap = self.min_gap
                 self.paced = True
             else:
                 return
         log.info("Лимит API: %s запросов в минуту — проверяю быстрее (запрос раз в %.2f с)",
                  limit, self.min_gap)
+
+    def _share_pace(self, r, now=None):
+        """Один ключ API — несколько программ (ты и друзья с кодом доступа). Лимит у ключа общий.
+        По остатку лимита в ответе видно, сколько запросов за эту минуту сделали все вместе; минус свои —
+        чужие. Пока кто-то ещё работает, берём не больше половины того, что осталось от 85% лимита,
+        — так несколько программ сами делят лимит поровну. Чужих запросов нет — снова весь темп."""
+        if not self.paced:
+            return
+        try:
+            limit = int(float(r.headers.get("x-ratelimit-limit")))
+            remaining = int(float(r.headers.get("x-ratelimit-remaining")))
+            reset = float(r.headers.get("x-ratelimit-reset"))
+        except (TypeError, ValueError):
+            return
+        if reset > 1e12:
+            reset /= 1000
+        now = now or time.time()
+        start = reset - 60                   # окно лимита — минута
+        if not start - 5 <= now <= reset + 5:
+            return
+        with self._lock:
+            mine = sum(1 for t in self._mine if t >= start)
+            elapsed = max(10.0, now - start)
+            others = max(0, (limit - remaining) - mine) / elapsed * 60      # чужих запросов в минуту
+            budget = limit * RATE_SHARE
+            was = self.sharing
+            # решаем не по одному ответу: 3 подряд — чтобы случайный сдвиг счётчика не замедлял зря
+            busy = others > limit * 0.1
+            self._votes = (max(self._votes, 0) + 1) if busy else (min(self._votes, 0) - 1)
+            if self._votes >= 3:
+                self.sharing = True
+            elif self._votes <= -3:
+                self.sharing = False
+            target = max(limit * 0.1, min(budget - others, budget / 2)) if self.sharing else budget
+            self.min_gap = max(self.base_gap or 0.15, 60 / target)
+        if self.sharing != was:
+            if self.sharing:
+                log.info("Ключ API сейчас использует ещё кто-то (~%.0f запр./мин) — делю лимит, "
+                         "проверки станут медленнее", others)
+            else:
+                log.info("Ключ API снова только у этой программы — проверяю в полную скорость")
 
     def _respect_ratelimit(self, r):
         """Если лимит почти исчерпан — все потоки ждут до его сброса."""
@@ -2148,6 +2199,26 @@ def selftest():
     finally:
         db_l.close()
         shutil.rmtree(tmp_l, ignore_errors=True)
+    # --- один ключ на несколько программ: делим лимит по остатку из ответов API ---
+    class _R:
+        def __init__(self, remaining, reset):
+            self.headers = {"x-ratelimit-limit": "400", "x-ratelimit-remaining": str(remaining),
+                            "x-ratelimit-reset": str(int(reset * 1000))}
+    sh = Api.__new__(Api)
+    sh._lock, sh._mine, sh.sharing, sh.paced, sh._votes = threading.Lock(), deque(), False, True, 0
+    sh.base_gap = sh.min_gap = 60 / (400 * RATE_SHARE)
+    t1 = time.time()
+    sh._mine.extend(t1 - 30 + i * 0.3 for i in range(100))              # мы: 100 запросов за 30 с
+    sh._share_pace(_R(400 - 100, t1 + 30), now=t1)                      # всего 100 — чужих нет
+    assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
+    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)                      # всего 250: чужих 150 за 30 с
+    assert not sh.sharing                                               # один ответ — ещё не повод
+    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)
+    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)
+    assert sh.sharing and sh.min_gap >= 60 / (400 * RATE_SHARE / 2) - 1e-9
+    for _ in range(3):
+        sh._share_pace(_R(400 - 102, t1 + 31), now=t1 + 1)              # друг закрыл программу
+    assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
     # --- категории ---
     assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"
     assert item_category({"data": "/items/other/x.json"}, "Стандартные инструменты") == "tools"

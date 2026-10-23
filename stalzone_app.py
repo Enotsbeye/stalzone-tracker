@@ -487,16 +487,21 @@ REVOKED_URL = "https://raw.githubusercontent.com/Enotsbeye/stalzone-tracker-rele
 OWNER_KEY_FILE = os.path.join(DATA_DIR, "owner_key.pem")      # личный ключ — только у владельца
 ISSUED_FILE = os.path.join(DATA_DIR, "issued_codes.json")     # кому владелец выдавал коды
 ACCESS_FILE = os.path.join(DATA_DIR, "access_state.json")     # отозванные и «самая поздняя дата»
+DEVICE_KEY_FILE = os.path.join(DATA_DIR, "device_key.pem")     # ключ этого компьютера — для ключа API владельца
 CODE_PREFIX = "SZ1-"
+REQUEST_PREFIX = "SZR1-"   # код запроса: ID компьютера + его открытый ключ
 REVOKED_REFRESH = 3 * 3600
 
 try:
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.exceptions import InvalidSignature, InvalidTag
+    from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 except ImportError:   # без модуля cryptography коды не проверить
-    Ed25519PrivateKey = Ed25519PublicKey = serialization = None
-    InvalidSignature = Exception
+    Ed25519PrivateKey = Ed25519PublicKey = serialization = X25519PrivateKey = None
+    InvalidSignature = InvalidTag = Exception
 
 
 def _b64e(raw):
@@ -532,6 +537,31 @@ def machine_id():
     return code[:5] + "-" + code[5:]
 
 
+def _raw_pub(key):
+    return key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def _share_key(shared, eph_pub, dev_pub):
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=b"stalzone-share-v1" + eph_pub + dev_pub).derive(shared)
+
+
+def seal_for(dev_pub, plaintext, aad):
+    """Зашифровать для одного компьютера (его открытый ключ X25519): расшифрует только он."""
+    eph = X25519PrivateKey.generate()
+    eph_pub = _raw_pub(eph)
+    key = _share_key(eph.exchange(X25519PublicKey.from_public_bytes(dev_pub)), eph_pub, dev_pub)
+    nonce = secrets.token_bytes(12)
+    return _b64e(eph_pub + nonce + AESGCM(key).encrypt(nonce, plaintext, aad))
+
+
+def unseal(dev_key, blob, aad):
+    raw = _b64d(blob)
+    eph_pub, nonce, ct = raw[:32], raw[32:44], raw[44:]
+    key = _share_key(dev_key.exchange(X25519PublicKey.from_public_bytes(eph_pub)), eph_pub, _raw_pub(dev_key))
+    return AESGCM(key).decrypt(nonce, ct, aad)
+
+
 def norm_machine(text):
     s = re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
     return s[:5] + "-" + s[5:] if len(s) == 10 else ""
@@ -557,6 +587,67 @@ class Access:
         self.revoked = set(saved.get("revoked", []))
         self.max_day = int(saved.get("max_day", 0))
         self.revoked_at = 0.0
+        self._device = None
+        self._shared = (None, None)   # (код, расшифрованный ключ API владельца) — только в памяти
+
+    # --- ключ этого компьютера и код запроса ---
+    def device_key(self):
+        """Ключ X25519 этого компьютера: им расшифровывается ключ API владельца из кода доступа."""
+        if self._device is None and X25519PrivateKey is not None:
+            try:
+                with open(DEVICE_KEY_FILE, "rb") as f:
+                    self._device = serialization.load_pem_private_key(f.read(), password=None)
+            except (OSError, ValueError, TypeError):
+                key = X25519PrivateKey.generate()
+                try:
+                    with open(DEVICE_KEY_FILE + ".tmp", "wb") as f:
+                        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                  serialization.NoEncryption()))
+                    os.replace(DEVICE_KEY_FILE + ".tmp", DEVICE_KEY_FILE)
+                    self._device = key
+                except OSError:
+                    return None
+        return self._device
+
+    def request_code(self):
+        """Что друг отправляет владельцу: ID компьютера + открытый ключ компьютера."""
+        key = self.device_key()
+        raw = self.machine.replace("-", "").encode("ascii") + (_raw_pub(key) if key else b"")
+        return REQUEST_PREFIX + _b64e(raw)
+
+    @staticmethod
+    def parse_request(text):
+        """(ID компьютера, открытый ключ или None) из кода запроса или просто из ID."""
+        t = re.sub(r"\s+", "", str(text or ""))
+        if t.upper().startswith(REQUEST_PREFIX):
+            try:
+                raw = _b64d(t[len(REQUEST_PREFIX):])
+                machine = norm_machine(raw[:10].decode("ascii"))
+                return machine, (raw[10:42] if len(raw) >= 42 else None)
+            except (ValueError, UnicodeDecodeError):
+                return "", None
+        return norm_machine(t), None
+
+    def shared_api(self):
+        """Ключ API владельца из кода доступа (если владелец его вложил) — расшифрован ключом этого
+        компьютера. Только в памяти: в настройки и журнал не попадает. None — ключа в коде нет."""
+        code = re.sub(r"\s+", "", str(self.state.cfg.get("access_code") or ""))
+        if not code or not OWNER_PUBLIC_KEY or self.is_owner():
+            return None
+        if self._shared[0] == code:
+            return self._shared[1]
+        creds = None
+        payload, err = self.parse(code)
+        if not err and payload.get("k") and self.device_key() is not None:
+            try:
+                data = json.loads(unseal(self.device_key(), payload["k"], str(payload["i"]).encode()).decode("utf-8"))
+                if isinstance(data, dict) and ((data.get("id") and data.get("secret")) or data.get("token")):
+                    creds = {"client_id": str(data.get("id") or ""), "client_secret": str(data.get("secret") or ""),
+                             "app_token": str(data.get("token") or "")}
+            except (InvalidTag, ValueError, TypeError, UnicodeDecodeError):
+                creds = None
+        self._shared = (code, creds)
+        return creds
 
     # --- ключ владельца ---
     @staticmethod
@@ -644,15 +735,22 @@ class Access:
             self._save_state()
 
     # --- коды ---
-    def issue(self, name, machine, days):
+    def issue(self, name, request, days, share=False, creds=None):
         if not self.is_owner() or not OWNER_PUBLIC_KEY:
             return False, "Выдавать коды может только владелец программы", None
         name = re.sub(r"\s+", " ", str(name or "")).strip()[:40]
-        machine = norm_machine(machine)
+        machine, dev_pub = self.parse_request(request)
         if not name:
             return False, "Впиши имя — по нему потом можно отозвать доступ", None
         if not machine:
-            return False, "ID компьютера — 10 букв и цифр, например ABCDE-23456. Его показывает программа у друга", None
+            return False, "Вставь код запроса из программы друга (начинается с SZR1-) или ID его компьютера", None
+        creds = {k: v for k, v in (creds or {}).items() if v}
+        if share:
+            if not dev_pub:
+                return False, ("Чтобы вложить твой ключ API, нужен код запроса целиком (SZR1-…) — "
+                               "друг копирует его в программе кнопкой «Копировать»"), None
+            if not ((creds.get("id") and creds.get("secret")) or creds.get("token")):
+                return False, "Сначала впиши свои Client ID и Client Secret в «Настройках»", None
         try:
             days = int(float(days or 0))
         except (TypeError, ValueError):
@@ -660,17 +758,20 @@ class Access:
         days = max(0, min(days, 3650))
         today = self.today()
         payload = {"n": name, "m": machine, "e": today + days if days else 0, "i": secrets.token_hex(3), "t": today}
+        if share:   # ключ API владельца — зашифрован для компьютера друга, в коде его не прочитать
+            payload["k"] = seal_for(dev_pub, json.dumps(creds).encode("utf-8"), payload["i"].encode())
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         code = CODE_PREFIX + _b64e(data) + "." + _b64e(self.owner_key.sign(data))
         issued = self.issued()
         issued.insert(0, {"name": name, "machine": machine, "id": payload["i"], "expires": payload["e"],
-                          "issued": today, "code": code})
+                          "issued": today, "code": code, "shared": bool(share)})
         try:
             write_json(ISSUED_FILE, issued[:300])
         except OSError:
             pass
         self.state.add_log(f"Выдан код доступа: {name} ({machine}), "
-                           + (f"до {day_text(payload['e'])}" if days else "бессрочно") + f", № {payload['i']}")
+                           + (f"до {day_text(payload['e'])}" if days else "бессрочно") + f", № {payload['i']}"
+                           + (", с твоим ключом API" if share else ""))
         return True, "Код создан — отправь его другу", code
 
     @staticmethod
@@ -737,6 +838,8 @@ class Access:
         info["has_owner_key"] = bool(self.owner_key)
         info["owner_public"] = self.owner_public()
         info["embedded"] = bool(OWNER_PUBLIC_KEY)
+        info["request"] = self.request_code() if X25519PrivateKey is not None else info["machine"]
+        info["shared_api"] = bool(info["ok"] and info.get("mode") == "code" and self.shared_api())
         if info["owner"] and OWNER_PUBLIC_KEY:
             info["issued"] = [dict({k: v for k, v in d.items() if k != "code"},
                                    expires_text=day_text(d["expires"]) if d.get("expires") else "бессрочно")
@@ -866,7 +969,11 @@ class Worker(threading.Thread):
                 pause = max(5, cfg["poll_minutes"] * 60 - (time.time() - started))
                 self.stop_event.wait(pause)
         except eng.AuthError as e:
-            self.emit("error", str(e))
+            if cfg.get("shared_api"):
+                self.emit("error", "Ключ API владельца не подошёл — возможно, он сменил ключ. "
+                                   "Попроси у владельца новый код доступа (или впиши свои ключи в «Настройках»).")
+            else:
+                self.emit("error", str(e))
         except Exception as e:
             self.emit("error", f"Не удалось запустить: {e}")
         finally:
@@ -1203,6 +1310,18 @@ class State:
                 self.stop()
             self.exit_requested.wait(600)
 
+    def api_cfg(self):
+        """Настройки для проверки: свои ключи API, а если их нет — ключ владельца из кода доступа
+        (только в памяти, в settings.json не пишется)."""
+        cfg = dict(self.cfg)
+        own = (cfg.get("client_id") and cfg.get("client_secret")) or cfg.get("app_token")
+        if not own and cfg.get("base_url", "").rstrip("/") != DEMO_URL:
+            shared = self.access.shared_api()
+            if shared:
+                cfg.update({k: v for k, v in shared.items() if v})
+                cfg["shared_api"] = True
+        return cfg
+
     def start(self):
         if not self.access.check()["ok"]:
             return
@@ -1215,11 +1334,12 @@ class State:
                         "ends": self._ts(d.get("ends"), None)}
                        for d in self.deals if d.get("kind") == "buyout" and d.get("lot_key") and not d.get("fate")]
             holdings = [dict(p) for p in self.purchases if p.get("status") != "sold"]
-            self.worker = Worker(dict(self.cfg), self.emit, self.api_factory,
+            self.worker = Worker(self.api_cfg(), self.emit, self.api_factory,
                                  shown={d["key"] for d in self.deals if d.get("key")},
                                  tracked=tracked, holdings=holdings)
             self.worker.start()
-        self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else ""))
+        self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else "")
+                     + (" — по ключу API владельца из кода доступа" if self.worker.cfg.get("shared_api") else ""))
 
     @staticmethod
     def _lot_price(d):
@@ -1258,13 +1378,16 @@ class State:
             cfg = dict(self.cfg)
             demo = cfg.get("base_url", "").rstrip("/") == DEMO_URL
             has_keys = bool(cfg.get("client_id") and cfg.get("client_secret"))
+        shared = bool(not demo and not has_keys and not cfg.get("app_token") and self.access.shared_api())
+        with self.lock:
             return {
                 "status": dict(self.status),
                 "deals": list(self.deals),
                 "log": list(self.log)[-200:],
                 "settings": cfg,
                 # для демо ключи встроены, поэтому демо-режим тоже считается «настроенным»
-                "configured": bool(demo or has_keys or cfg.get("app_token")),
+                "configured": bool(demo or has_keys or cfg.get("app_token") or shared),
+                "shared_api": shared,
                 "has_keys": has_keys,
                 "demo": demo,
                 "artifacts": self.artifacts,
@@ -1444,7 +1567,10 @@ def make_handler(state, token):
                 ok, msg = state.access.create_owner_key()
                 return self.send_json({"ok": ok, "message": msg})
             if path == "/api/access/issue":
-                ok, msg, code = state.access.issue(data.get("name"), data.get("machine"), data.get("days"))
+                own = {"id": state.cfg.get("client_id"), "secret": state.cfg.get("client_secret"),
+                       "token": state.cfg.get("app_token")}
+                ok, msg, code = state.access.issue(data.get("name"), data.get("machine"), data.get("days"),
+                                                   share=bool(data.get("share")), creds=own)
                 return self.send_json({"ok": ok, "message": msg, "code": code})
             if path == "/api/access/refresh":
                 threading.Thread(target=state.access.refresh_revoked, kwargs={"force": True}, daemon=True).start()
@@ -1958,6 +2084,7 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
         <div class="card">
           <h3>Доступ к API</h3>
           <div class="sub">Ключи выдаёт @stalzone_api_bot после одобрения заявки.</div>
+          <div class="note ok" id="sharedNote" hidden>Работает ключ API владельца из кода доступа — свои ключи не нужны. Впишешь свои — будут использоваться они.</div>
           <div class="row" id="demoRow"><label>Демо-режим<small>Тестовые данные EXBO, ключи не нужны</small></label><label class="switch"><input type="checkbox" id="sDemo"><i></i></label></div>
           <div class="row wide"><label>Client ID</label><input class="field" id="sClientId" autocomplete="off"></div>
           <div class="row wide"><label>Client Secret</label><input class="field" id="sClientSecret" type="password" autocomplete="off"></div>
@@ -2020,7 +2147,8 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
         <div class="card">
           <h3>Этот компьютер</h3>
           <div class="sub">По ID компьютера владелец выдаёт код доступа. Код работает только на этом ПК.</div>
-          <div class="idrow"><b class="num" id="accMachine">—</b><button class="btn" id="accCopyId">Копировать ID</button></div>
+          <div class="idrow"><b class="num" id="accMachine">—</b><button class="btn" id="accCopyId">Копировать код запроса</button></div>
+          <div class="muted" style="font-size:12px;margin:-4px 0 8px">Код запроса = ID компьютера + его ключ. С ним владелец может вложить в код доступа свой ключ API — тогда свои ключи не нужны.</div>
           <div class="note" id="accStatus"></div>
           <div id="accCodeBox">
             <div class="row wide"><label>Новый код доступа<small>если владелец прислал новый или продлил старый</small></label><textarea class="field code" id="accCode" placeholder="SZ1-…"></textarea></div>
@@ -2041,9 +2169,10 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
         <div class="col">
         <div class="card" id="ownerIssue" hidden>
           <h3>Выдать доступ</h3>
-          <div class="sub">Друг запускает программу, видит ID своего компьютера и присылает тебе.</div>
+          <div class="sub">Друг запускает программу, жмёт «Копировать код запроса» и присылает тебе. С галочкой «Вложить мой ключ API» ему не нужны свои ключи EXBO.</div>
           <div class="row wide"><label>Имя<small>по нему потом можно отозвать доступ</small></label><input class="field" id="isName" autocomplete="off"></div>
-          <div class="row wide"><label>ID компьютера друга</label><input class="field" id="isMachine" placeholder="ABCDE-23456" autocomplete="off"></div>
+          <div class="row wide"><label>Код запроса друга<small>друг копирует его в своей программе: «Копировать код запроса»</small></label><input class="field" id="isMachine" placeholder="SZR1-…" autocomplete="off"></div>
+          <div class="row"><label>Вложить мой ключ API<small>другу не нужны свои ключи; лимит EXBO (400 в минуту) делится между вами</small></label><label class="switch"><input type="checkbox" id="isShare" checked><i></i></label></div>
           <div class="row"><label>Срок<small>дней, 0 — бессрочно</small></label><input class="field num" id="isDays" value="30" inputmode="numeric"></div>
           <div class="linkrow"><button class="btn primary" id="isBtn">Создать код</button></div>
           <div id="isResult" hidden>
@@ -2071,8 +2200,8 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
   <div class="logo">◈</div>
   <h2>Закрытый доступ</h2>
   <div class="muted" id="lockReason"></div>
-  <div class="idrow"><span class="muted">ID этого компьютера:</span><b class="num" id="lockMachine">—</b><button class="btn" id="lockCopy">Копировать</button></div>
-  <div class="muted" style="font-size:13px">Отправь ID владельцу программы — он пришлёт код. Вставь его сюда:</div>
+  <div class="idrow"><span class="muted">ID этого компьютера:</span><b class="num" id="lockMachine">—</b><button class="btn primary" id="lockCopy">Копировать код запроса</button></div>
+  <div class="muted" style="font-size:13px">Отправь владельцу код запроса (кнопка выше скопирует его целиком) — он пришлёт код доступа. Вставь его сюда:</div>
   <textarea class="field code" id="lockCode" placeholder="SZ1-…"></textarea>
   <button class="btn primary" id="lockBtn">Открыть доступ</button>
 </div></div>
@@ -2655,8 +2784,8 @@ $("saveBtn").onclick = async () => {
 
 // ---------- доступ ----------
 document.querySelectorAll("[data-opendata]").forEach((b) => b.onclick = () => api("/api/open_data", {}));
-$("accCopyId").onclick = () => copyText($("accMachine").textContent, "ID скопирован — отправь его владельцу");
-$("lockCopy").onclick = () => copyText($("lockMachine").textContent, "ID скопирован — отправь его владельцу");
+$("accCopyId").onclick = () => copyText((S.access || {}).request || $("accMachine").textContent, "Код запроса скопирован — отправь его владельцу");
+$("lockCopy").onclick = () => copyText((S.access || {}).request || $("lockMachine").textContent, "Код запроса скопирован — отправь его владельцу");
 async function enterCode(text) {
   const r = await api("/api/access/enter", {code: text});
   toast(r.message, !r.ok);
@@ -2668,7 +2797,7 @@ $("accCodeBtn").onclick = async () => { if (await enterCode($("accCode").value))
 $("osCreate").onclick = async () => { const r = await api("/api/access/owner_key", {}); toast(r.message, !r.ok); refresh(); };
 $("osCopy").onclick = () => copyText($("osPub").value, "Открытый ключ скопирован");
 $("isBtn").onclick = async () => {
-  const r = await api("/api/access/issue", {name: $("isName").value, machine: $("isMachine").value, days: $("isDays").value});
+  const r = await api("/api/access/issue", {name: $("isName").value, machine: $("isMachine").value, days: $("isDays").value, share: $("isShare").checked});
   toast(r.message, !r.ok);
   if (r.ok) { $("isCode").value = r.code; $("isResult").hidden = false; $("isName").value = ""; $("isMachine").value = ""; }
   refresh();
@@ -2683,13 +2812,14 @@ function renderAccess() {
   $("accMachine").textContent = a.machine || "—";
   $("accStatus").textContent = !a.required ? "Закрытый доступ ещё не включён — программа открыта всем."
     : a.mode === "owner" ? "Ты владелец программы — код доступа тебе не нужен."
-    : a.ok ? `Доступ открыт: ${a.name}, срок — ${a.expires_text}. Номер кода: ${a.code_id}.` : (a.reason || "");
+    : a.ok ? `Доступ открыт: ${a.name}, срок — ${a.expires_text}. Номер кода: ${a.code_id}.` + (a.shared_api ? " Ключ API — владельца (вложен в код): свои ключи не нужны." : "") : (a.reason || "");
   $("accCodeBox").hidden = !a.required || a.mode === "owner";
   const setup = !a.embedded;                     // ключ ещё не вписан в программу
   $("ownerSetup").hidden = !(setup || a.owner);
   $("osNoKey").hidden = !setup || a.has_owner_key || !a.has_crypto;
   $("osHasKey").hidden = !(setup && a.has_owner_key);
   $("osPub").value = a.owner_public || "";
+  $("sharedNote").hidden = !S.shared_api;
   $("osSub").textContent = setup ? "Закрытый доступ включается один раз: владелец создаёт личный ключ, а его открытая часть вписывается в программу."
     : "Закрытый доступ включён. Ты владелец: коды выдаёшь в карточке «Выдать доступ».";
   $("osWarn").hidden = !a.has_owner_key || !(setup || a.owner);
@@ -2698,7 +2828,7 @@ function renderAccess() {
   if (owner) {
     const list = a.issued || [];
     $("issuedList").innerHTML = list.length ? ["<span class='muted'>Кому</span><span class='muted'>До</span><span class='muted'>№ кода</span>"]
-      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${esc(d.machine)}</span></span><span>${esc(d.expires_text)}</span><span class="num">${esc(d.id)}</span>`)).join("")
+      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${esc(d.machine)}</span>${d.shared ? ` <span class="tag fate" title="С твоим ключом API">ключ API</span>` : ""}</span><span>${esc(d.expires_text)}</span><span class="num">${esc(d.id)}</span>`)).join("")
       : "<span class='muted' style='grid-column:1/-1'>Пока никому не выдавал.</span>";
   }
 }
