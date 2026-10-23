@@ -30,6 +30,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import gzip
 import time
 import uuid
 import webbrowser
@@ -50,7 +51,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "1.9"
+APP_VERSION = "2.0"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -122,7 +123,7 @@ MIGRATED = migrate_old_files()
 PROD_URL = "https://eapi.stalzone.com"
 DEMO_URL = "https://dapi.stalzone.com"
 SETTINGS_VERSION = 2
-DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION)
+DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[])   # новый пользователь начинает с пустого списка
 OPEN_LINKS = {
     "api_bot": "https://t.me/stalzone_api_bot",
     "docs": "https://eapi.stalzone.net/overview.html",
@@ -225,6 +226,50 @@ def send_telegram(cfg, text):
     hints = {401: "неверный токен бота", 400: "неверный Chat ID или ты не нажал Start у своего бота",
              403: "бот заблокирован — открой его и нажми Start", 404: "неверный токен бота"}
     return False, f"Telegram отказал: {hints.get(r.status_code, 'ошибка ' + str(r.status_code))}" + (f" ({why})" if why else "")
+
+
+WATCH_MAX = 300            # предметов в своём списке (категории целиком — сверх этого)
+RESTART_DELAY = 3          # сменили ключи — перезапуск через столько секунд после последнего изменения
+RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days")
+QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
+              "server_url_override")   # из-за них новый проход не начинаем — просто запомнить
+FEED_PORT = 8790            # сервер для подписчиков слушает только этот компьютер; наружу — через Tailscale Funnel
+FEED_POLL = 30              # подписчик спрашивает сервер раз в столько секунд
+FEED_MIN_INTERVAL = 10      # чаще одного запроса в 10 с с одного кода — отказ
+FEED_KEEP_GONE = 30 * 60    # пропавшие находки ещё полчаса видны подписчикам («уже купили»)
+
+
+def meets_thresholds(rec, cfg, rare):
+    """Подходит ли находка под свои пороги: «дешевле рынка на» и минимальная прибыль
+    (у особо редких — свой порог прибыли)."""
+    min_profit = float(cfg.get("min_profit", 0))
+    if rare and cfg.get("rare_enabled", True):
+        min_profit = min(min_profit, float(cfg.get("rare_min_profit", min_profit)))
+    if float(rec.get("profit") or 0) < min_profit:
+        return False
+    if rec.get("kind") == "bid":
+        return bool(cfg.get("bids", True))
+    k = 1 - float(cfg.get("discount", 0.15))
+    unit = float(rec.get("unit") or 0)
+    return unit <= float(rec.get("hist") or 0) * k + 1e-6 and unit <= float(rec.get("market") or 0) * k + 1e-6
+
+
+def feed_text(rec, cfg):
+    """Сообщение в Telegram о находке с сервера (у подписчика — со своими порогами)."""
+    rub = eng.fmt_rub
+    if rec.get("kind") == "bid":
+        max_bid = rec["market"] * (1 - cfg.get("fee", 0.05)) * rec["amount"] - float(cfg.get("min_profit", 0))
+        lines = [f"⏳ {rec['name']} — ставка ниже рынка",
+                 f"{rec['amount']} шт, {'текущая ставка' if rec.get('has_bids') else 'старт'} {rub(rec['cost'])}",
+                 f"Перепродать ~{rub(rec['market'])}/шт · ставь не выше {rub(max_bid)}",
+                 f"Прибыль сейчас ~{rub(rec['profit'])}"]
+    else:
+        lines = [f"🔔 {rec['name']} — дешевле рынка на {rec['pct']:.0f}%",
+                 f"Купить: {rec['amount']} шт за {rub(rec['cost'])} ({rub(rec['unit'])}/шт)",
+                 f"Перепродать ~{rub(rec['market'])}/шт · прибыль ~{rub(rec['profit'])} после комиссии"]
+    if rec.get("chance_info"):
+        lines.append(chance_text(rec["chance_info"]))
+    return ("💎 ОСОБО РЕДКИЙ\n" if rec.get("rare") else "") + "\n".join(lines)
 
 
 def chance_text(c):
@@ -735,7 +780,7 @@ class Access:
             self._save_state()
 
     # --- коды ---
-    def issue(self, name, request, days, share=False, creds=None):
+    def issue(self, name, request, days, share=False, creds=None, server=None, base_day=None):
         if not self.is_owner() or not OWNER_PUBLIC_KEY:
             return False, "Выдавать коды может только владелец программы", None
         name = re.sub(r"\s+", " ", str(name or "")).strip()[:40]
@@ -757,14 +802,18 @@ class Access:
             return False, "Срок — число дней (0 — бессрочно)", None
         days = max(0, min(days, 3650))
         today = self.today()
-        payload = {"n": name, "m": machine, "e": today + days if days else 0, "i": secrets.token_hex(3), "t": today}
+        start = max(today, int(base_day or 0))     # продление: считаем от конца прошлого срока
+        payload = {"n": name, "m": machine, "e": start + days if days else 0, "i": secrets.token_hex(3), "t": today}
+        server = str(server or "").strip().rstrip("/")
+        if server:   # куда подписчику ходить за находками
+            payload["s"] = server
         if share:   # ключ API владельца — зашифрован для компьютера друга, в коде его не прочитать
             payload["k"] = seal_for(dev_pub, json.dumps(creds).encode("utf-8"), payload["i"].encode())
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         code = CODE_PREFIX + _b64e(data) + "." + _b64e(self.owner_key.sign(data))
         issued = self.issued()
         issued.insert(0, {"name": name, "machine": machine, "id": payload["i"], "expires": payload["e"],
-                          "issued": today, "code": code, "shared": bool(share)})
+                          "issued": today, "code": code, "shared": bool(share), "server": bool(server)})
         try:
             write_json(ISSUED_FILE, issued[:300])
         except OSError:
@@ -773,6 +822,72 @@ class Access:
                            + (f"до {day_text(payload['e'])}" if days else "бессрочно") + f", № {payload['i']}"
                            + (", с твоим ключом API" if share else ""))
         return True, "Код создан — отправь его другу", code
+
+    def _save_issued(self, issued):
+        try:
+            write_json(ISSUED_FILE, issued[:300])
+        except OSError:
+            pass
+
+    def set_blocked(self, code_id, blocked):
+        """Отключить (или включить обратно) подписчика: сервер сразу перестаёт отдавать ему находки."""
+        if not self.is_owner():
+            return False, "Только владелец"
+        issued, found = self.issued(), None
+        for d in issued:
+            if d.get("id") == code_id:
+                d["blocked"] = bool(blocked)
+                found = d
+        if not found:
+            return False, "Код не найден"
+        self._save_issued(issued)
+        self.state.add_log(f"{'Отключил' if blocked else 'Включил'} подписчика: {found['name']} (№ {code_id})")
+        return True, ("Отключён — сервер больше не отдаёт ему находки" if blocked else "Снова включён")
+
+    def renew(self, code_id, days, server=None):
+        """Продлить подписку: новый код на тот же компьютер, срок — от конца прошлого."""
+        old = next((d for d in self.issued() if d.get("id") == code_id), None)
+        if not old:
+            return False, "Код не найден", None
+        ok, msg, code = self.issue(old["name"], old["machine"], days, server=server, base_day=old.get("expires") or 0)
+        if ok:
+            issued = self.issued()
+            for d in issued:
+                if d.get("id") == code_id:
+                    d["renewed"] = True
+            self._save_issued(issued)
+            msg = "Новый код скопирован — отправь его подписчику"
+        return ok, msg, code
+
+    def blocked_ids(self):
+        return {str(d.get("id")) for d in self.issued() if d.get("blocked")}
+
+    def verify_subscriber(self, code, machine):
+        """Для сервера: можно ли отдать находки по этому коду с этого компьютера. (данные кода, ошибка)."""
+        payload, err = self.parse(code)
+        if err:
+            return None, err
+        if norm_machine(payload["m"]) != norm_machine(machine):
+            return None, "Код выдан для другого компьютера"
+        expires = int(payload.get("e") or 0)
+        if expires and self.today() > expires:
+            return None, f"Подписка закончилась {day_text(expires)} — продли у владельца"
+        cid = str(payload["i"])
+        with self.lock:
+            revoked = str(payload["n"]).lower() in self.revoked or cid.lower() in self.revoked
+        if revoked or cid in self.blocked_ids():
+            return None, "Владелец отключил этот доступ"
+        return payload, None
+
+    def server_url(self):
+        """Адрес сервера владельца из своего кода доступа (подписчик) или None."""
+        if self.is_owner():
+            return None
+        payload, err = self.parse(self.state.cfg.get("access_code", ""))
+        if err or not payload.get("s"):
+            return None
+        url = str(payload["s"]).strip().rstrip("/")
+        return url if re.match(r"^https?://[^\s/]+", url) else None
 
     @staticmethod
     def issued():
@@ -820,6 +935,7 @@ class Access:
         name, expires = str(payload["n"]), int(payload["e"] or 0)
         info = dict(base, name=name, expires=expires, expires_text=day_text(expires) if expires else "бессрочно",
                     code_id=str(payload["i"]))
+        info["server"] = str(payload.get("s") or "")
         if norm_machine(payload["m"]) != self.machine:
             return dict(info, ok=False, mode="locked",
                         reason="Этот код выдан для другого компьютера. Отправь владельцу свой ID — он выдаст новый")
@@ -841,9 +957,12 @@ class Access:
         info["request"] = self.request_code() if X25519PrivateKey is not None else info["machine"]
         info["shared_api"] = bool(info["ok"] and info.get("mode") == "code" and self.shared_api())
         if info["owner"] and OWNER_PUBLIC_KEY:
+            today, seen = self.today(), self.state.subscribers_seen()
             info["issued"] = [dict({k: v for k, v in d.items() if k != "code"},
-                                   expires_text=day_text(d["expires"]) if d.get("expires") else "бессрочно")
-                              for d in self.issued()[:50]]
+                                   expires_text=day_text(d["expires"]) if d.get("expires") else "бессрочно",
+                                   expired=bool(d.get("expires") and today > d["expires"]),
+                                   last_seen=seen.get(d.get("id")))
+                              for d in self.issued()[:100]]
         return info
 
 
@@ -855,14 +974,30 @@ def minutes_since(iso):
 
 
 # ------------------------------ Фоновая проверка ------------------------------
-class Worker(threading.Thread):
-    """Проверяет аукцион и передаёт находки в общее состояние через emit()."""
+def api_delay(ages):
+    """Через сколько минут новый лот виден в API: нижняя четверть возрастов лотов при первой встрече.
+    Медиана врала: в неё попадали старые лоты, которые просто раньше не попадали в выдачу
+    (по настоящей базе: новые лоты видны через ~10–12 мин, а медиана выходила под час)."""
+    if not ages:
+        return None
+    ages = sorted(ages)
+    return ages[(len(ages) - 1) // 4]
 
-    def __init__(self, cfg, emit, api_factory=None, shown=(), tracked=(), holdings=()):
+
+class Worker(threading.Thread):
+    """Проверяет аукцион и передаёт находки в общее состояние через emit().
+    Настройки меняются на ходу (reconfigure): пороги — сразу, список предметов — со следующего прохода.
+    Перезапуск нужен только при смене ключей API (раньше любая галочка перезапускала проверку с нуля)."""
+
+    def __init__(self, cfg, emit, api_factory=None, shown=(), tracked=(), holdings=(), serving=False, shared=None):
         super().__init__(daemon=True)
         self.cfg = cfg
+        self.serving = serving             # владелец раздаёт находки подписчикам
         self.emit = emit
         self.stop_event = threading.Event()
+        self.wake = threading.Event()      # новые настройки — не ждать конца паузы между проходами
+        self._pending = None               # (настройки, serving) — применить со следующего прохода
+        self._pending_lock = threading.Lock()
         self.api_factory = api_factory or eng.Api
         self.db = None
         self.initial_shown = set(shown)   # что уже есть в таблице (например, восстановлено после перезапуска)
@@ -870,9 +1005,49 @@ class Worker(threading.Thread):
         self.tracked = {t["lot_key"]: dict(t) for t in tracked}
         self.holdings = list(holdings)     # мои покупки: следим за их текущей ценой
         self.meta = {}
+        # что уже писали в журнал за этот запуск программы (строки рынка и т. п.) — после перезапуска не повторяем
+        self.shared = shared if shared is not None else {}
 
     def stop(self):
         self.stop_event.set()
+        self.wake.set()
+
+    def reconfigure(self, cfg, serving=None, wake=True):
+        """Новые настройки без перезапуска: пороги и уведомления — сразу, что проверять — со следующего прохода
+        (он начнётся сразу, если проверка ждала паузу между проходами)."""
+        with self._pending_lock:
+            self._pending = (dict(cfg), self.serving if serving is None else bool(serving))
+            self.cfg = self._pending[0]
+        if wake:
+            self.wake.set()
+
+    def _take_pending(self):
+        with self._pending_lock:
+            pending, self._pending = self._pending, None
+        if pending:
+            self.serving = pending[1]
+        return pending is not None
+
+    def _plan(self, names):
+        """Что проверять и с какими порогами — по текущим настройкам: (предметы, авто, купленное, категории, пороги)."""
+        cfg = self.cfg
+        items, auto = eng.watch_items(cfg, names)
+        cats = eng.auto_categories(cfg)
+        have = {i for i, _ in items}
+        hold_ids = set()
+        for h in list(self.holdings):   # купленное тоже проверяем — чтобы видеть его текущую цену
+            if h.get("item_id") in names and h["item_id"] not in have:
+                have.add(h["item_id"])
+                hold_ids.add(h["item_id"])
+                items.append((h["item_id"], names[h["item_id"]]))
+        scan_cfg = dict(cfg)
+        if cfg.get("rare_enabled", True):   # редкие ищем со своим (обычно меньшим) порогом прибыли
+            scan_cfg["find_min_profit"] = min(cfg["min_profit"], float(cfg.get("rare_min_profit", cfg["min_profit"])))
+        if self.serving:   # для подписчиков ищем шире — у каждого свои пороги, отсеют у себя
+            scan_cfg["discount"] = min(float(cfg["discount"]), 0.08)
+            scan_cfg["min_profit"] = min(float(cfg["min_profit"]), 1000.0)
+            scan_cfg["find_min_profit"] = min(scan_cfg.get("find_min_profit", cfg["min_profit"]), 1000.0)
+        return items, auto, hold_ids, cats, scan_cfg
 
     def telegram(self, text):
         ok, msg = send_telegram(self.cfg, text)
@@ -888,19 +1063,11 @@ class Worker(threading.Thread):
                 self.meta = {e["id"]: e for e in eng.load_catalog(cfg["region"])}
             except Exception:
                 self.meta = {}
-            items, auto = eng.watch_items(cfg, names)
-            cats = eng.auto_categories(cfg)
-            have = {i for i, _ in items}
-            hold_ids = set()
-            for h in self.holdings:   # купленное тоже проверяем — чтобы видеть его текущую цену
-                if h.get("item_id") in names and h["item_id"] not in have:
-                    have.add(h["item_id"])
-                    hold_ids.add(h["item_id"])
-                    items.append((h["item_id"], names[h["item_id"]]))
+            self._take_pending()   # что поменяли, пока запускались, уже в self.cfg
+            items, auto, hold_ids, cats, scan_cfg = self._plan(names)
             if not items:
                 self.emit("error", "Список предметов пуст или названия не найдены — проверь вкладку «Предметы».")
                 return
-            self.emit("log", eng.watching_line([x for x in items if x[0] not in hold_ids], auto, cats))
             seen = eng.load_seen()   # о каких лотах уже сообщали (звук, Telegram) — в прошлых запусках тоже
             shown = set(self.initial_shown)  # что уже есть в таблице — второй раз не добавляем
             known = set()
@@ -908,13 +1075,29 @@ class Worker(threading.Thread):
             self.db = db
             self.emit("log", eng.db_line(db.stats()))
             # рынок, формат цен, строка рынка в журнале; автодобавленные предметы — без строки на каждый
-            scan_cfg = dict(cfg)
-            if cfg.get("rare_enabled", True):   # редкие ищем со своим (обычно меньшим) порогом прибыли
-                scan_cfg["find_min_profit"] = min(cfg["min_profit"], float(cfg.get("rare_min_profit", cfg["min_profit"])))
             scanner = eng.Scanner(api, scan_cfg, quiet=auto | hold_ids, db=db)
-            scanner.quiet_label = "Все артефакты" if cats == ["artefact"] else "Категории целиком"
-            first_pass = True
+            for attr in ("described", "mismatched", "fields_logged"):   # раз за запуск программы, а не проверки
+                setattr(scanner, attr, self.shared.setdefault(attr, set()))
+            first_pass, announce, last_line = True, True, None
             while not self.stop_event.is_set():
+                if self._take_pending():
+                    items, auto, hold_ids, cats, scan_cfg = self._plan(names)
+                    scanner.cfg, scanner.quiet = scan_cfg, auto | hold_ids
+                    announce = True
+                if announce:
+                    announce = False
+                    scanner.quiet_label = "Все артефакты" if cats == ["artefact"] else "Категории целиком"
+                    line = (eng.watching_line([x for x in items if x[0] not in hold_ids], auto, cats) if items else
+                            "Список предметов пуст — добавь предметы во вкладке «Предметы», проверка продолжится сама")
+                    if self.serving:
+                        line += ". Сервер для подписчиков: ищу шире (от 8% и 1 000 ₽), у себя показываю по своим порогам"
+                    if line != last_line:
+                        self.emit("log", line)
+                        last_line = line
+                if not items:
+                    self.wake.wait()
+                    self.wake.clear()
+                    continue
                 started = time.time()
                 fresh_ages, found = [], [0]
 
@@ -926,10 +1109,11 @@ class Worker(threading.Thread):
                         self.emit("log", f"{name}: ошибка — {result}")
                         return
                     lots, deals, bids = result
+                    cfg = self.cfg                      # настройки могли поменять на ходу
                     if lots is not None:  # лоты получили — отметим находки, которых больше нет
                         self.emit("lots_seen", {"item_id": item_id, "keys": list(lots.keys())})
                         self.check_gone(item_id, lots)
-                        if item_id in hold_ids or any(h.get("item_id") == item_id for h in self.holdings):
+                        if item_id in hold_ids or any(h.get("item_id") == item_id for h in list(self.holdings)):
                             self.update_holdings(scanner, item_id, name, list(lots.values()))
                     # замер задержки API: только у предметов, где видны все лоты (иначе старые лоты
                     # «въезжают» в первые страницы и выглядят новыми)
@@ -946,13 +1130,16 @@ class Worker(threading.Thread):
                         for d in items_found:
                             g = d.get("grade") or d.get("bucket")
                             rare = is_rare(cfg, item_id, name, meta, g[0] if g else None)
-                            if kind == "buyout" and not rare and d["profit"] < cfg["min_profit"]:
-                                continue   # нашлось только по «редкому» порогу, а предмет обычный
                             key = ("bid|" if kind == "bid" else "") + eng.lot_key(item_id, d["lot"])
+                            rec, text = self.record(item_id, name, d, kind, key, meta)
+                            if self.serving:
+                                self.emit("feed", rec)
+                            if not meets_thresholds(rec, cfg, rare):
+                                continue   # нашлось по более низкому порогу (редкие, сервер) — себе не показываем
                             if key not in shown:
                                 shown.add(key)
                                 found[0] += 1
-                                self.deal(item_id, name, d, kind, key, notify=key not in seen, rare=rare, meta=meta)
+                                self.publish(rec, text, notify=key not in seen, rare=rare)
                                 seen.add(key)
 
                 # сеть — параллельно, обработка — по порядку (см. eng.scan_pass)
@@ -961,13 +1148,14 @@ class Worker(threading.Thread):
                 if first_pass and not self.stop_event.is_set() and scanner.summary():
                     self.emit("log", scanner.summary())
                 self.emit("pass", {"time": time.time(), "found": found[0], "took": time.time() - started,
-                                   "delay": statistics.median(fresh_ages) if fresh_ages else None,
+                                   "delay": api_delay(fresh_ages),
                                    "delay_min": min(fresh_ages) if fresh_ages else None,
                                    "delay_n": len(fresh_ages),
                                    "total": len(items), "db": db.stats()})
                 first_pass = False
-                pause = max(5, cfg["poll_minutes"] * 60 - (time.time() - started))
-                self.stop_event.wait(pause)
+                pause = max(5, float(self.cfg["poll_minutes"]) * 60 - (time.time() - started))
+                self.wake.wait(pause)
+                self.wake.clear()
         except eng.AuthError as e:
             if cfg.get("shared_api"):
                 self.emit("error", "Ключ API владельца не подошёл — возможно, он сменил ключ. "
@@ -1030,7 +1218,8 @@ class Worker(threading.Thread):
             self.emit("holding", {"id": h["id"], "market": resale, "hist": hist, "floor": floor,
                                   "chance": chance, "updated": time.time()})
 
-    def deal(self, item_id, name, d, kind, key, notify=True, rare=False, meta=None):
+    def record(self, item_id, name, d, kind, key, meta=None):
+        """Находка в том виде, в каком она уходит в таблицу и подписчикам. (запись, текст для Telegram)."""
         lot = d["lot"]
         b = d["bucket"]
         meta = meta or {}
@@ -1043,12 +1232,6 @@ class Worker(threading.Thread):
         chance = d.get("chance")
         if chance:
             text = text.rstrip() + "\n" + chance_text(chance)
-        if rare:
-            text = "💎 ОСОБО РЕДКИЙ\n" + text
-        # о находках с низким шансом продажи можно не сообщать (в таблице они всё равно есть)
-        min_chance = float(self.cfg.get("notify_min_chance", 0) or 0) / 100
-        if notify and not rare and chance and chance["chance"] < min_chance:
-            notify = False
         cost = unit * d["amount"]
         grade = d.get("grade")
         if kind == "buyout":
@@ -1063,10 +1246,13 @@ class Worker(threading.Thread):
             self.tracked[eng.lot_key(item_id, lot)] = {
                 "lot_key": eng.lot_key(item_id, lot), "item_id": item_id, "amount": d["amount"],
                 "price": eng._num(lot.get("buyoutPrice")), "since": since, "ends": ends}
-        self.emit("deal", {
+        max_bid = d.get("max_bid")
+        if kind == "bid":   # «ставь не выше» — по своей минимальной прибыли
+            max_bid = d["market"] * (1 - self.cfg["fee"]) * d["amount"] - self.cfg["min_profit"]
+        rec = {
             "item_id": item_id, "name": name, "kind": kind,
             "key": key, "lot_key": eng.lot_key(item_id, lot), "gone": False,
-            "cat": meta.get("cat"), "rank": meta.get("rank"), "rare": bool(rare),
+            "cat": meta.get("cat"), "rank": meta.get("rank"),
             "additional": {k: v for k, v in (lot.get("additional") or {}).items() if k in ("qlt", "ptn")},
             "chance": chance["chance"] if chance else None, "sell_hours": chance.get("hours") if chance else None,
             "chance_info": chance,
@@ -1082,11 +1268,259 @@ class Worker(threading.Thread):
             "n_sales": d["n"], "per_day": d["per_day"],
             "speed": eng.sell_speed(d["amount"], d["per_day"]),
             "listed": lot.get("startTime"), "ends": lot.get("endTime"),
-            "max_bid": d.get("max_bid"), "has_bids": d.get("has_bids"),
-            "text": text, "notify": notify,
-        })
+            "max_bid": max_bid, "has_bids": d.get("has_bids"),
+        }
+        return rec, text
+
+    def publish(self, rec, text, notify=True, rare=False):
+        """В свою таблицу; звук и Telegram — только о новом (и с подходящим шансом продажи)."""
+        if rare:
+            text = "💎 ОСОБО РЕДКИЙ\n" + text
+        chance = rec.get("chance_info")
+        min_chance = float(self.cfg.get("notify_min_chance", 0) or 0) / 100
+        if notify and not rare and chance and chance["chance"] < min_chance:
+            notify = False
+        self.emit("deal", dict(rec, rare=bool(rare), text=text, notify=notify))
         if notify:
             self.telegram(text)
+
+    def deal(self, item_id, name, d, kind, key, notify=True, rare=False, meta=None):
+        """Совместимость: собрать запись и показать."""
+        rec, text = self.record(item_id, name, d, kind, key, meta)
+        self.publish(rec, text, notify=notify, rare=rare)
+
+
+class FeedWorker(threading.Thread):
+    """Подписчик: находки не ищет сам, а берёт у сервера владельца и отбирает по своим настройкам."""
+
+    def __init__(self, cfg, emit, url, code, machine, shown=(), holdings=()):
+        super().__init__(daemon=True)
+        self.cfg, self.emit, self.url = cfg, emit, url.rstrip("/")
+        self.code, self.machine = code, machine
+        self.stop_event = threading.Event()
+        self.wake = threading.Event()
+        self._pending_lock = threading.Lock()
+        self._changed = False
+        self.initial_shown = set(shown)
+        self.holdings = list(holdings)
+        self.db = None
+
+    def stop(self):
+        self.stop_event.set()
+        self.wake.set()
+
+    def reconfigure(self, cfg, serving=None, wake=True):
+        """Новые пороги и список — со следующего запроса к серверу (он будет сразу), без перезапуска."""
+        with self._pending_lock:
+            self.cfg = dict(cfg)
+            self._changed = True
+        if wake:
+            self.wake.set()
+
+    def _sleep(self, seconds):
+        self.wake.wait(seconds)
+        self.wake.clear()
+
+    def run(self):
+        cfg = self.cfg
+        try:
+            names = eng.load_listing(cfg["region"])
+            try:
+                meta = {e["id"]: e for e in eng.load_catalog(cfg["region"])}
+            except Exception:
+                meta = {}
+            watch_ids = {i for i, _ in eng.resolve_watch(cfg.get("watch") or [], names)}
+            cats = set(eng.auto_categories(cfg))
+            seen, shown = eng.load_seen(), set(self.initial_shown)
+            etag, fails, first, quiet_next = None, 0, True, False
+            self.emit("log", f"Подписка: находки беру с сервера владельца ({self.url}). "
+                             + ("Отбираю по твоему списку и категориям" if watch_ids or cats else "Показываю все находки")
+                             + " и по твоим порогам.")
+            while not self.stop_event.is_set():
+                with self._pending_lock:
+                    changed, self._changed = self._changed, False
+                if changed:   # настройки поменяли — перечитать всю ленту по новым, старое — без звука
+                    cfg = self.cfg
+                    watch_ids = {i for i, _ in eng.resolve_watch(cfg.get("watch") or [], names)}
+                    cats = set(eng.auto_categories(cfg))
+                    etag, quiet_next = None, True
+                started = time.time()
+                headers = {"X-Access-Code": self.code, "X-Machine": self.machine, "X-App-Version": APP_VERSION,
+                           "Accept-Encoding": "gzip"}
+                if etag:
+                    headers["If-None-Match"] = etag
+                wait = FEED_POLL
+                try:
+                    r = requests.get(self.url + "/v1/feed", headers=headers, timeout=25)
+                except requests.RequestException as e:
+                    fails += 1
+                    self.emit("server", {"ok": False, "error": f"сервер владельца не отвечает ({type(e).__name__})"})
+                    if fails == 1:
+                        self.emit("log", "Сервер владельца не отвечает — возможно, его компьютер выключен. Повторяю…")
+                    self._sleep(min(300, FEED_POLL * 2 ** min(fails, 3)))
+                    continue
+                if r.status_code in (401, 403):
+                    try:
+                        why = r.json().get("error") or ""
+                    except ValueError:
+                        why = ""
+                    self.emit("server", {"ok": False, "error": why or f"сервер отказал ({r.status_code})"})
+                    self.emit("error", "Сервер владельца не пускает: " + (why or str(r.status_code)))
+                    self._sleep(300)
+                    continue
+                if r.status_code == 429:
+                    try:
+                        wait = max(5, int(r.headers.get("Retry-After", "15")))
+                    except ValueError:
+                        wait = 15
+                elif r.status_code == 304:
+                    fails = 0
+                    self.emit("server", {"ok": True, "checked": time.time()})
+                    self.emit("pass", {"time": time.time(), "found": 0, "took": time.time() - started,
+                                       "delay": None, "total": None})
+                elif r.status_code == 200:
+                    fails = 0
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        data = None
+                    if isinstance(data, dict):
+                        etag = r.headers.get("ETag")
+                        found = self.process(data, cfg, meta, watch_ids, cats, seen, shown, quiet=first or quiet_next)
+                        first = quiet_next = False
+                        eng.save_seen(seen)
+                        self.emit("server", {"ok": True, "checked": time.time(), "server_pass": data.get("last_pass"),
+                                             "items": data.get("items"), "version": data.get("server_version")})
+                        self.emit("pass", {"time": time.time(), "found": found, "took": time.time() - started,
+                                           "delay": None, "total": data.get("items")})
+                else:
+                    self.emit("server", {"ok": False, "error": f"сервер ответил {r.status_code}"})
+                self._sleep(max(1, wait - (time.time() - started)))
+        except Exception as e:
+            self.emit("error", f"Не удалось подключиться к серверу: {e}")
+        finally:
+            self.emit("stopped", None)
+
+    def process(self, data, cfg, meta, watch_ids, cats, seen, shown, quiet=False):
+        present, fates, found = set(), {}, 0
+        for rec in data.get("deals") or []:
+            if not isinstance(rec, dict) or not rec.get("key") or not rec.get("lot_key"):
+                continue
+            present.add(rec["lot_key"])
+            if rec.get("gone") or rec.get("fate"):
+                fates[rec["lot_key"]] = rec.get("fate") or ""
+                continue
+            item = rec.get("item_id")
+            if (watch_ids or cats) and item not in watch_ids and rec.get("cat") not in cats:
+                continue   # не из моего списка и не из моих категорий
+            rare = is_rare(cfg, item, rec.get("name", ""), meta.get(item), rec.get("quality"))
+            if not meets_thresholds(rec, cfg, rare):
+                continue
+            key = rec["key"]
+            self.update_holding_price(rec)
+            if key in shown:
+                continue
+            shown.add(key)
+            found += 1
+            out = {k: v for k, v in rec.items() if k not in ("found", "id", "notify", "text")}
+            out["rare"], out["source"] = bool(rare), "server"
+            if out.get("kind") == "bid":
+                out["max_bid"] = out["market"] * (1 - cfg["fee"]) * out["amount"] - cfg["min_profit"]
+            notify = key not in seen and not quiet
+            chance = out.get("chance_info")
+            if notify and not rare and chance and chance["chance"] < float(cfg.get("notify_min_chance", 0) or 0) / 100:
+                notify = False
+            seen.add(key)
+            text = feed_text(out, cfg)
+            self.emit("deal", dict(out, text=text, notify=notify))
+            if notify:
+                ok, msg = send_telegram(cfg, text)
+                if not ok and msg:
+                    self.emit("log", msg)
+        self.emit("feed_sync", {"present": sorted(present), "fates": fates})
+        return found
+
+    def update_holding_price(self, rec):
+        """Текущая цена купленного — по находкам того же предмета с сервера."""
+        for h in self.holdings:
+            if h.get("item_id") != rec.get("item_id") or h.get("status") == "sold":
+                continue
+            if h.get("quality") != rec.get("quality"):
+                continue
+            self.emit("holding", {"id": h["id"], "market": rec.get("market"), "hist": rec.get("hist"),
+                                  "floor": rec.get("floor"), "chance": rec.get("chance_info"), "updated": time.time()})
+
+
+def make_feed_handler(state):
+    """Сервер для подписчиков: только /v1/ping и /v1/feed. Слушает 127.0.0.1 — наружу его выводит Tailscale Funnel."""
+
+    class FeedHandler(BaseHTTPRequestHandler):
+        server_version = "STALZONE-Feed"
+        sys_version = ""
+
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body=b"", headers=None):
+            self.send_response(code)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if body and self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _json(self, code, obj, headers=None):
+            self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                       dict({"Content-Type": "application/json; charset=utf-8"}, **(headers or {})))
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/v1/ping":
+                return self._json(200, {"ok": True, "app": "stalzone-tracker", "version": APP_VERSION,
+                                        "time": time.time()})
+            if path != "/v1/feed":
+                return self._json(404, {"error": "not found"})
+            code = str(self.headers.get("X-Access-Code") or "")[:4000]
+            machine = str(self.headers.get("X-Machine") or "")[:40]
+            payload, err = state.access.verify_subscriber(code, machine)
+            if err:
+                return self._json(403, {"error": err})
+            cid, now = str(payload["i"]), time.time()
+            first = False
+            with state.lock:
+                sub = state.subscribers.get(cid)
+                if sub and now - sub["last"] < FEED_MIN_INTERVAL:
+                    too_fast = True
+                else:
+                    too_fast = False
+                    first = sub is None
+                    state.subscribers[cid] = {
+                        "name": payload["n"], "machine": payload["m"], "last": now,
+                        "requests": (sub or {}).get("requests", 0) + 1,
+                        "version": str(self.headers.get("X-App-Version") or "")[:20],
+                        "ip": str(self.headers.get("X-Forwarded-For") or self.client_address[0])[:60]}
+            if too_fast:
+                return self._json(429, {"error": "слишком часто"}, {"Retry-After": str(FEED_MIN_INTERVAL)})
+            if first:
+                state.add_log(f"Подписчик подключился: {payload['n']} (№ {cid})")
+            rev, body, gz = state.feed_bytes()
+            etag = f'"{rev}"'
+            if self.headers.get("If-None-Match") == etag:
+                return self._send(304, b"", {"ETag": etag})
+            headers = {"Content-Type": "application/json; charset=utf-8", "ETag": etag}
+            if "gzip" in str(self.headers.get("Accept-Encoding") or ""):
+                headers["Content-Encoding"] = "gzip"
+                return self._send(200, gz, headers)
+            return self._send(200, body, headers)
+
+        def do_HEAD(self):
+            return self._send(405)
+
+        do_POST = do_PUT = do_DELETE = do_HEAD
+
+    return FeedHandler
 
 
 # --------------------------------- Состояние ---------------------------------
@@ -1106,9 +1540,15 @@ class State:
         self.purchases = load_purchases()
         self.worker = None
         self.api_factory = api_factory
+        self.journal_once = {}      # что проверка уже писала в журнал за этот запуск программы (строки рынка и т. п.)
+        self._restart_due, self._restarting = 0.0, False
+        # сервер для подписчиков (у владельца) и связь с сервером (у подписчика)
+        self.feed, self.feed_rev, self._feed_cache = {}, 0, (None, b"", b"")
+        self.subscribers = {}               # № кода → когда и откуда приходил
+        self.feed_server, self.feed_error = None, ""
         self.status = {"running": False, "starting": False, "progress": None, "last_pass": None,
                        "delay": None, "delay_min": None, "delay_n": 0, "found_total": 0, "took": None,
-                       "error": None, "error_id": 0, "db": None, "total": None}
+                       "error": None, "error_id": 0, "db": None, "total": None, "server": None}
         self.last_poll = time.time()
         self.updater = Updater(self)
         self.access = Access(self)
@@ -1177,6 +1617,7 @@ class State:
             w = self.worker
             if w and w.is_alive():      # трекер уже работает — пусть сразу следит и за этой покупкой
                 w.holdings.append(dict(self.purchases[0]))
+        self.reconfigure_worker(wake=False)   # предмет покупки — в проверку со следующего прохода
         self.add_log(f"Отметил покупку: {d['name']} за {eng.fmt_rub(paid)}")
         self.save_purchases()
         self.save_deals()
@@ -1217,6 +1658,70 @@ class State:
         self.save_deals()
         return True, "Удалено"
 
+    # --- сервер для подписчиков (владелец) ---
+    def feed_bytes(self):
+        """(номер версии, JSON, JSON в gzip) — собираем заново, только если лента изменилась."""
+        now = time.time()
+        with self.lock:
+            for key in [k for k, r in self.feed.items()
+                        if (r.get("gone") and now - (r.get("gone_at") or now) > FEED_KEEP_GONE)
+                        or (r.get("ends") and State._ts(r["ends"], now + 1) < now - 300)]:
+                del self.feed[key]
+                self.feed_rev += 1
+            if self._feed_cache[0] == self.feed_rev:
+                return self._feed_cache
+            payload = {"v": 1, "server_version": APP_VERSION, "time": now,
+                       "last_pass": self.status.get("last_pass"), "items": self.status.get("total"),
+                       "deals": [{k: v for k, v in r.items() if k not in ("text", "notify", "id")}
+                                 for r in self.feed.values()]}
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            self._feed_cache = (self.feed_rev, body, gzip.compress(body, 6))
+            return self._feed_cache
+
+    def subscribers_seen(self):
+        with self.lock:
+            return {cid: s["last"] for cid, s in self.subscribers.items()}
+
+    def serving(self):
+        return bool(self.cfg.get("server_enabled") and self.access.is_owner() and OWNER_PUBLIC_KEY)
+
+    def sync_feed_server(self):
+        """Включить или выключить сервер для подписчиков по настройкам."""
+        want = self.serving()
+        port = int(self.cfg.get("server_port") or FEED_PORT)
+        srv = self.feed_server
+        if srv and (not want or srv.server_address[1] != port):
+            srv.shutdown()
+            srv.server_close()
+            self.feed_server = None
+            self.add_log("Сервер для подписчиков выключен")
+        if want and not self.feed_server:
+            try:
+                srv = ThreadingHTTPServer(("127.0.0.1", port), make_feed_handler(self))
+            except OSError as e:
+                self.feed_error = f"порт {port} занят ({e.strerror or e})"
+                self.add_log("Сервер для подписчиков не запустился: " + self.feed_error)
+                return
+            srv.daemon_threads = True
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.feed_server, self.feed_error = srv, ""
+            self.add_log(f"Сервер для подписчиков работает: 127.0.0.1:{port}. Наружу его выводит Tailscale Funnel "
+                         f"(команда: tailscale funnel {port})")
+
+    def test_public_url(self):
+        """Владелец проверяет, видно ли его сервер из интернета по публичному адресу."""
+        url = str(self.cfg.get("server_url") or "").strip().rstrip("/")
+        if not re.match(r"^https?://[^\s/]+", url):
+            return False, "Впиши публичный адрес, например https://мой-пк.xxxx.ts.net"
+        try:
+            r = requests.get(url + "/v1/ping", timeout=15)
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            return False, f"По адресу {url} сервер не отвечает ({type(e).__name__}). Включён ли Tailscale Funnel?"
+        if r.status_code == 200 and data.get("app") == "stalzone-tracker":
+            return True, f"Работает: по адресу {url} отвечает твой трекер {data.get('version', '')}"
+        return False, f"По адресу {url} отвечает что-то другое (код {r.status_code})"
+
     def save_deals(self):
         with self.lock:
             deals = list(self.deals)
@@ -1253,11 +1758,40 @@ class State:
                 for d in self.deals:
                     if d.get("item_id") == data["item_id"] and d.get("lot_key") and d["lot_key"] not in present:
                         d["gone"] = True
+                now = time.time()
+                for rec in self.feed.values():
+                    if rec["item_id"] == data["item_id"] and rec["lot_key"] not in present and not rec.get("gone"):
+                        rec["gone"], rec["gone_at"] = True, now
+                        self.feed_rev += 1
+            elif kind == "feed":         # находка для подписчиков (широкие пороги)
+                old = self.feed.get(data["key"])
+                rec = dict(data, found=(old or {}).get("found", time.time()))
+                if old and old.get("gone"):
+                    rec.update(gone=old["gone"], gone_at=old.get("gone_at"), fate=old.get("fate"))
+                self.feed[data["key"]] = rec
+                self.feed_rev += 1
+            elif kind == "feed_sync":    # подписчик: что сейчас есть на сервере
+                present, fates = set(data["present"]), data["fates"]
+                for d in self.deals:
+                    if d.get("source") != "server":
+                        continue
+                    if d.get("lot_key") in fates:
+                        d["gone"] = True
+                        if fates[d["lot_key"]]:
+                            d["fate"] = fates[d["lot_key"]]
+                    elif d.get("lot_key") not in present:
+                        d["gone"] = True
+            elif kind == "server":
+                self.status["server"] = dict(data, at=time.time())
             elif kind == "lot_status":   # пропавший лот: купили (есть сделка в истории), сняли или истёк
                 for d in self.deals:
                     if d.get("lot_key") == data["lot_key"]:
                         d["gone"] = True
                         d["fate"] = data["status"]
+                for rec in self.feed.values():
+                    if rec.get("lot_key") == data["lot_key"]:
+                        rec.update(gone=True, fate=data["status"], gone_at=rec.get("gone_at") or time.time())
+                        self.feed_rev += 1
             elif kind == "holding":      # текущая цена купленного
                 for p in self.purchases:
                     if p["id"] == data["id"]:
@@ -1296,6 +1830,7 @@ class State:
         if stats:
             with self.lock:
                 self.status["db"] = stats
+        self.sync_feed_server()
         if self.updater.repo():
             self.updater.check()    # при запуске сами смотрим, нет ли новой версии
         threading.Thread(target=self.watch_access, daemon=True).start()
@@ -1322,8 +1857,29 @@ class State:
                 cfg["shared_api"] = True
         return cfg
 
+    def subscriber_server(self):
+        """Адрес сервера владельца, если эта программа — подписчик (находки берёт с сервера)."""
+        if not OWNER_PUBLIC_KEY or self.access.is_owner():
+            return None
+        info = self.access.check()
+        if not info["ok"] or info.get("mode") != "code":
+            return None
+        return str(self.cfg.get("server_url_override") or "").strip().rstrip("/") or self.access.server_url()
+
     def start(self):
         if not self.access.check()["ok"]:
+            return
+        feed_url = self.subscriber_server()
+        if feed_url:
+            with self.lock:
+                if self.worker and self.worker.is_alive():
+                    return
+                self.status.update(running=True, starting=True, error=None)
+                self.worker = FeedWorker(dict(self.cfg), self.emit, feed_url, self.cfg.get("access_code", ""),
+                                         self.access.machine, shown={d["key"] for d in self.deals if d.get("key")},
+                                         holdings=[dict(p) for p in self.purchases if p.get("status") != "sold"])
+                self.worker.start()
+            self.add_log("Трекер запущен — находки с сервера владельца")
             return
         with self.lock:
             if self.worker and self.worker.is_alive():
@@ -1336,7 +1892,8 @@ class State:
             holdings = [dict(p) for p in self.purchases if p.get("status") != "sold"]
             self.worker = Worker(self.api_cfg(), self.emit, self.api_factory,
                                  shown={d["key"] for d in self.deals if d.get("key")},
-                                 tracked=tracked, holdings=holdings)
+                                 tracked=tracked, holdings=holdings, serving=self.serving(),
+                                 shared=self.journal_once)
             self.worker.start()
         self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else "")
                      + (" — по ключу API владельца из кода доступа" if self.worker.cfg.get("shared_api") else ""))
@@ -1363,15 +1920,48 @@ class State:
             self.add_log("Останавливаю…")
 
     def restart_if_running(self):
+        """Перезапуск проверки (сменили ключи API). Несколько изменений подряд — один перезапуск,
+        через RESTART_DELAY секунд после последнего. Если проверку за это время остановили — не запускаем."""
         w = self.worker
         if not (w and w.is_alive()):
             return
+        with self.lock:
+            self._restart_due = time.time() + RESTART_DELAY
+            if self._restarting:
+                return
+            self._restarting = True
 
         def go():
-            w.stop()
-            w.join(timeout=90)
-            self.start()
+            try:
+                while True:
+                    with self.lock:
+                        left = self._restart_due - time.time()
+                    if left <= 0:
+                        break
+                    time.sleep(min(left, 0.5))
+                w = self.worker
+                if not (w and w.is_alive()) or w.stop_event.is_set():
+                    return              # остановили вручную или проверка завершилась сама
+                w.stop()
+                w.join(timeout=180)
+                if w.is_alive():
+                    self.add_log("Проверка не остановилась за 3 минуты — запусти её заново кнопкой")
+                    return
+                self.start()
+            finally:
+                with self.lock:
+                    self._restarting = False
         threading.Thread(target=go, daemon=True).start()
+
+    def reconfigure_worker(self, wake=True):
+        """Новые настройки работающей проверке — без перезапуска."""
+        w = self.worker
+        if not (w and w.is_alive()) or w.stop_event.is_set():
+            return
+        if isinstance(w, FeedWorker):
+            w.reconfigure(dict(self.cfg), wake=wake)
+        else:
+            w.reconfigure(self.api_cfg(), serving=self.serving(), wake=wake)
 
     def snapshot(self):
         with self.lock:
@@ -1379,6 +1969,19 @@ class State:
             demo = cfg.get("base_url", "").rstrip("/") == DEMO_URL
             has_keys = bool(cfg.get("client_id") and cfg.get("client_secret"))
         shared = bool(not demo and not has_keys and not cfg.get("app_token") and self.access.shared_api())
+        feed_url = self.subscriber_server()
+        server = None
+        if self.access.is_owner() and OWNER_PUBLIC_KEY:
+            now = time.time()
+            with self.lock:
+                online = sum(1 for x in self.subscribers.values() if now - x["last"] < 120)
+                feed_n = sum(1 for r in self.feed.values() if not r.get("gone"))
+            server = {"role": "owner", "enabled": bool(cfg.get("server_enabled")), "running": bool(self.feed_server),
+                      "port": int(cfg.get("server_port") or FEED_PORT), "url": cfg.get("server_url") or "",
+                      "error": self.feed_error, "online": online, "feed": feed_n}
+        elif feed_url:
+            server = {"role": "subscriber", "url": feed_url}
+        access, update = self.access.snapshot(), self.updater.snapshot()   # до self.lock: им самим нужен этот замок
         with self.lock:
             return {
                 "status": dict(self.status),
@@ -1386,15 +1989,16 @@ class State:
                 "log": list(self.log)[-200:],
                 "settings": cfg,
                 # для демо ключи встроены, поэтому демо-режим тоже считается «настроенным»
-                "configured": bool(demo or has_keys or cfg.get("app_token") or shared),
+                "configured": bool(demo or has_keys or cfg.get("app_token") or shared or feed_url),
+                "server": server,
                 "shared_api": shared,
                 "has_keys": has_keys,
                 "demo": demo,
                 "artifacts": self.artifacts,
                 "version": APP_VERSION,
                 "data_dir": DATA_DIR,
-                "update": self.updater.snapshot(),
-                "access": self.access.snapshot(),
+                "update": update,
+                "access": access,
                 "purchases": [dict(p) for p in self.purchases],
                 "cat_counts": dict(self.cat_counts),
                 "auto_cats": eng.auto_categories(cfg),
@@ -1438,6 +2042,17 @@ class State:
                 cfg["rare_min_profit"] = max(0.0, float(data["rare_min_profit"]))
             if "rare_items" in data:
                 cfg["rare_items"] = list(dict.fromkeys(str(x).strip() for x in data["rare_items"] if str(x).strip()))[:200]
+            if "server_enabled" in data:
+                cfg["server_enabled"] = bool(data["server_enabled"])
+            if "server_url" in data:
+                url = str(data["server_url"] or "").strip().rstrip("/")
+                if url and not re.match(r"^https?://[^\s/]+$", url):
+                    return False, "Публичный адрес пишется так: https://имя-пк.xxxx.ts.net"
+                cfg["server_url"] = url
+            if "server_port" in data:
+                cfg["server_port"] = min(65000, max(1024, int(float(data["server_port"]))))
+            if "server_url_override" in data:
+                cfg["server_url_override"] = str(data["server_url_override"] or "").strip().rstrip("/")
             if "notify_min_chance" in data:
                 cfg["notify_min_chance"] = min(90.0, max(0.0, float(data["notify_min_chance"])))
             if "update_repo" in data:
@@ -1449,13 +2064,22 @@ class State:
             if "demo" in data:
                 cfg["base_url"] = DEMO_URL if data["demo"] else PROD_URL
             if "watch" in data:
-                cfg["watch"] = list(dict.fromkeys(str(w).strip() for w in data["watch"] if str(w).strip()))[:150]
+                watch = list(dict.fromkeys(str(w).strip() for w in data["watch"] if str(w).strip()))
+                if len(watch) > WATCH_MAX:   # раньше лишнее молча отрезалось — и «Добавлено» врало
+                    return False, (f"В списке не больше {WATCH_MAX} предметов. Для целых групп включи "
+                                   "«Категории целиком» — они в этот предел не входят.")
+                cfg["watch"] = watch
         except (TypeError, ValueError):
             return False, "Проверь числа в настройках — там должны быть только цифры."
         with self.lock:
-            self.cfg = cfg
+            old, self.cfg = self.cfg, cfg
         save_settings(cfg)
-        self.restart_if_running()
+        self.sync_feed_server()
+        changed = {k for k in set(old) | set(cfg) if old.get(k) != cfg.get(k)}
+        if changed & set(RESTART_KEYS):
+            self.restart_if_running()       # другие ключи API — нужен новый вход
+        elif changed:                       # остальное — на ходу, без перезапуска
+            self.reconfigure_worker(wake=bool(changed - set(QUIET_KEYS)))
         return True, "Сохранено"
 
     def suggest(self, q):
@@ -1570,8 +2194,19 @@ def make_handler(state, token):
                 own = {"id": state.cfg.get("client_id"), "secret": state.cfg.get("client_secret"),
                        "token": state.cfg.get("app_token")}
                 ok, msg, code = state.access.issue(data.get("name"), data.get("machine"), data.get("days"),
-                                                   share=bool(data.get("share")), creds=own)
+                                                   share=bool(data.get("share")), creds=own,
+                                                   server=state.cfg.get("server_url") if state.serving() else None)
                 return self.send_json({"ok": ok, "message": msg, "code": code})
+            if path == "/api/access/renew":
+                ok, msg, code = state.access.renew(data.get("id"), data.get("days") or 30,
+                                                   server=state.cfg.get("server_url") if state.serving() else None)
+                return self.send_json({"ok": ok, "message": msg, "code": code})
+            if path == "/api/access/block":
+                ok, msg = state.access.set_blocked(data.get("id"), bool(data.get("blocked")))
+                return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/server/test":
+                ok, msg = state.test_public_url()
+                return self.send_json({"ok": ok, "message": msg})
             if path == "/api/access/refresh":
                 threading.Thread(target=state.access.refresh_revoked, kwargs={"force": True}, daemon=True).start()
                 return self.send_json({"ok": True})
@@ -1582,7 +2217,8 @@ def make_handler(state, token):
                 if not state.snapshot()["configured"]:
                     return self.send_json({"ok": False, "message": "Сначала вставь Client ID и Client Secret "
                                                                    "в настройках — или включи демо-режим."})
-                if not state.cfg.get("watch") and not state.cfg.get("all_artifacts"):
+                if (not state.cfg.get("watch") and not eng.auto_categories(state.cfg)
+                        and not state.subscriber_server()):
                     return self.send_json({"ok": False, "message": "Добавь предметы во вкладке «Предметы» "
                                                                    "или включи «Все артефакты»."})
                 state.start()
@@ -1805,6 +2441,14 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12px/1.4 ui-
 .lock textarea.field.code{margin:10px 0 12px}
 .issued{display:grid;grid-template-columns:1fr auto auto;gap:4px 14px;font-size:13px;margin-top:10px}
 .issued span{padding:6px 0;border-bottom:1px solid var(--line)}
+.issued.subs{grid-template-columns:minmax(0,1fr) auto auto auto;align-items:center}
+.issued .act{display:flex;gap:6px;justify-content:flex-end}
+.dotx{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim);margin-right:6px}
+.dotx.on{background:var(--good)}
+.howto ol{margin:8px 0 6px 18px;padding:0}
+.howto li{margin:4px 0}
+.howto code,#srvStatus code{background:var(--raise);padding:1px 6px;border-radius:5px;font-size:12px}
+.howto summary{cursor:pointer;color:var(--text);font-weight:550}
 .row.flash{animation:flash 1.8s ease}
 @keyframes flash{0%,55%{background:rgba(232,184,74,.16)}100%{background:transparent}}
 
@@ -2032,6 +2676,7 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
         <div class="col">
         <div class="card">
           <h3>Мой список <span class="muted" id="watchCnt" style="font-weight:500"></span></h3>
+          <div class="note ok" id="subItemsNote" hidden style="margin-top:6px">Подписка: список и категории — это фильтр. Показываю находки сервера только по ним; пусто — все находки.</div>
           <div class="chips" id="chips"></div>
           <div class="muted" id="chipsEmpty" style="margin-top:12px">Список пуст.</div>
         </div>
@@ -2085,6 +2730,7 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
           <h3>Доступ к API</h3>
           <div class="sub">Ключи выдаёт @stalzone_api_bot после одобрения заявки.</div>
           <div class="note ok" id="sharedNote" hidden>Работает ключ API владельца из кода доступа — свои ключи не нужны. Впишешь свои — будут использоваться они.</div>
+          <div class="note ok" id="feedNote" hidden>Подписка: находки приходят с сервера владельца — ключи EXBO не нужны.</div>
           <div class="row" id="demoRow"><label>Демо-режим<small>Тестовые данные EXBO, ключи не нужны</small></label><label class="switch"><input type="checkbox" id="sDemo"><i></i></label></div>
           <div class="row wide"><label>Client ID</label><input class="field" id="sClientId" autocomplete="off"></div>
           <div class="row wide"><label>Client Secret</label><input class="field" id="sClientSecret" type="password" autocomplete="off"></div>
@@ -2167,6 +2813,22 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
         </div>
         </div>
         <div class="col">
+        <div class="card" id="serverCard" hidden>
+          <h3>Сервер для подписчиков</h3>
+          <div class="sub">Твоя программа ищет находки твоим ключом EXBO и раздаёт их подписчикам — им ключи не нужны. Пока сервер работает, компьютер должен быть включён.</div>
+          <div class="row"><label>Раздавать находки подписчикам</label><label class="switch"><input type="checkbox" id="srvOn"><i></i></label></div>
+          <div class="row wide"><label>Публичный адрес<small>его даёт Tailscale Funnel, например https://мой-пк.xxxx.ts.net — он вписывается в новые коды</small></label><input class="field" id="srvUrl" placeholder="https://…ts.net" autocomplete="off"></div>
+          <div class="note" id="srvStatus"></div>
+          <div class="linkrow"><button class="btn primary" id="srvSave">Сохранить</button><button class="btn" id="srvTest">Проверить адрес</button></div>
+          <details class="note howto"><summary>Как открыть сервер в интернет — бесплатно, без настройки роутера</summary>
+            <ol>
+              <li>Скачай и установи Tailscale: tailscale.com/download → Windows. Войди через Google или Microsoft.</li>
+              <li>Открой «Командную строку» (Win+R → <b>cmd</b> → Enter) и выполни: <code id="funnelCmd">tailscale funnel --bg 8790</code></li>
+              <li>Если попросит — открой ссылку из окна и подтверди включение Funnel.</li>
+              <li>Команда покажет адрес вида https://имя.xxxx.ts.net — вставь его выше, нажми «Сохранить» и «Проверить адрес».</li>
+            </ol>
+            Флаг --bg оставляет сервер открытым и после перезагрузки. Закрыть: <code>tailscale funnel --https=443 off</code></details>
+        </div>
         <div class="card" id="ownerIssue" hidden>
           <h3>Выдать доступ</h3>
           <div class="sub">Друг запускает программу, жмёт «Копировать код запроса» и присылает тебе. С галочкой «Вложить мой ключ API» ему не нужны свои ключи EXBO.</div>
@@ -2181,10 +2843,11 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
           </div>
         </div>
         <div class="card" id="ownerList" hidden>
-          <h3>Выданные коды</h3>
-          <div class="sub">Отозвать доступ: впиши имя или номер кода отдельной строкой в файл revoked.txt на GitHub. Программа у друга заметит это в течение трёх часов и остановится.</div>
-          <div class="issued" id="issuedList"></div>
+          <h3>Подписчики</h3>
+          <div class="sub">«+30 дн.» создаёт новый код с продлением от конца оплаченного срока и копирует его — отправь подписчику. «Отключить» сразу закрывает ему находки с сервера.</div>
+          <div class="issued subs" id="issuedList"></div>
           <div class="linkrow"><button class="btn" data-open="revoked_new">Создать revoked.txt</button><button class="btn" data-open="revoked_edit">Изменить revoked.txt</button></div>
+          <div class="muted" style="font-size:12px;margin-top:6px">revoked.txt — для тех, кто пользуется программой без сервера: впиши имя или номер кода, программа у него закроется в течение трёх часов.</div>
         </div>
         </div>
       </div>
@@ -2488,6 +3151,7 @@ function chanceBlock(c) {
       <span>Конкуренты рядом по цене</span><span>${c.comp}</span>
       ${c.supply !== null && c.supply !== undefined ? `<span title="Похожие лоты до +30% к цене и за сколько дней рынок их разберёт">Запас на аукционе</span><span>${c.supply} лот. · ${c.supply_days < 1 ? "< суток" : "≈ " + n1(c.supply_days) + " дн."}</span>
       <span>Ликвидность</span><span>${c.supply_days < 1 ? "высокая" : c.supply_days < 5 ? "средняя" : "низкая"}${c.liq_f < 0.99 ? " · ×" + c.liq_f.toFixed(2) : ""}</span>` : ""}
+      <span title="Не каждый покупатель берёт именно твой лот: ставки, другое количество, тебя перебивают">Строгая поправка</span><span>×0.60</span>
       ${c.confidence !== undefined && c.confidence < 0.9 ? `<span>Мало сделок</span><span>×${c.confidence.toFixed(2)}</span>` : ""}
       ${c.trend_f !== 1 ? `<span>Рынок ${c.trend_f < 1 ? "падает" : "растёт"}</span><span>×${c.trend_f.toFixed(2)}</span>` : ""}
       ${c.stale_f !== 1 ? `<span>Лот давно не покупают</span><span>×${c.stale_f.toFixed(2)}</span>` : ""}
@@ -2803,6 +3467,19 @@ $("isBtn").onclick = async () => {
   refresh();
 };
 $("isCopy").onclick = () => copyText($("isCode").value, "Код скопирован — отправь его другу");
+$("srvSave").onclick = async () => {
+  const r = await api("/api/settings", {server_enabled: $("srvOn").checked, server_url: $("srvUrl").value});
+  toast(r.ok ? ($("srvOn").checked ? "Сервер включён" : "Сервер выключен") : r.message, !r.ok); srvDirty = false; refresh();
+};
+$("srvTest").onclick = async () => { toast("Проверяю адрес из интернета…"); const r = await api("/api/server/test", {}); toast(r.message, !r.ok); };
+$("srvOn").onchange = () => { srvDirty = true; };
+$("srvUrl").oninput = () => { srvDirty = true; };
+let srvDirty = false;
+function onlineText(t) {
+  if (!t) return `<span class="dotx"></span><span class="muted">не подключался</span>`;
+  const m = (S.now - t) / 60;
+  return m < 2 ? `<span class="dotx on"></span>онлайн` : `<span class="dotx"></span><span class="muted">${ago(new Date(t * 1000).toISOString(), S.now)}</span>`;
+}
 $("isCopyLink").onclick = () => copyText(RELEASES_URL, "Ссылка на программу скопирована");
 function renderAccess() {
   const a = S.access || {};
@@ -2812,7 +3489,8 @@ function renderAccess() {
   $("accMachine").textContent = a.machine || "—";
   $("accStatus").textContent = !a.required ? "Закрытый доступ ещё не включён — программа открыта всем."
     : a.mode === "owner" ? "Ты владелец программы — код доступа тебе не нужен."
-    : a.ok ? `Доступ открыт: ${a.name}, срок — ${a.expires_text}. Номер кода: ${a.code_id}.` + (a.shared_api ? " Ключ API — владельца (вложен в код): свои ключи не нужны." : "") : (a.reason || "");
+    : a.ok ? (a.server ? `Подписка: ${a.name}, оплачено до ${a.expires_text}. Находки приходят с сервера владельца — ключи EXBO не нужны.`
+      : `Доступ открыт: ${a.name}, срок — ${a.expires_text}. Номер кода: ${a.code_id}.` + (a.shared_api ? " Ключ API — владельца (вложен в код): свои ключи не нужны." : "")) : (a.reason || "");
   $("accCodeBox").hidden = !a.required || a.mode === "owner";
   const setup = !a.embedded;                     // ключ ещё не вписан в программу
   $("ownerSetup").hidden = !(setup || a.owner);
@@ -2824,13 +3502,33 @@ function renderAccess() {
     : "Закрытый доступ включён. Ты владелец: коды выдаёшь в карточке «Выдать доступ».";
   $("osWarn").hidden = !a.has_owner_key || !(setup || a.owner);
   const owner = a.owner && a.embedded;
-  $("ownerIssue").hidden = !owner; $("ownerList").hidden = !owner;
+  $("ownerIssue").hidden = !owner; $("ownerList").hidden = !owner; $("serverCard").hidden = !owner;
+  const sv = S.server || {};
   if (owner) {
-    const list = a.issued || [];
-    $("issuedList").innerHTML = list.length ? ["<span class='muted'>Кому</span><span class='muted'>До</span><span class='muted'>№ кода</span>"]
-      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${esc(d.machine)}</span>${d.shared ? ` <span class="tag fate" title="С твоим ключом API">ключ API</span>` : ""}</span><span>${esc(d.expires_text)}</span><span class="num">${esc(d.id)}</span>`)).join("")
+    if (!srvDirty) { $("srvOn").checked = !!sv.enabled; $("srvUrl").value = sv.url || ""; }
+    $("funnelCmd").textContent = "tailscale funnel --bg " + (sv.port || 8790);
+    $("srvStatus").innerHTML = !sv.enabled ? "Выключен. Подписчики не получают находки."
+      : sv.running ? `Работает на этом компьютере (порт ${sv.port}). Подписчиков онлайн: <b>${sv.online}</b> · в ленте находок: <b>${sv.feed}</b>`
+        + (S.status.running ? "" : `<br><b style="color:var(--accent)">Нажми «Запустить» — без проверки аукциона лента пустая.</b>`)
+        + (sv.url ? "" : `<br><b style="color:var(--accent)">Впиши публичный адрес — без него подписчики не найдут сервер.</b>`)
+      : `Не запустился: ${esc(sv.error || "")}`;
+    const list = (a.issued || []).filter((d) => !d.renewed || d.blocked);
+    $("issuedList").innerHTML = list.length ? ["<span class='muted'>Кто</span><span class='muted'>Оплачено до</span><span class='muted'>Сейчас</span><span></span>"]
+      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${esc(d.machine)} · № ${esc(d.id)}</span>${d.shared ? ` <span class="tag fate" title="С твоим ключом API">ключ API</span>` : ""}${d.blocked ? ` <span class="tag fate" style="color:var(--bad)">отключён</span>` : ""}</span>`
+        + `<span style="${d.expired ? "color:var(--bad)" : ""}">${esc(d.expires_text)}</span><span>${onlineText(d.last_seen)}</span>`
+        + `<span class="act"><button class="btn sm" data-renew="${esc(d.id)}">+30 дн.</button><button class="btn sm ghost" data-block="${esc(d.id)}" data-on="${d.blocked ? 0 : 1}">${d.blocked ? "Включить" : "Отключить"}</button></span>`)).join("")
       : "<span class='muted' style='grid-column:1/-1'>Пока никому не выдавал.</span>";
+    $("issuedList").querySelectorAll("[data-renew]").forEach((b) => b.onclick = async () => {
+      const r = await api("/api/access/renew", {id: b.dataset.renew, days: 30});
+      if (r.ok) { copyText(r.code, r.message); $("isCode").value = r.code; $("isResult").hidden = false; } else toast(r.message, true);
+      refresh();
+    });
+    $("issuedList").querySelectorAll("[data-block]").forEach((b) => b.onclick = async () => {
+      const r = await api("/api/access/block", {id: b.dataset.block, blocked: b.dataset.on === "1"}); toast(r.message, !r.ok); refresh();
+    });
   }
+  const sub = sv.role === "subscriber";
+  $("feedNote").hidden = !sub; $("subItemsNote").hidden = !sub;
 }
 
 // ---------- состояние ----------
@@ -2850,9 +3548,15 @@ function renderStatus() {
   const active = S.deals.filter((d) => !d.gone && (!d.ends || Date.parse(d.ends) / 1000 > S.now));
   $("kFound").textContent = st.found_total; $("kFoundS").textContent = active.length + " " + plural(active.length, ["активный", "активных", "активных"]) + " сейчас";
   $("kProfit").textContent = rub(active.reduce((s, d) => s + d.profit, 0));
-  if (st.delay !== null && st.delay !== undefined) {
+  if (S.server && S.server.role === "subscriber") {
+    const sv = st.server;
+    $("kDelay").parentElement.querySelector(".l").textContent = "Сервер владельца";
+    $("kDelay").textContent = !sv ? "—" : sv.ok ? "на связи" : "нет связи";
+    $("kDelay").style.color = !sv ? "" : sv.ok ? "var(--good)" : "var(--bad)";
+    $("kDelayS").textContent = !sv ? "подключусь после «Запустить»" : sv.ok ? ("проверка у сервера " + (sv.server_pass ? ago(new Date(sv.server_pass * 1000).toISOString(), S.now) : "—")) : (sv.error || "");
+  } else if (st.delay !== null && st.delay !== undefined) {
     $("kDelay").textContent = "~" + Math.round(st.delay) + " мин";
-    $("kDelayS").textContent = `медиана по ${st.delay_n} нов. ${plural(st.delay_n, ["лоту", "лотам", "лотам"])} · самый быстрый ${Math.round(st.delay_min)} мин`;
+    $("kDelayS").textContent = `новый лот виден в API через столько · по ${st.delay_n} ${plural(st.delay_n, ["лоту", "лотам", "лотам"])}, самый быстрый ${Math.round(st.delay_min)} мин`;
   }
   if (st.progress) {
     $("kPass").textContent = st.progress.done + " / " + st.progress.total; $("kPassS").textContent = "идёт проверка";
@@ -2885,6 +3589,7 @@ async function refresh() {
   fresh.forEach((d) => knownIds.add(d.id));
   const loud = fresh.filter((d) => d.notify !== false);  // о старых находках из прошлых запусков — тихо
   if (!firstLoad && loud.length) { beep(loud.some((d) => d.rare)); loud.slice(0, 3).forEach(notifyDesktop); }
+  if (firstLoad && S.server && S.server.role === "owner" && S.server.enabled) $("isShare").checked = false;
   if (firstLoad || !formDirty) fillForm();
   firstLoad = false;
   if (!CAT) loadCatalog();

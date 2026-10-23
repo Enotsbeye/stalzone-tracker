@@ -115,6 +115,9 @@ LONG_DAYS = 7                # если за history_hours сделок мало
 FETCH_THREADS = 6            # столько запросов к API могут идти одновременно
 FETCH_AHEAD = 12             # на сколько предметов вперёд заранее запрашивать данные
 RATE_SHARE = 0.85            # какую долю лимита API тратить (остальное — запас)
+SHARE_ON, SHARE_OFF = 0.1, 0.05   # чужих запросов за минуту больше 10% лимита — делим ключ, меньше 5% — нет
+SHARE_SETTLE = 5             # через столько секунд после начала новой минуты лимита считаем прошлую
+SHARE_MIN_SPAN = 40          # минута в счёт, только если мы сами работали в ней столько секунд
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEEN_FILE = os.path.join(HERE, "seen_lots.json")
 TOKEN_FILE = os.path.join(HERE, "api_token.json")  # старые версии хранили тут токен — удаляем
@@ -366,9 +369,7 @@ class Api:
         self._resets = []           # моменты сброса лимита из ответов API — по ним узнаём его окно
         self.paced = False
         self.base_gap = None        # темп, когда ключ API использует только эта программа
-        self._mine = deque()        # когда эта программа отправляла запросы — чтобы видеть чужие
-        self.sharing = False        # ключ сейчас использует ещё кто-то (друг с кодом доступа)
-        self._votes = 0             # сколько ответов подряд говорят «делить» (+) или «не делить» (−)
+        self._init_share()
         self.bearer = None          # токен от EXBO — только в памяти
         self.oauth_tried = False
         remove_old_token_file()
@@ -451,9 +452,6 @@ class Api:
             now = time.time()
             slot = max(now, self._next_slot)
             self._next_slot = slot + self.min_gap
-            self._mine.append(slot)
-            while self._mine and self._mine[0] < now - 120:
-                self._mine.popleft()
         if slot > now:
             time.sleep(slot - now)
 
@@ -485,6 +483,7 @@ class Api:
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
+            self._share_pace(r)          # каждый ответ, и с ошибкой: сервер его тоже посчитал
             self._respect_ratelimit(r)
             if r.status_code in (401, 403):
                 if self._try_oauth(headers, r.status_code):
@@ -503,7 +502,6 @@ class Api:
                 raise ApiError(r.status_code, f"API ответил {r.status_code}" + (f" ({why})" if why else "")
                                + f" на запрос {path}")
             self._adapt_pace(r)
-            self._share_pace(r)
             try:
                 return r.json()
             except ValueError:
@@ -536,39 +534,68 @@ class Api:
         log.info("Лимит API: %s запросов в минуту — проверяю быстрее (запрос раз в %.2f с)",
                  limit, self.min_gap)
 
+    def _init_share(self):
+        self.sharing = False        # ключ сейчас использует ещё кто-то (друг с кодом доступа)
+        self._win = {}              # окна лимита: момент сброса → счётчик сервера и наши ответы в этом окне
+        self._win_closed = 0.0      # минуты с моментом сброса не позже этого уже посчитаны
+        self._others = deque(maxlen=4)   # чужих запросов в последних посчитанных окнах
+
     def _share_pace(self, r, now=None):
         """Один ключ API — несколько программ (ты и друзья с кодом доступа). Лимит у ключа общий.
-        По остатку лимита в ответе видно, сколько запросов за эту минуту сделали все вместе; минус свои —
-        чужие. Пока кто-то ещё работает, берём не больше половины того, что осталось от 85% лимита,
-        — так несколько программ сами делят лимит поровну. Чужих запросов нет — снова весь темп."""
+
+        Сервер сам пишет в каждом ответе, к какой минуте лимита он отнёс запрос (момент сброса),
+        и сколько запросов в этой минуте уже было (лимит − остаток). Наших ответов с тем же моментом
+        сброса — столько наших запросов в этой минуте. Разница — чужие. Считаем только по
+        закончившимся минутам, где мы сами работали почти всю минуту: тогда ни часы компьютера,
+        ни задержка сети на подсчёт не влияют (раньше из-за них программа «делила ключ» сама с собой).
+        Делим лимит, когда чужих больше 10% лимита две минуты подряд; перестаём — когда меньше 5%
+        две минуты подряд. Пока делим, берём не больше половины того, что остаётся от 85% лимита,
+        и меняем темп плавно — так несколько программ сходятся к поровну, а не раскачивают друг друга."""
         if not self.paced:
             return
         try:
             limit = int(float(r.headers.get("x-ratelimit-limit")))
             remaining = int(float(r.headers.get("x-ratelimit-remaining")))
             reset = float(r.headers.get("x-ratelimit-reset"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             return
         if reset > 1e12:
             reset /= 1000
-        now = now or time.time()
-        start = reset - 60                   # окно лимита — минута
-        if not start - 5 <= now <= reset + 5:
-            return
+        now = time.monotonic() if now is None else now
         with self._lock:
-            mine = sum(1 for t in self._mine if t >= start)
-            elapsed = max(10.0, now - start)
-            others = max(0, (limit - remaining) - mine) / elapsed * 60      # чужих запросов в минуту
-            budget = limit * RATE_SHARE
+            if reset < self._win_closed + 2:
+                return                          # запоздалый ответ из уже посчитанной минуты
+            # одна минута — один момент сброса (± пару секунд, если сервер его округляет по-разному)
+            key = next((k for k in self._win if abs(k - reset) < 2), reset)
+            w = self._win.setdefault(key, {"used": 0, "mine": 0, "first": now, "last": now})
+            w["used"] = max(w["used"], limit - remaining)
+            w["mine"] += 1
+            w["last"] = now
+            newest = max(self._win)
+            if now - self._win[newest]["first"] < SHARE_SETTLE:
+                return                          # ответы прошлой минуты могут ещё идти
+            closed = sorted(k for k in self._win if k < newest)
+            if not closed:
+                return
+            for k in closed:
+                st = self._win.pop(k)
+                if st["mine"] >= 20 and st["last"] - st["first"] >= SHARE_MIN_SPAN:
+                    self._others.append(max(0, st["used"] - st["mine"]))
+            self._win_closed = closed[-1]
             was = self.sharing
-            # решаем не по одному ответу: 3 подряд — чтобы случайный сдвиг счётчика не замедлял зря
-            busy = others > limit * 0.1
-            self._votes = (max(self._votes, 0) + 1) if busy else (min(self._votes, 0) - 1)
-            if self._votes >= 3:
-                self.sharing = True
-            elif self._votes <= -3:
-                self.sharing = False
-            target = max(limit * 0.1, min(budget - others, budget / 2)) if self.sharing else budget
+            last = list(self._others)[-2:]
+            if len(last) == 2:
+                if all(o > limit * SHARE_ON for o in last):
+                    self.sharing = True
+                elif all(o < limit * SHARE_OFF for o in last):
+                    self.sharing = False
+            others = last[-1] if last else 0
+            budget = limit * RATE_SHARE
+            if self.sharing:
+                want = max(limit * 0.1, min(budget - others, budget / 2))
+                target = (60 / self.min_gap + want) / 2
+            else:
+                target = budget
             self.min_gap = max(self.base_gap or 0.15, 60 / target)
         if self.sharing != was:
             if self.sharing:
@@ -770,31 +797,44 @@ def _per_what(total):
     return "за весь лот" if total else "за штуку"
 
 
+_FORMAT_SAID = set()   # что про формат цен уже писали в журнал (раз за запуск программы)
+
+
 class PriceFormat:
-    """Помнит, за что API отдаёт цены. По каждому предмету решает по его же данным;
-    если по предмету не ясно — берёт вывод, сделанный по другим предметам;
-    пока выводов нет — считает «за весь лот»."""
+    """За что API отдаёт цены. По документации EXBO — за весь лот, и в истории сделок, и в лотах;
+    так и считаем для всех предметов сразу (API не меняет формат от предмета к предмету).
+
+    По данным каждого предмета формат проверяется (наклон цены от количества), но один предмет его
+    не меняет: у оптовых товаров одиночные лоты стоят за штуку в разы дороже больших (полимеры:
+    ~11 500 ₽ за 1 шт и ~1 300 ₽/шт в пачке по 50), и наклон выходит как «за штуку», хотя цены — за лот.
+    Раньше из-за этого у таких предметов цены считались неверно. Теперь формат переключается, только
+    если «за штуку» вышло у большинства предметов (не меньше 3 и 80% ясных выводов)."""
 
     WHERE = {"history": "в истории сделок", "lots": "в лотах"}
+    SWITCH_MIN, SWITCH_SHARE = 3, 0.8
 
     def __init__(self):
-        self.known = {}      # "history" / "lots" -> (за лот?, по какому предмету решили)
-        self.warned = set()
+        self.votes = {k: {} for k in self.WHERE}      # вид → {предмет: за лот?}
+        self.current = {k: True for k in self.WHERE}
 
     def total(self, kind, records, key, name):
         found = detect_total(records, key)
-        known = self.known.get(kind)
         if found is None:
-            return known[0] if known else True
-        if known is None:
-            self.known[kind] = (found, name)
-            log.info("Формат цен %s: %s (определил по «%s»)", self.WHERE[kind], _per_what(found), name)
-        elif known[0] != found and kind not in self.warned:
-            self.warned.add(kind)
-            log.warning("⚠ Формат цен %s по «%s» вышел «%s», а раньше по «%s» — «%s». Для каждого "
-                        "предмета беру его собственный вывод. Пришли этот журнал.",
-                        self.WHERE[kind], name, _per_what(found), known[1], _per_what(known[0]))
-        return found
+            return self.current[kind]
+        votes = self.votes[kind]
+        votes[name] = found
+        per_unit = sum(1 for v in votes.values() if not v)
+        verdict = not (per_unit >= self.SWITCH_MIN and per_unit >= self.SWITCH_SHARE * len(votes))
+        if verdict != self.current[kind]:
+            self.current[kind] = verdict
+            log.warning("⚠ Формат цен %s: %s — так вышло у %d из %d предметов. Пришли этот журнал.",
+                        self.WHERE[kind], _per_what(verdict),
+                        len(votes) - per_unit if verdict else per_unit, len(votes))
+        elif verdict and found and (kind, verdict) not in _FORMAT_SAID:
+            _FORMAT_SAID.add((kind, verdict))
+            log.info("Формат цен %s: %s (как в документации EXBO, сходится с «%s»)",
+                     self.WHERE[kind], _per_what(verdict), name)
+        return self.current[kind]
 
 
 def history_window(sales, hours, now=None):
@@ -970,8 +1010,9 @@ def competitors(lot, lots, price, total=True, spread=0.05):
 
 
 CHANCE_HOURS = 24   # шанс продать за сутки
-CHANCE_CAP = 0.95   # наверняка не бывает: API не знает, сколько людей хотят купить
-OBSERVED_TRUST = 15  # после стольких своих наблюдений лотов формула и наблюдения весят поровну
+CHANCE_CAP = 0.9    # наверняка не бывает: API не знает, сколько людей хотят купить
+OBSERVED_TRUST = 10  # после стольких своих наблюдений лотов формула и наблюдения весят поровну
+VISIBILITY = 0.6     # не каждый покупатель берёт самый дешёвый лот: ставки, другое количество, перебивают цену
 
 
 def poisson_at_least(lam, k):
@@ -1007,13 +1048,15 @@ def liquidity_label(days):
 def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, hours=CHANCE_HOURS,
                 supply=None, observed=None):
     """Примерный шанс продать лот за hours часов по цене price за штуку. Своя формула, не знание.
-    Покупатели приходят случайно (пуассоновский поток) с частотой прошлых сделок этой корзины, и она
-      × уверенность: при малом числе сделок частота ненадёжна — n/(n+2) (5 сделок — ×0,71),
+    Строгая («сердитая») оценка. Покупатели приходят случайно (пуассоновский поток) с частотой прошлых
+    сделок этой корзины, и она
+      × 0,6 — не каждый покупатель берёт именно твой лот (ставки, другое количество, тебя перебивают),
+      × уверенность: при малом числе сделок частота ненадёжна — n/(n+5) (5 сделок — ×0,5),
       × доля сделок, где платили не меньше price (со сглаживанием: никогда не 0 и не 100%),
-      ÷ (1 + 0,35 × конкурентов почти по той же цене, до +5%),
+      ÷ (1 + 0,5 × конкурентов почти по той же цене, до +5%),
       × ликвидность: за сколько дней рынок разберёт похожие лоты, что уже висят (до +30% к цене);
-        запас больше суток — продавцы перебивают цену друг друга, шанс ниже,
-      × тренд (рынок за сутки упал на 10% — ×0,8) и «давно висит» (лот час никто не купил даже со скидкой).
+        запас больше полусуток — продавцы перебивают цену друг друга, шанс ниже,
+      × тренд (рынок за сутки упал на 10% — ×0,75) и «давно висит» (лот час никто не купил даже со скидкой).
     Чтобы продать amount штук, нужно ~amount / (обычный размер сделки) покупателей.
     observed — (продано за сутки, всего) по лотам, за которыми трекер следил сам: чем их больше,
     тем сильнее итог опирается на них, а не на формулу.
@@ -1023,22 +1066,22 @@ def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, ho
     n = len(pairs)
     window_h = max(float(window_h or 0), 1.0)
     per_day = n / window_h * 24                               # сделок в сутки
-    confidence = n / (n + 2)
+    confidence = n / (n + 5)
     above = sum(1 for unit, _ in pairs if unit >= price * 0.995)
     share = (above + 1) / (n + 2)
     size = max(1.0, statistics.median(a for _, a in pairs))   # обычный размер одной сделки
     need = min(50, max(1, math.ceil(amount / size - 1e-9)))   # сколько покупателей нужно
     comp = int(comp or 0)
-    comp_f = 1 / (1 + 0.35 * min(comp, 20))
+    comp_f = 1 / (1 + 0.5 * min(comp, 20))
     supply_days, liq_f = None, 1.0
     if supply is not None and per_day > 0:
         supply_days = int(supply) / per_day
-        liq_f = 1 / (1 + 0.08 * max(0.0, supply_days - 1))
-    trend_f = 1.0 if trend is None else min(1.2, max(0.5, 1 + float(trend) / 50))
+        liq_f = 1 / (1 + 0.15 * max(0.0, supply_days - 0.5))
+    trend_f = 1.0 if trend is None else min(1.1, max(0.4, 1 + float(trend) / 40))
     stale_f = 1.0
     if age is not None and age > STALE_MINUTES:
-        stale_f = 0.55 if age > 3 * STALE_MINUTES else 0.75
-    rate = per_day * confidence * share * comp_f * liq_f * trend_f * stale_f   # покупателей в сутки для лота
+        stale_f = 0.4 if age > 3 * STALE_MINUTES else 0.6
+    rate = per_day * VISIBILITY * confidence * share * comp_f * liq_f * trend_f * stale_f   # покупателей в сутки
     model = poisson_at_least(rate * hours / 24, need)
     chance, weight, seen = model, 0.0, None
     if observed and observed[1] > 0:
@@ -1189,17 +1232,24 @@ def lot_units(lots, bucket, total_lots):
 
 
 def price_mismatch(market, lots, total_lots):
-    """Во сколько раз (≥5) медиана цены лотов за штуку расходится с рыночной, иначе None.
+    """Во сколько раз (≥5) цена лотов за штуку расходится с рыночной, иначе None.
     Такое расхождение почти наверняка значит, что формат цен понят неверно.
+    Медиана — по штукам, как и рыночная цена: иначе у оптовых товаров (много одиночных лотов,
+    каждый за штуку в разы дороже пачки) медиана по числу лотов ложно кричала бы «формат не тот».
     Проверяем только когда в лотах есть стаки: при amount = 1 формат ни на что не влияет."""
     if not market:
         return None
     b = main_bucket(market)
     m = market[b][0]
-    same, units = lot_units(lots, b, total_lots)
-    if len(units) < 3 or m <= 0 or max(int(_num(lot.get("amount"))) for lot in same) <= 1:
+    same, _ = lot_units(lots, b, total_lots)
+    pairs = []
+    for lot in same:
+        amount, raw = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
+        if raw > 0:
+            pairs.append((raw / amount if total_lots else raw, amount))
+    if len(pairs) < 3 or m <= 0 or max(a for _, a in pairs) <= 1:
         return None
-    ratio = statistics.median(units) / m
+    ratio = weighted_median(pairs) / m
     if ratio >= 5 or ratio <= 0.2:
         return ratio if ratio >= 1 else 1 / ratio
     return None
@@ -1961,8 +2011,22 @@ def selftest():
         assert fmt.total("history", priced(False), "price", "А") is True
         assert fmt.total("history", [{"amount": 1, "price": 5}] * 10, "price", "Б") is True  # не ясно → вывод по «А»
         assert fmt.total("lots", [], "buyoutPrice", "В") is True                             # выводов ещё нет → за лот
+        as_lots = lambda per_unit: [{"amount": r["amount"], "buyoutPrice": r["price"]} for r in priced(per_unit)]
+        # как у полимеров в настоящей базе: одиночные лоты за штуку в разы дороже пачек — формат не меняется
+        assert fmt.total("lots", as_lots(True), "buyoutPrice", "Полимеры") is True
+        assert fmt.total("lots", as_lots(True), "buyoutPrice", "Фрагмент") is True
+        assert fmt.total("lots", as_lots(False), "buyoutPrice", "Морфин") is True
+        fmt2 = PriceFormat()   # а если «за штуку» выходит почти у всех — значит, API и правда так считает
+        assert [fmt2.total("lots", as_lots(True), "buyoutPrice", n) for n in "ХЦЧ"] == [True, True, False]
     finally:
         log.disabled = was_disabled
+    # оптовый товар (настоящие цифры полимеров): сделки в основном пачками по 50 по ~1 300 ₽/шт,
+    # лотов-одиночек по 11 500 ₽ больше всего — это не «формат не тот»
+    poly_sales = ([{"amount": 50, "price": 65000}] * 112 + [{"amount": 10, "price": 20000}] * 42
+                  + [{"amount": 1, "price": 9500}] * 15)
+    poly_lots = ([{"amount": 1, "buyoutPrice": 11500}] * 123 + [{"amount": 10, "buyoutPrice": 19998}] * 53
+                 + [{"amount": 5, "buyoutPrice": 14942}] * 20)
+    assert price_mismatch(market_prices(poly_sales, 5), poly_lots, True) is None
 
     # один и тот же лот в обоих форматах даёт одну и ту же прибыль
     far, soon = iso(now + timedelta(hours=20)), iso(now + timedelta(minutes=30))
@@ -2152,7 +2216,7 @@ def selftest():
     base = sale_chance(100, 1, pairs, 48)
     assert base["chance"] == CHANCE_CAP and base["need"] == 1 and base["hours"] < 3
     rare = sale_chance(100, 1, pairs[:5], 168)       # 5 сделок за неделю
-    assert 0.2 < rare["chance"] < 0.6 < base["chance"] and rare["week"] > rare["chance"]
+    assert 0.1 < rare["chance"] < 0.4 < base["chance"] and rare["week"] > rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, comp=4)["chance"] < rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, trend=-20)["chance"] < rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, age=200)["chance"] < sale_chance(100, 1, pairs[:5], 168, age=90)["chance"]
@@ -2160,7 +2224,7 @@ def selftest():
     assert glut["supply_days"] > 25 and glut["chance"] < rare["chance"] / 2 and liquidity_label(glut["supply_days"]) == "низкая"
     assert sale_chance(100, 1, pairs, 48, supply=3)["liq_f"] == 1.0     # запас меньше суток — не штрафуем
     assert sale_chance(130, 1, [(100.0, 1)] * 20 + [(140.0, 1)] * 5, 48)["share"] == 6 / 27
-    assert sale_chance(1, 1, pairs[:2], 48)["confidence"] == 0.5        # 2 сделки — уверенность 50%
+    assert abs(sale_chance(1, 1, pairs[:2], 48)["confidence"] - 2 / 7) < 1e-12   # 2 сделки — уверенность 29%
     big = sale_chance(100, 50, [(100.0, 5)] * 10, 48)   # 50 шт, а покупают по 5 и 5 раз в сутки
     assert big["need"] == 10 and big["chance"] < 0.2
     assert sale_chance(100, 1, [], 48) is None and chance_label(0.75) == "высокий"
@@ -2205,20 +2269,29 @@ def selftest():
             self.headers = {"x-ratelimit-limit": "400", "x-ratelimit-remaining": str(remaining),
                             "x-ratelimit-reset": str(int(reset * 1000))}
     sh = Api.__new__(Api)
-    sh._lock, sh._mine, sh.sharing, sh.paced, sh._votes = threading.Lock(), deque(), False, True, 0
+    sh._lock, sh.paced = threading.Lock(), True
+    sh._init_share()
     sh.base_gap = sh.min_gap = 60 / (400 * RATE_SHARE)
-    t1 = time.time()
-    sh._mine.extend(t1 - 30 + i * 0.3 for i in range(100))              # мы: 100 запросов за 30 с
-    sh._share_pace(_R(400 - 100, t1 + 30), now=t1)                      # всего 100 — чужих нет
-    assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
-    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)                      # всего 250: чужих 150 за 30 с
-    assert not sh.sharing                                               # один ответ — ещё не повод
-    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)
-    sh._share_pace(_R(400 - 250, t1 + 30), now=t1)
-    assert sh.sharing and sh.min_gap >= 60 / (400 * RATE_SHARE / 2) - 1e-9
+    clock = [1000.0]      # своё время программы: важны только промежутки, часы компьютера не нужны
+
+    def minute(ours, others):
+        """Минута лимита: наши ответы идут всю минуту, чужие запросы сервер считает вперемешку."""
+        reset = 1_790_000_000 + 60 * int(clock[0] / 60 + 1)
+        for i in range(ours):
+            used = min(400, round((i + 1) * (ours + others) / ours))
+            sh._share_pace(_R(400 - used, reset), now=clock[0] + i * 58 / ours)
+        clock[0] += 60
     for _ in range(3):
-        sh._share_pace(_R(400 - 102, t1 + 31), now=t1 + 1)              # друг закрыл программу
+        minute(300, 0)                                                  # одни — чужих нет
     assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
+    minute(250, 150); minute(300, 0); minute(300, 0)                    # одна шумная минута — не повод
+    assert not sh.sharing
+    minute(200, 150); minute(200, 150); minute(200, 150)                # друг работает две минуты подряд
+    assert sh.sharing and sh.min_gap > sh.base_gap
+    minute(170, 5); minute(170, 5); minute(170, 5)                      # друг закрыл программу
+    assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
+    sh._share_pace(_R(10, 1_790_000_000), now=clock[0])                 # запоздалый ответ давней минуты
+    assert not sh.sharing
     # --- категории ---
     assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"
     assert item_category({"data": "/items/other/x.json"}, "Стандартные инструменты") == "tools"
