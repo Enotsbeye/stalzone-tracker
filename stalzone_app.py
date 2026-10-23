@@ -481,8 +481,8 @@ class Updater:
 # владельца (Ed25519). Программа проверяет подпись встроенным открытым ключом — подделать код
 # или перенести его на другой ПК нельзя. Отозвать: вписать имя или номер кода в revoked.txt
 # в открытом репозитории с выпусками.
-# Пока OWNER_PUBLIC_KEY пустой, программа открыта всем — так владелец может создать свой ключ.
-OWNER_PUBLIC_KEY = ""
+# Пустой OWNER_PUBLIC_KEY — программа открыта всем (так владелец создаёт свой ключ).
+OWNER_PUBLIC_KEY = "8jFXVw8KRA87j0EZ51KzGtDkzun5eXuanTy2Q05b_5Y"
 REVOKED_URL = "https://raw.githubusercontent.com/Enotsbeye/stalzone-tracker-releases/main/revoked.txt"
 OWNER_KEY_FILE = os.path.join(DATA_DIR, "owner_key.pem")      # личный ключ — только у владельца
 ISSUED_FILE = os.path.join(DATA_DIR, "issued_codes.json")     # кому владелец выдавал коды
@@ -915,8 +915,11 @@ class Worker(threading.Thread):
             fake = {"amount": h.get("amount", 1), "buyoutPrice": 0, "additional": add}
             resale, floor = eng.resale_price(fake, lot_list, hist, total)
             pairs = eng.deal_pairs(market, add)
+            observed = self.db.lot_outcomes(self.cfg["region"], item_id, eng.grade_of(add)) if self.db else None
             chance = eng.sale_chance(resale, h.get("amount", 1), pairs[0], pairs[1],
-                                     eng.competitors(fake, lot_list, resale, total)) if pairs else None
+                                     eng.competitors(fake, lot_list, resale, total),
+                                     supply=eng.competitors(fake, lot_list, resale, total, spread=0.3),
+                                     observed=observed if observed and observed[1] else None) if pairs else None
             self.emit("holding", {"id": h["id"], "market": resale, "hist": hist, "floor": floor,
                                   "chance": chance, "updated": time.time()})
 
@@ -1173,8 +1176,8 @@ class State:
             self.artifacts = len(eng.load_artifacts(self.cfg["region"]))
             catalog = eng.load_catalog(self.cfg["region"])
             counts = {}
-            for e in catalog:
-                if e["trade"]:
+            for e in catalog:   # в «категориях целиком» — только то, что продаётся и не бартерное
+                if e["trade"] and not e["barter"]:
                     counts[e["cat"]] = counts.get(e["cat"], 0) + 1
             with self.lock:
                 self.catalog, self.meta, self.cat_counts = catalog, {e["id"]: e for e in catalog}, counts
@@ -1680,7 +1683,7 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12px/1.4 ui-
 @keyframes flash{0%,55%{background:rgba(232,184,74,.16)}100%{background:transparent}}
 
 /* боковая карточка сделки */
-.drawer{position:fixed;top:0;right:0;height:100vh;width:380px;background:var(--panel);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .22s ease;padding:22px;overflow:auto;z-index:20;box-shadow:-20px 0 50px rgba(0,0,0,.35)}
+.drawer{position:fixed;top:0;right:0;height:100vh;width:410px;background:var(--panel);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .22s ease;padding:22px;overflow:auto;z-index:20;box-shadow:-20px 0 50px rgba(0,0,0,.35)}
 .drawer.on{transform:none}
 .drawer h2{margin:6px 0 2px;font-size:19px}
 .big{font-size:32px;font-weight:750;color:var(--good);margin:16px 0 2px}
@@ -1779,7 +1782,7 @@ tr.lot.mine td:first-child{box-shadow:inset 3px 0 0 var(--good)}
 .cblock .cv span{font-size:13px;font-weight:550;margin-left:6px}
 .cbar{height:6px;background:var(--line);border-radius:6px;overflow:hidden;margin:9px 0 11px}
 .cbar i{display:block;height:100%;border-radius:6px}
-.kv{display:grid;grid-template-columns:1fr auto;gap:5px 12px;font-size:12.5px}
+.kv{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;font-size:12.5px}
 .kv span:nth-child(odd){color:var(--muted)}
 .kv span:nth-child(even){text-align:right;font-variant-numeric:tabular-nums}
 .buybox{display:flex;gap:8px;align-items:center;margin-top:10px}
@@ -2096,7 +2099,7 @@ const store = { get(k, d) { try { const v = localStorage.getItem(k); return v ==
                 set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
 let CAT = null, CATMAP = {}, CATNAMES = {}, catTab = store.get("catTab", "all"), catLoading = 0;
 let F = Object.assign({cat: "all", chance: 0, profit: "", rare: false, fresh: false}, store.get("filters", {}));
-let bFilter = store.get("bFilter", "open"), sellOpen = null;
+let bFilter = store.get("bFilter", "open"), sellOpen = null, showBarter = store.get("showBarter", false);
 
 async function api(path, body) {
   const opt = { headers: { "X-Token": TOKEN } };
@@ -2150,6 +2153,68 @@ function notifyDesktop(d) {
         { body: (d.kind === "bid" ? "Ставка · " : "Выкуп · ") + d.amount + " шт по " + rub(d.unit) + (d.chance != null ? " · шанс продажи " + Math.round(d.chance * 100) + "%" : "") });
   } catch (e) {}
 }
+
+// ---------- умный поиск ----------
+// понимает опечатки («морфн»), неверную раскладку («vjhaby» → «морфин»), латиницу и кириллицу («мп7» → MP7),
+// слова в любом порядке; точное совпадение и начало названия — выше всего
+const KB_EN = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`", KB_RU = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const KB = {};
+[...KB_EN].forEach((c, i) => { KB[c] = KB_RU[i]; KB[KB_RU[i]] = c; });
+const C2L = {а:"a",б:"b",в:"v",г:"g",д:"d",е:"e",ж:"zh",з:"z",и:"i",й:"y",к:"k",л:"l",м:"m",н:"n",о:"o",п:"p",р:"r",с:"s",т:"t",у:"u",ф:"f",х:"h",ц:"c",ч:"ch",ш:"sh",щ:"sch",ъ:"",ы:"y",ь:"",э:"e",ю:"yu",я:"ya"};
+function normQ(s) { return String(s || "").toLowerCase().replace(/ё/g, "е").replace(/[«»"'`.,:;!?()\[\]\/\\_+-]+/g, " ").replace(/\s+/g, " ").trim(); }
+function toLat(s) { return [...s].map((c) => C2L[c] ?? c).join(""); }
+function lev(a, b, lim) {
+  if (Math.abs(a.length - b.length) > lim) return lim + 1;
+  let prev = Array.from({length: b.length + 1}, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]; let best = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      best = Math.min(best, cur[j]);
+    }
+    if (best > lim) return lim + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+function searchKey(name, extra) {
+  const n = normQ(name), l = toLat(n);
+  return {n, l, w: n.split(" "), lw: l.split(" "), c: n.replace(/ /g, ""), lc: l.replace(/ /g, ""), x: normQ(extra || "")};
+}
+function prepQuery(text) {
+  const n = normQ(text);
+  if (!n) return null;
+  const vs = [n], sw = normQ([...n].map((c) => KB[c] || c).join(""));
+  if (sw && sw !== n) vs.push(sw);
+  return vs.map((v) => ({n: v, w: v.split(" "), l: toLat(v), lw: toLat(v).split(" "), c: v.replace(/ /g, ""), lc: toLat(v).replace(/ /g, "")}));
+}
+function scoreOne(q, k) {
+  let best = 0;
+  for (const [qs, ks, qw, kw] of [[q.n, k.n, q.w, k.w], [q.l, k.l, q.lw, k.lw]]) {
+    if (!qs) continue;
+    if (ks === qs) return 1000;
+    if (ks.startsWith(qs)) { best = Math.max(best, 900 - ks.length); continue; }
+    if (qw.every((w) => kw.some((x) => x.startsWith(w)))) { best = Math.max(best, 700 - ks.length); continue; }
+    if (qw.every((w) => ks.includes(w))) { best = Math.max(best, 500 - ks.length); continue; }
+    const qc = qs === q.n ? q.c : q.lc, kc = ks === k.n ? k.c : k.lc;   // «ак103» = «АК-103»
+    if (qc.length >= 3 && kc.startsWith(qc)) { best = Math.max(best, 850 - ks.length); continue; }
+    if (qc.length >= 3 && kc.includes(qc)) { best = Math.max(best, 450 - ks.length); continue; }
+    let ok = true, cost = 0;
+    for (const w of qw) {
+      if (kw.some((x) => x.startsWith(w)) || ks.includes(w)) continue;
+      if (w.length < 3) { ok = false; break; }
+      const lim = w.length >= 7 ? 2 : 1;
+      let d = lim + 1;
+      for (const x of kw) d = Math.min(d, lev(w, x.slice(0, w.length), lim), lev(w, x, lim));
+      if (d > lim) { ok = false; break; }
+      cost += d;
+    }
+    if (ok) best = Math.max(best, 300 - cost * 40 - ks.length);
+  }
+  if (!best && k.x && q.w.every((w) => k.x.split(" ").some((x) => x.startsWith(w)))) best = 150;   // категория, ранг
+  return best;
+}
+function matchScore(qv, key) { let b = 0; for (const q of qv) b = Math.max(b, scoreOne(q, key)); return b; }
 
 // ---------- навигация ----------
 function go(v) {
@@ -2232,10 +2297,10 @@ function rankTag(d) {
     ? `<span class="rk ${d.rank}">${RANK_RU[d.rank]}</span>` : "";
 }
 function visibleDeals() {
-  const q = $("search").value.trim().toLowerCase().replace(/ё/g, "е");
+  const qv = prepQuery($("search").value);
   const now = S.now, minProfit = +(F.profit || 0);
   let list = S.deals.filter((d) => (kind === "all" || d.kind === kind)
-    && (!q || d.name.toLowerCase().replace(/ё/g, "е").includes(q))
+    && (!qv || matchScore(qv, d._k || (d._k = searchKey(d.name, (CATNAMES[d.cat] || "") + " " + (RANK_RU[d.rank] || "")))) > 0)
     && (F.cat === "all" || catGroup(d.cat) === F.cat)
     && (!F.chance || (d.chance !== null && d.chance !== undefined && d.chance * 100 >= F.chance))
     && (!minProfit || d.profit >= minProfit)
@@ -2288,14 +2353,20 @@ function chanceBlock(c) {
     <div class="cv" style="color:${col}">${p}%<span>${lbl}${c.hours !== null && c.hours !== undefined ? " · обычно за " + fmtHours(c.hours).replace("~", "") : ""}</span></div>
     <div class="cbar"><i style="width:${p}%;background:${col}"></i></div>
     <div class="kv">
-      <span>Сделок в сутки по такому товару</span><span>${n1(c.per_day)}</span>
-      <span>Платили не меньше этой цены</span><span>${Math.round(c.share * 100)}% сделок</span>
+      <span>Сделок в сутки</span><span>${n1(c.per_day)}</span>
+      <span>Платили не меньше этой цены</span><span>${Math.round(c.share * 100)}%</span>
       <span>Нужно покупателей</span><span>${c.need}${c.need > 1 ? " (обычно берут по " + Math.round(c.size) + " шт)" : ""}</span>
-      <span>Похожих лотов почти по той же цене</span><span>${c.comp}</span>
-      ${c.trend_f !== 1 ? `<span>Поправка: рынок ${c.trend_f < 1 ? "падает" : "растёт"}</span><span>×${c.trend_f.toFixed(2)}</span>` : ""}
-      ${c.stale_f !== 1 ? `<span>Поправка: лот давно не покупают</span><span>×${c.stale_f.toFixed(2)}</span>` : ""}
+      <span>Конкуренты рядом по цене</span><span>${c.comp}</span>
+      ${c.supply !== null && c.supply !== undefined ? `<span title="Похожие лоты до +30% к цене и за сколько дней рынок их разберёт">Запас на аукционе</span><span>${c.supply} лот. · ${c.supply_days < 1 ? "< суток" : "≈ " + n1(c.supply_days) + " дн."}</span>
+      <span>Ликвидность</span><span>${c.supply_days < 1 ? "высокая" : c.supply_days < 5 ? "средняя" : "низкая"}${c.liq_f < 0.99 ? " · ×" + c.liq_f.toFixed(2) : ""}</span>` : ""}
+      ${c.confidence !== undefined && c.confidence < 0.9 ? `<span>Мало сделок</span><span>×${c.confidence.toFixed(2)}</span>` : ""}
+      ${c.trend_f !== 1 ? `<span>Рынок ${c.trend_f < 1 ? "падает" : "растёт"}</span><span>×${c.trend_f.toFixed(2)}</span>` : ""}
+      ${c.stale_f !== 1 ? `<span>Лот давно не покупают</span><span>×${c.stale_f.toFixed(2)}</span>` : ""}
+      ${c.observed ? `<span title="Сколько похожих лотов по такой цене реально продались за сутки — по наблюдениям трекера">Сам видел, продано за сутки</span><span>${c.observed[0]} из ${c.observed[1]} · вес ${Math.round(c.weight * 100)}%</span>`
+        : c.model !== undefined ? `<span>Свои наблюдения</span><span>пока копятся</span>` : ""}
+      ${c.week !== undefined ? `<span>Шанс за неделю</span><span>${Math.round(c.week * 100)}%</span>` : ""}
     </div>
-    <div class="muted" style="font-size:12px;margin-top:9px">Оценка по формуле трекера, а не гарантия: API не показывает, сколько людей хотят купить.</div>
+    <div class="muted" style="font-size:12px;margin-top:9px">Оценка трекера, а не гарантия: API не показывает, сколько людей хотят купить. Чем дольше трекер работает, тем больше она опирается на то, какие лоты реально продались.</div>
   </div>`;
 }
 function rareMarks() { return (S.settings.rare_items || []).map((x) => String(x).toLowerCase().replace(/ё/g, "е")); }
@@ -2404,50 +2475,53 @@ async function loadCatalog() {
     const r = await api("/api/catalog");
     if (r.items && r.items.length) {
       CAT = r.items; CATNAMES = r.names || {}; CATMAP = {};
-      CAT.forEach((e) => CATMAP[e.id] = e);
+      CAT.forEach((e) => { CATMAP[e.id] = e; e._k = searchKey(e.name, (CATNAMES[e.cat] || "") + " " + (RANK_RU[e.rank] || "") + (e.barter ? " бартер" : "")); });
       renderCatalog(true); renderChips();
     }
   } catch (e) {}
 }
 function renderTabs() {
   const counts = {};
-  (CAT || []).forEach((e) => { if (e.trade) counts[e.cat] = (counts[e.cat] || 0) + 1; });
+  const visible = (CAT || []).filter((e) => e.trade && (showBarter || !e.barter));
+  visible.forEach((e) => counts[e.cat] = (counts[e.cat] || 0) + 1);
   const order = ["all", "artefact", "armor", "weapon", "parts", "tools", "attachment", "misc", "supply", "bullet", "containers", "backpacks", "grenade", "other"];
   $("catTabs").innerHTML = order.filter((c) => c === "all" || counts[c]).map((c) =>
-    `<button data-c="${c}" class="${c === catTab ? "on" : ""}">${c === "all" ? "Все" : esc(CATNAMES[c] || c)}<span>${c === "all" ? (CAT || []).filter((e) => e.trade).length : counts[c]}</span></button>`).join("");
-  $("catTabs").querySelectorAll("button").forEach((b) => b.onclick = () => { catTab = b.dataset.c; store.set("catTab", catTab); renderCatalog(); $("catResults").scrollTop = 0; });
+    `<button data-c="${c}" class="${c === catTab ? "on" : ""}">${c === "all" ? "Все" : esc(CATNAMES[c] || c)}<span>${c === "all" ? visible.length : counts[c]}</span></button>`).join("")
+    + `<button id="barterBtn" class="${showBarter ? "on" : ""}" title="Предметы, которые получают бартером у торговцев">${showBarter ? "Бартерные показаны" : "+ бартерные"}</button>`;
+  $("barterBtn").onclick = () => { showBarter = !showBarter; store.set("showBarter", showBarter); renderCatalog(true); };
+  $("catTabs").querySelectorAll("button[data-c]").forEach((b) => b.onclick = () => { catTab = b.dataset.c; store.set("catTab", catTab); renderCatalog(); $("catResults").scrollTop = 0; });
 }
 let lastCatSig = "";
 function renderCatalog(force) {
   if (!CAT) return;
-  const sig = [catTab, $("catSearch").value, watch().join("|"), (S.settings.rare_items || []).join("|")].join("#");
+  const sig = [catTab, showBarter, $("catSearch").value, watch().join("|"), (S.settings.rare_items || []).join("|")].join("#");
   if (!force && sig === lastCatSig) return;
   lastCatSig = sig;
   renderTabs();
-  const q = normName($("catSearch").value);
-  const words = q.split(/\s+/).filter(Boolean);
-  let list = CAT.filter((e) => e.trade && (catTab === "all" || e.cat === catTab)
-    && (!words.length || words.every((w) => normName(e.name).includes(w) || normName(CATNAMES[e.cat] || "").startsWith(w))));
-  if (q) list.sort((a, b) => (normName(b.name).startsWith(q) - normName(a.name).startsWith(q)) || a.name.localeCompare(b.name, "ru"));
+  const qv = prepQuery($("catSearch").value);
+  let list = CAT.filter((e) => e.trade && (showBarter || !e.barter) && (catTab === "all" || e.cat === catTab));
+  if (qv) list = list.map((e) => [matchScore(qv, e._k), e]).filter((x) => x[0] > 0)
+    .sort((a, b) => b[0] - a[0] || a[1].name.localeCompare(b[1].name, "ru")).map((x) => x[1]);
   else list.sort((a, b) => a.name.localeCompare(b.name, "ru"));
   const shown = list.slice(0, 120);
   $("catResults").innerHTML = shown.map((e) => {
     const on = inWatch(e), star = isStarred(e.id, e.name);
     return `<div class="res"><button class="star${star ? " on" : ""}" data-star="${e.id}" title="Особо редкий — отдельное уведомление">${star ? "★" : "☆"}</button>
       <span class="n">${esc(e.name)}</span>${e.rank && RANK_RU[e.rank] ? `<span class="rk ${e.rank}">${RANK_RU[e.rank]}</span>` : ""}
-      <span class="tag cat">${esc(CATNAMES[e.cat] || e.cat)}</span>
+      ${e.barter ? `<span class="tag fate" title="Получают бартером у торговцев">бартер</span>` : ""}<span class="tag cat">${esc(CATNAMES[e.cat] || e.cat)}</span>
       <button class="btn sm${on ? " done" : ""}" data-add="${e.id}">${on ? "✓ В списке" : "+ Следить"}</button></div>`;
   }).join("") || `<div class="res muted">Ничего не нашёл — попробуй часть названия или другую вкладку.</div>`;
   $("catMore").textContent = list.length > shown.length ? `Показано ${shown.length} из ${list.length} — уточни поиск.` : (list.length ? `Найдено: ${list.length}` : "");
   $("catResults").querySelectorAll("[data-add]").forEach((b) => b.onclick = () => { const e = CATMAP[b.dataset.add]; inWatch(e) ? removeEntry(e) : addEntry(e); });
   $("catResults").querySelectorAll("[data-star]").forEach((b) => b.onclick = async () => { const e = CATMAP[b.dataset.star]; await toggleStar(e.id, e.name); renderCatalog(); });
 }
-$("catSearch").oninput = () => renderCatalog();
+$("catSearch").oninput = () => { clearTimeout(renderCatalog.t); renderCatalog.t = setTimeout(() => renderCatalog(), 90); };
 $("catSearch").onkeydown = (e) => {
   if (e.key !== "Enter" || !CAT) return;
-  const q = normName($("catSearch").value); if (!q) return;
-  const exact = CAT.find((x) => x.trade && normName(x.name) === q);
-  if (exact) addEntry(exact); else addItem($("catSearch").value, true);
+  const qv = prepQuery($("catSearch").value); if (!qv) return;
+  let best = null, score = 0;   // Enter — добавить лучшее совпадение
+  CAT.forEach((x) => { if (!x.trade) return; const sc = matchScore(qv, x._k); if (sc > score) { score = sc; best = x; } });
+  if (best) addEntry(best); else toast("Не нашёл такого предмета", true);
 };
 function renderChips() {
   const list = watch(), cats = S.auto_cats || [];

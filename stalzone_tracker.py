@@ -99,6 +99,8 @@ CONFIG = {
 
 LISTING_URL = ("https://raw.githubusercontent.com/EXBO-Studio/"
                "stalzone-database/main/{region}/listing.json")
+BARTER_URL = ("https://raw.githubusercontent.com/EXBO-Studio/"
+              "stalzone-database/main/{region}/barter_recipes.json")   # что получают бартером у торговцев
 OAUTH_URL = "https://exbo.net/oauth/token"
 # Публичные ключи демо-API из документации EXBO (eapi.stalzone.net/auth.html).
 # Работают только с dapi.stalzone.com, там тестовые данные, не настоящий аукцион.
@@ -190,8 +192,51 @@ def item_category(it, ru=None):
     return {"medicine": "supply", "device": "other", "weapon_modules": "attachment"}.get(cat, cat)
 
 
+_barter_cache = {}
+_barter_failed = {"at": 0.0}
+
+
+def barter_ids(region):
+    """id предметов, которые получают бартером у торговцев (из базы EXBO, обновляется раз в неделю).
+    Такие предметы трекер не берёт в «категории целиком»: их делает кто угодно, на аукционе это не
+    редкость из ящиков. None — список не удалось получить (тогда ничего не исключаем)."""
+    path = os.path.join(HERE, f"barter_{region}.json")
+    stale = not os.path.exists(path) or time.time() - os.path.getmtime(path) > 7 * 86400
+    if stale and not os.environ.get("STALZONE_OFFLINE") and time.time() - _barter_failed["at"] > 600:
+        try:
+            r = requests.get(BARTER_URL.format(region=region), timeout=30)
+            r.raise_for_status()
+            json.loads(r.text)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.write(r.text)
+            os.replace(path + ".tmp", path)
+        except (requests.RequestException, ValueError, OSError) as e:
+            _barter_failed["at"] = time.time()
+            log.info("Список бартерных предметов не скачался (%s) — бартерные пока не отделяю", type(e).__name__)
+    if not os.path.exists(path):
+        return None
+    mtime = os.path.getmtime(path)
+    cached = _barter_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    ids = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        for place in data if isinstance(data, list) else []:
+            for recipe in (place.get("recipes") or []) if isinstance(place, dict) else []:
+                if isinstance(recipe, dict) and recipe.get("item"):
+                    ids.add(str(recipe["item"]))
+    except (OSError, ValueError, AttributeError):
+        return None
+    _barter_cache[path] = (mtime, ids)
+    return ids
+
+
 def load_catalog(region):
-    """Все предметы: [{id, name, cat, rank, trade}] — для поиска по категориям и «категорий целиком»."""
+    """Все предметы: [{id, name, cat, rank, trade, barter}] — для поиска по категориям и «категорий целиком».
+    trade — может попасть на аукцион; barter — получают бартером у торговцев."""
+    barter = barter_ids(region) or set()
     out = []
     for it in _listing(region):
         item_id, ru = _id_and_name(it)
@@ -200,7 +245,8 @@ def load_catalog(region):
         cat = item_category(it, ru)
         out.append({"id": item_id, "name": ru, "cat": cat if cat in CATEGORY_NAMES else "other",
                     "rank": str(it.get("color") or "DEFAULT"),
-                    "trade": (it.get("status") or {}).get("state") not in NOT_TRADED})
+                    "trade": (it.get("status") or {}).get("state") not in NOT_TRADED,
+                    "barter": item_id in barter})
     return out
 
 
@@ -244,8 +290,8 @@ def watch_items(cfg, names):
     if cats:
         catalog = sorted(load_catalog(cfg["region"]), key=lambda e: (cats.index(e["cat"]) if e["cat"] in cats else 99,
                                                                     e["name"].lower()))
-        for entry in catalog:
-            if entry["cat"] in cats and entry["trade"] and entry["id"] not in have:
+        for entry in catalog:   # только то, что продаётся и не делается бартером
+            if entry["cat"] in cats and entry["trade"] and not entry["barter"] and entry["id"] not in have:
                 have.add(entry["id"])
                 auto.add(entry["id"])
                 items.append((entry["id"], entry["name"]))
@@ -873,6 +919,8 @@ def competitors(lot, lots, price, total=True, spread=0.05):
 
 
 CHANCE_HOURS = 24   # шанс продать за сутки
+CHANCE_CAP = 0.95   # наверняка не бывает: API не знает, сколько людей хотят купить
+OBSERVED_TRUST = 15  # после стольких своих наблюдений лотов формула и наблюдения весят поровну
 
 
 def poisson_at_least(lam, k):
@@ -887,34 +935,75 @@ def poisson_at_least(lam, k):
     return max(0.0, 1.0 - below)
 
 
-def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, hours=CHANCE_HOURS):
-    """Примерный шанс продать лот за hours часов по цене price за штуку. Своя формула, не знание:
-    покупатели приходят случайно (пуассоновский поток) с частотой прошлых сделок этой корзины,
-      × доля сделок, где платили не меньше price (дороже рынка — меньше покупателей),
-      ÷ (1 + 0,25 × конкурентов почти по той же цене),
-      × поправка на тренд (рынок падает на 10% — ×0,8),
-      × поправка на «давно висит» (лот час и больше никто не купил даже со скидкой — спрос слабый).
+def _rate_for(chance, need):
+    """Сколько покупателей в среднем нужно, чтобы с вероятностью chance пришли хотя бы need."""
+    lo, hi = 0.0, 500.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if poisson_at_least(mid, need) < chance:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def liquidity_label(days):
+    if days is None:
+        return ""
+    return "высокая" if days < 1 else "средняя" if days < 5 else "низкая"
+
+
+def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, hours=CHANCE_HOURS,
+                supply=None, observed=None):
+    """Примерный шанс продать лот за hours часов по цене price за штуку. Своя формула, не знание.
+    Покупатели приходят случайно (пуассоновский поток) с частотой прошлых сделок этой корзины, и она
+      × уверенность: при малом числе сделок частота ненадёжна — n/(n+2) (5 сделок — ×0,71),
+      × доля сделок, где платили не меньше price (со сглаживанием: никогда не 0 и не 100%),
+      ÷ (1 + 0,35 × конкурентов почти по той же цене, до +5%),
+      × ликвидность: за сколько дней рынок разберёт похожие лоты, что уже висят (до +30% к цене);
+        запас больше суток — продавцы перебивают цену друг друга, шанс ниже,
+      × тренд (рынок за сутки упал на 10% — ×0,8) и «давно висит» (лот час никто не купил даже со скидкой).
     Чтобы продать amount штук, нужно ~amount / (обычный размер сделки) покупателей.
-    Возвращает {chance 0…1, hours — ожидаемое время продажи, …} или None."""
+    observed — (продано за сутки, всего) по лотам, за которыми трекер следил сам: чем их больше,
+    тем сильнее итог опирается на них, а не на формулу.
+    Возвращает {chance 0…1, hours — ожидаемое время продажи, week — шанс за неделю, …} или None."""
     if not pairs or price <= 0 or amount <= 0:
         return None
+    n = len(pairs)
     window_h = max(float(window_h or 0), 1.0)
-    per_day = len(pairs) / window_h * 24                      # сделок в сутки
-    share = sum(1 for unit, _ in pairs if unit >= price * 0.995) / len(pairs)
-    share = max(share, 0.05)                                  # хоть кто-то купит и дороже рынка
+    per_day = n / window_h * 24                               # сделок в сутки
+    confidence = n / (n + 2)
+    above = sum(1 for unit, _ in pairs if unit >= price * 0.995)
+    share = (above + 1) / (n + 2)
     size = max(1.0, statistics.median(a for _, a in pairs))   # обычный размер одной сделки
     need = min(50, max(1, math.ceil(amount / size - 1e-9)))   # сколько покупателей нужно
-    comp_f = 1 / (1 + 0.25 * min(int(comp or 0), 12))
+    comp = int(comp or 0)
+    comp_f = 1 / (1 + 0.35 * min(comp, 20))
+    supply_days, liq_f = None, 1.0
+    if supply is not None and per_day > 0:
+        supply_days = int(supply) / per_day
+        liq_f = 1 / (1 + 0.08 * max(0.0, supply_days - 1))
     trend_f = 1.0 if trend is None else min(1.2, max(0.5, 1 + float(trend) / 50))
     stale_f = 1.0
     if age is not None and age > STALE_MINUTES:
         stale_f = 0.55 if age > 3 * STALE_MINUTES else 0.75
-    rate = per_day * share * comp_f * trend_f * stale_f       # покупателей в сутки — именно для этого лота
-    lam = rate * hours / 24
-    chance = min(0.97, max(0.01, poisson_at_least(lam, need)))
-    return {"chance": chance, "hours": need / rate * 24 if rate > 0 else None, "per_day": per_day,
-            "share": share, "size": size, "need": need, "comp": int(comp or 0),
-            "trend_f": trend_f, "stale_f": stale_f}
+    rate = per_day * confidence * share * comp_f * liq_f * trend_f * stale_f   # покупателей в сутки для лота
+    model = poisson_at_least(rate * hours / 24, need)
+    chance, weight, seen = model, 0.0, None
+    if observed and observed[1] > 0:
+        sold, total = int(observed[0]), int(observed[1])
+        seen = ((sold + 0.5) / (total + 1)) ** need             # доля лотов, проданных за сутки
+        weight = total / (total + OBSERVED_TRUST)
+        chance = weight * seen + (1 - weight) * model
+    if weight:   # частота покупателей, которая даёт итоговый шанс, — для времени продажи
+        rate = _rate_for(min(chance, 0.999), need) * 24 / hours if chance > 0 else 0.0
+    return {"chance": min(CHANCE_CAP, max(0.01, chance)),
+            "hours": need / rate * 24 if rate > 0 else None,
+            "week": min(CHANCE_CAP, max(0.01, poisson_at_least(rate * 7, need))),
+            "per_day": per_day, "confidence": confidence, "share": share, "size": size, "need": need,
+            "comp": comp, "supply": None if supply is None else int(supply), "supply_days": supply_days,
+            "liq_f": liq_f, "trend_f": trend_f, "stale_f": stale_f, "model": model,
+            "observed": [int(observed[0]), int(observed[1])] if observed else None, "weight": weight}
 
 
 def chance_label(c):
@@ -1112,6 +1201,13 @@ class MarketDB:
             region TEXT NOT NULL, item_id TEXT NOT NULL,
             covered_from REAL NOT NULL, last_ts REAL NOT NULL,
             PRIMARY KEY (region, item_id));
+        CREATE TABLE IF NOT EXISTS lots (           -- все лоты, что видел трекер: продались ли и как быстро
+            region TEXT NOT NULL, item_id TEXT NOT NULL, lot_key TEXT NOT NULL,
+            start_ts REAL NOT NULL, end_ts REAL, first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+            amount INTEGER NOT NULL, price REAL NOT NULL, qlt INTEGER NOT NULL, ptn INTEGER NOT NULL,
+            ratio REAL,                                 -- цена за шт / рыночная, когда увидели
+            gone_ts REAL, outcome TEXT, sold_ts REAL,   -- пропал; sold / expired / removed
+            PRIMARY KEY (region, item_id, lot_key));
     """
 
     def __init__(self, path=None, keep_days=14):
@@ -1133,6 +1229,7 @@ class MarketDB:
         cutoff = time.time() - self.keep_days * 86400
         with self.con:
             self.con.execute("DELETE FROM sales WHERE ts < ?", (cutoff,))
+            self.con.execute("DELETE FROM lots WHERE last_seen < ?", (cutoff,))
             self.con.execute("UPDATE coverage SET covered_from = ? WHERE covered_from < ?", (cutoff, cutoff))
 
     def coverage(self, region, item_id):
@@ -1204,6 +1301,81 @@ class MarketDB:
             "SELECT 1 FROM sales WHERE region = ? AND item_id = ? AND amount = ? AND ABS(price - ?) < 0.5 "
             "AND ts >= ? LIMIT 1", (region, item_id, int(amount), float(price), float(since_ts))).fetchone()
         return row is not None
+
+    def observe_lots(self, region, item_id, lots, ratio_fn=lambda lot: None, now=None):
+        """Запомнить лоты этой проверки; пропавшие разобрать: в истории есть сделка ровно на лот — продан,
+        вышло время — истёк, иначе через 2 часа — снят продавцом."""
+        now = now or time.time()
+        rows = []
+        for lot in lots:
+            amount, price = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
+            if amount <= 0 or price <= 0:
+                continue   # только со ставками — по ним не сверить
+            try:
+                start = parse_time(lot.get("startTime")).timestamp()
+            except (TypeError, ValueError):
+                continue
+            try:
+                end = parse_time(lot.get("endTime")).timestamp()
+            except (TypeError, ValueError):
+                end = None
+            g = grade_of(lot.get("additional"))
+            rows.append((region, item_id, lot_key(item_id, lot), start, end, now, now, amount, price,
+                         g[0] if g else -1, g[1] if g else -1, ratio_fn(lot)))
+        with self.con:
+            self.con.executemany(
+                "INSERT OR IGNORE INTO lots (region, item_id, lot_key, start_ts, end_ts, first_seen, last_seen, "
+                "amount, price, qlt, ptn, ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.con.executemany(
+                "UPDATE lots SET last_seen = ?, gone_ts = NULL WHERE region = ? AND item_id = ? AND lot_key = ? "
+                "AND outcome IS NULL", [(now, region, item_id, r[2]) for r in rows])
+            self.con.execute("UPDATE lots SET gone_ts = ? WHERE region = ? AND item_id = ? AND outcome IS NULL "
+                             "AND gone_ts IS NULL AND last_seen < ?", (now, region, item_id, now))
+            pending = self.con.execute(
+                "SELECT lot_key, start_ts, end_ts, amount, price, gone_ts FROM lots WHERE region = ? AND item_id = ? "
+                "AND outcome IS NULL AND gone_ts IS NOT NULL", (region, item_id)).fetchall()
+            for key, start, end, amount, price, gone in pending:
+                sold = self.con.execute(
+                    "SELECT MIN(ts) FROM sales WHERE region = ? AND item_id = ? AND amount = ? AND ABS(price - ?) < 0.5 "
+                    "AND ts >= ?", (region, item_id, amount, price, start - 60)).fetchone()[0]
+                if sold is not None:
+                    outcome = "sold"
+                elif end and end <= gone + 300:
+                    outcome = "expired"
+                elif now - gone > 2 * 3600:
+                    outcome = "removed"
+                else:
+                    continue
+                self.con.execute("UPDATE lots SET outcome = ?, sold_ts = ? WHERE region = ? AND item_id = ? "
+                                 "AND lot_key = ?", (outcome, sold, region, item_id, key))
+
+    def lot_outcomes(self, region, item_id, grade=None, now=None, days=7, max_ratio=1.05):
+        """(продано за сутки, всего) среди лотов, выставленных не дороже рынка (до +5%), той же корзины.
+        Учитываются лоты с известным исходом за первые сутки: проданные, истёкшие, снятые после суток
+        и всё ещё висящие дольше суток. Лоты, купленные раньше, чем их показал API, трекер не видит —
+        поэтому оценка скорее осторожная."""
+        now = now or time.time()
+        sold = total = 0
+        for start, last, gone, outcome, sold_ts, qlt, ptn, ratio in self.con.execute(
+                "SELECT start_ts, last_seen, gone_ts, outcome, sold_ts, qlt, ptn, ratio FROM lots "
+                "WHERE region = ? AND item_id = ? AND start_ts >= ?", (region, item_id, now - days * 86400)):
+            if grade is None:
+                if qlt != -1:
+                    continue
+            elif qlt != grade[0] or not grade[1] - 4 <= ptn <= grade[1]:
+                continue
+            if ratio is None or ratio > max_ratio:
+                continue
+            if outcome == "sold":
+                total += 1
+                sold += (sold_ts - start) <= 86400
+            elif outcome == "expired":
+                total += 1
+            elif outcome == "removed":
+                total += (gone - start) >= 86400
+            elif gone is None and now - start >= 86400:
+                total += 1
+        return sold, total
 
     def window_hours(self, region, item_id, hours):
         """Сколько часов из последних hours покрыто непрерывной историей."""
@@ -1386,6 +1558,14 @@ class Scanner:
         if item_id not in self.described and not quiet:
             self.described.add(item_id)
             log.info("%s", describe_market(name, market, lot_list, cfg["history_hours"], total_lots))
+        if self.db is not None and len(lot_list) < LOT_PAGES * 100:   # видны все лоты — следим, какие продаются
+            def ratio(lot, market=market, total=total_lots):
+                found = market_for(market, lot.get("additional"))
+                amount, raw = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
+                if not found or amount <= 0 or raw <= 0 or not found[0][0]:
+                    return None
+                return (raw / amount if total else raw) / found[0][0]
+            self.db.observe_lots(cfg["region"], item_id, lot_list, ratio)
         factor = price_mismatch(market, lot_list, total_lots)
         if factor:  # находки по такому предмету почти наверняка ложные — молчим
             if item_id not in self.mismatched:
@@ -1405,8 +1585,12 @@ class Scanner:
             found = deal_pairs(market, d["lot"].get("additional"))
             if found:
                 comp = competitors(d["lot"], lot_list, d["market"], total_lots)
+                supply = competitors(d["lot"], lot_list, d["market"], total_lots, spread=0.3)
+                observed = (self.db.lot_outcomes(cfg["region"], item_id, grade_of(d["lot"].get("additional")))
+                            if self.db is not None else None)
                 d["chance"] = sale_chance(d["market"], d["amount"], found[0], found[1], comp, d.get("trend"),
-                                          d.get("age") if "unit" in d else None)
+                                          d.get("age") if "unit" in d else None, supply=supply,
+                                          observed=observed if observed and observed[1] else None)
         return lots, deals, bids
 
 
@@ -1912,26 +2096,58 @@ def selftest():
     finally:
         db.close()
         shutil.rmtree(tmp, ignore_errors=True)
-    # --- шанс продажи: больше сделок — выше; конкуренты, падение рынка, «давно висит», большой лот — ниже ---
+    # --- шанс продажи: больше сделок — выше; конкуренты, запас, падение рынка, «давно висит», большой лот — ниже ---
     pairs = [(100.0, 1)] * 40                       # 40 сделок за 48 ч по 100
     base = sale_chance(100, 1, pairs, 48)
-    assert 0.9 < base["chance"] <= 0.97 and base["need"] == 1 and base["hours"] < 3
+    assert base["chance"] == CHANCE_CAP and base["need"] == 1 and base["hours"] < 3
     rare = sale_chance(100, 1, pairs[:5], 168)       # 5 сделок за неделю
-    assert rare["chance"] < 0.6 < base["chance"]
+    assert 0.2 < rare["chance"] < 0.6 < base["chance"] and rare["week"] > rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, comp=4)["chance"] < rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, trend=-20)["chance"] < rare["chance"]
     assert sale_chance(100, 1, pairs[:5], 168, age=200)["chance"] < sale_chance(100, 1, pairs[:5], 168, age=90)["chance"]
-    assert sale_chance(130, 1, [(100.0, 1)] * 20 + [(140.0, 1)] * 5, 48)["share"] == 5 / 25
+    glut = sale_chance(100, 1, pairs[:5], 168, supply=20)       # 20 таких лотов при <1 сделке в сутки
+    assert glut["supply_days"] > 25 and glut["chance"] < rare["chance"] / 2 and liquidity_label(glut["supply_days"]) == "низкая"
+    assert sale_chance(100, 1, pairs, 48, supply=3)["liq_f"] == 1.0     # запас меньше суток — не штрафуем
+    assert sale_chance(130, 1, [(100.0, 1)] * 20 + [(140.0, 1)] * 5, 48)["share"] == 6 / 27
+    assert sale_chance(1, 1, pairs[:2], 48)["confidence"] == 0.5        # 2 сделки — уверенность 50%
     big = sale_chance(100, 50, [(100.0, 5)] * 10, 48)   # 50 шт, а покупают по 5 и 5 раз в сутки
     assert big["need"] == 10 and big["chance"] < 0.2
     assert sale_chance(100, 1, [], 48) is None and chance_label(0.75) == "высокий"
     assert abs(poisson_at_least(2.0, 1) - (1 - math.exp(-2))) < 1e-12
+    assert abs(poisson_at_least(_rate_for(0.6, 3), 3) - 0.6) < 1e-6
+    # наблюдения: из 40 таких лотов за сутки продались 4 — итог тянется к 10%, а не к формуле
+    seen = sale_chance(100, 1, pairs, 48, observed=(4, 40))
+    assert seen["weight"] > 0.7 and seen["chance"] < 0.4 and seen["hours"] > base["hours"]
+    assert sale_chance(100, 1, pairs, 48, observed=(1, 1))["chance"] > 0.8    # одно наблюдение почти ничего не меняет
     lot_a = {"amount": 1, "buyoutPrice": 100}
     near = [lot_a, {"amount": 1, "buyoutPrice": 103}, {"amount": 1, "buyoutPrice": 120},
             {"amount": 1, "buyoutPrice": 101, "additional": {"qlt": 3}}]
     assert competitors(lot_a, near, 100) == 1         # 120 — дорого, артефакт другой корзины — не конкурент
     m = market_prices([{"amount": 1, "price": 100, "time": iso(now - timedelta(hours=i))} for i in range(6)], 5)
     assert deal_pairs(m, None)[0] == [(100.0, 1)] * 6 and PAIRS not in range_keys(m)
+    # --- наблюдение за лотами: продан (есть сделка), снят, истёк, висит дольше суток ---
+    tmp_l = tempfile.mkdtemp()
+    db_l = MarketDB(os.path.join(tmp_l, "m.db"))
+    try:
+        t0 = time.time()
+        mk = lambda key, amount, price, start_h, end_h=48: {"amount": amount, "buyoutPrice": price,
+            "startTime": iso(datetime.fromtimestamp(t0 - start_h * 3600, timezone.utc)),
+            "endTime": iso(datetime.fromtimestamp(t0 + end_h * 3600, timezone.utc)), "_k": key}
+        a, b, c, d = mk("a", 1, 90, 2), mk("b", 1, 95, 3), mk("c", 1, 99, 30), mk("e", 2, 300, 1)
+        db_l.observe_lots("ru", "x", [a, b, c, d], lambda lot: lot["buyoutPrice"] / lot["amount"] / 100, now=t0)
+        db_l.store("ru", "x", [{"amount": 1, "price": 90, "time": iso(datetime.fromtimestamp(t0 + 60, timezone.utc))}], "stop")
+        db_l.observe_lots("ru", "x", [c, d], lambda lot: 0.99, now=t0 + 600)          # «a» и «b» пропали
+        rows = dict(db_l.con.execute("SELECT lot_key, outcome FROM lots").fetchall())
+        assert rows[lot_key("x", a)] == "sold" and rows[lot_key("x", b)] is None    # b ещё ждём
+        db_l.observe_lots("ru", "x", [c, d], lambda lot: 0.99, now=t0 + 3 * 3600)
+        rows = dict(db_l.con.execute("SELECT lot_key, outcome FROM lots").fetchall())
+        assert rows[lot_key("x", b)] == "removed"
+        sold, total = db_l.lot_outcomes("ru", "x", None, now=t0 + 3 * 3600)
+        assert (sold, total) == (1, 2), (sold, total)   # a — продан за сутки; c — висит 33 ч; b снят до суток; e дорогой
+        assert db_l.lot_outcomes("ru", "x", (3, 15), now=t0) == (0, 0)
+    finally:
+        db_l.close()
+        shutil.rmtree(tmp_l, ignore_errors=True)
     # --- категории ---
     assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"
     assert item_category({"data": "/items/other/x.json"}, "Стандартные инструменты") == "tools"
