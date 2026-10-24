@@ -469,6 +469,14 @@ class AuthError(Exception):
     pass
 
 
+class RateLimited(Exception):
+    """Ответ 429 у ключа из KeyPool: решает пул — подождать этот ключ или всем сбавить скорость."""
+
+    def __init__(self, remaining, limit, reset_at):
+        super().__init__("429")
+        self.remaining, self.limit, self.reset_at = remaining, limit, reset_at
+
+
 class ApiError(RuntimeError):
     """API ответил ошибкой 4xx (кроме входа). status — код ответа."""
 
@@ -498,6 +506,8 @@ class Api:
       * на боевом API без ключей, но с «Токеном» — вход по токену.
     """
 
+    AUTH_RETRY_S = 60    # «нет доступа» у работавшего ключа — столько секунд ждём перед повтором
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.base = str(cfg["base_url"]).rstrip("/")
@@ -522,6 +532,10 @@ class Api:
         self._init_share()
         self.bearer = None          # токен от EXBO — только в памяти
         self.oauth_tried = False
+        self.pool = None            # KeyPool, если ключ — один из нескольких
+        self._ok_at = 0.0           # когда ключ последний раз ответил нормально
+        self._auth_retries = 0      # сколько раз подряд ждали после «нет доступа» у работавшего ключа
+        self._said = {}             # что и когда писали в журнал (чтобы не сыпать одинаковыми строками)
         remove_old_token_file()
         self.mode = self._pick_mode()
 
@@ -591,7 +605,7 @@ class Api:
                         "для демо ключи уже встроены.")
             return (f"API не принял токен из настроек (ответ {code}). Вставь Client ID и Client Secret "
                     "из @stalzone_api_bot, а поле «Токен» очисти.")
-        return (f"API не пустил по ключам (ответ {code}). Проверь в настройках: Client ID и Client Secret "
+        return (f"API не пустил ключ с Client ID {self.client_id} (ответ {code}). Проверь в настройках: Client ID и Client Secret "
                 "скопированы целиком, без лишних символов; если сбрасывал секрет в @stalzone_api_bot — "
                 "вставь новый; заявка в боте одобрена.")
 
@@ -634,12 +648,26 @@ class Api:
                 delay = min(delay * 2, 120)
                 continue
             self._share_pace(r)          # каждый ответ, и с ошибкой: сервер его тоже посчитал
-            self._respect_ratelimit(r)
+            if self.pool is None:
+                self._respect_ratelimit(r)
+            else:
+                self._hold_if_spent(r)   # в пуле не спим: запрос возьмёт другой ключ
             if r.status_code in (401, 403):
                 if self._try_oauth(headers, r.status_code):
                     continue
+                if self._auth_flaky():   # ключ только что работал — EXBO иногда отвечает так зря
+                    continue
                 raise AuthError(self._auth_hint(r.status_code))
-            if r.status_code == 429 or r.status_code >= 500:
+            if r.status_code == 429:
+                if self.pool is not None:
+                    raise RateLimited(*self._limits(r))
+                # один ключ: ждут все потоки разом — иначе каждый сам по себе снова упирается в лимит
+                with self._lock:
+                    self._next_slot = max(self._next_slot, time.time() + delay)
+                self._say("429", 30, "API ответил 429 (слишком много запросов) — пауза %s с", delay)
+                delay = min(delay * 2, 120)
+                continue
+            if r.status_code >= 500:
                 log.warning("API ответил %s — жду %s с", r.status_code, delay)
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
@@ -652,11 +680,58 @@ class Api:
                 raise ApiError(r.status_code, f"API ответил {r.status_code}" + (f" ({why})" if why else "")
                                + f" на запрос {path}")
             self._adapt_pace(r)
+            self._ok_at, self._auth_retries = time.time(), 0
             try:
                 return r.json()
             except ValueError:
                 raise RuntimeError(f"API прислал непонятный ответ на запрос {path}") from None
         raise RuntimeError(f"API не отвечает: {path}")
+
+    def _say(self, key, every, msg, *args):
+        """В журнал — не чаще раза в every секунд на одну и ту же тему."""
+        now = time.time()
+        with self._lock:
+            if now - self._said.get(key, 0) < every:
+                return
+            self._said[key] = now
+        log.warning(msg, *args)
+
+    @staticmethod
+    def _limits(r):
+        """(остаток, лимит, момент сброса) из заголовков ответа; чего нет — None."""
+        def num(name):
+            try:
+                return float(r.headers.get(name))
+            except (TypeError, ValueError):
+                return None
+        remaining, limit, reset = num("x-ratelimit-remaining"), num("x-ratelimit-limit"), num("x-ratelimit-reset")
+        if reset is not None:
+            reset = reset / 1000 if reset > 1e12 else reset
+            reset = reset if reset > 1e9 else time.time() + reset
+        return (None if remaining is None else int(remaining), None if limit is None else int(limit), reset)
+
+    def _hold_if_spent(self, r):
+        """Лимит ключа почти кончился — этот ключ не трогаем до сброса (пул берёт другие)."""
+        remaining, _, reset = self._limits(r)
+        if remaining is not None and remaining <= 2:
+            with self._lock:
+                self._next_slot = max(self._next_slot, min(reset or time.time() + 15, time.time() + 90))
+
+    def _auth_flaky(self):
+        """«Нет доступа» у ключа, который только что работал: подождать минуту и повторить (до 3 раз подряд).
+        Так один сбой EXBO не останавливает поиск. Ключ правда сменили — через 3 минуты будет ошибка."""
+        now = time.time()
+        with self._lock:
+            if self.mode != "keys" or not self._ok_at or now - self._ok_at > 1800 or self._auth_retries >= 3:
+                return False
+            if self._next_slot > now + self.AUTH_RETRY_S * 0.8:
+                return True          # паузу уже объявил другой поток
+            self._auth_retries += 1
+            self._next_slot = now + self.AUTH_RETRY_S
+            n = self._auth_retries
+        log.warning("EXBO не пустила ключ с Client ID %s, хотя он только что работал — жду минуту и пробую снова "
+                    "(%d из 3)", self.client_id, n)
+        return True
 
     def _adapt_pace(self, r):
         """Ускоряемся, когда точно знаем лимит: если момент сброса лимита сдвигается ровно
@@ -877,35 +952,101 @@ class KeyPool(Api):
                                              share_expected=False, share_hint="")))
             except AuthError:
                 continue
-        self.dead = set()
+        for m in self.members:
+            m.pool = self
+        self.dead = {}                       # ключ → до какого момента его не трогаем (не пустил)
         self._pick_lock = threading.Lock()
-        log.info("Ключей API: %d — запросы делятся между ними (до %d в минуту)", len(self.members),
-                 len(self.members) * 400 * RATE_SHARE)
+        # Общий темп пула. EXBO, кроме лимита на ключ, может ограничивать и всё вместе (ответ 429, хотя у ключа
+        # лимит не кончился). Тогда снижаем темп на 20%, а минуту без 429 — понемногу поднимаем обратно.
+        self.max_rate = len(self.members) * 400 * RATE_SHARE
+        self.rate = self.max_rate
+        self._gate_next = 0.0
+        self._last_429 = self._cut_at = self._raise_at = 0.0
+        self._spent = {}                     # ключ → сколько раз подряд его лимит кончался раньше времени
+        log.info("Ключей API: %d — запросы делятся между ними (до %d в минуту)", len(self.members), self.max_rate)
 
     def alive(self):
-        return [m for m in self.members if id(m) not in self.dead]
+        now = time.time()
+        return [m for m in self.members if self.dead.get(id(m), 0) <= now]
 
     def _pick(self):
         with self._pick_lock:
             alive = self.alive()
             if not alive:
                 raise AuthError("Ни один ключ API не подошёл — проверь Client ID и Client Secret в «Настройках».")
-            return min(alive, key=lambda m: m._next_slot)
+            m = min(alive, key=lambda x: x._next_slot)
+            if self._spent.get(id(m)):          # ключ, чей лимит тратит кто-то ещё, — пробуем по одному запросу
+                with m._lock:
+                    m._next_slot = max(m._next_slot, time.time()) + 1.0
+            return m
+
+    def _gate(self):
+        """Очередь всего пула: не чаще self.rate запросов в минуту на все ключи вместе."""
+        with self._pick_lock:
+            now = time.time()
+            if self.rate < self.max_rate and now - self._last_429 > 30 and now - self._raise_at > 15:
+                self.rate = min(self.max_rate, self.rate * 1.05 + 10)
+                self._raise_at = now
+            slot = max(now, self._gate_next)
+            self._gate_next = slot + 60.0 / self.rate
+        if slot > now:
+            time.sleep(slot - now)
+
+    def _limited(self, api, e):
+        """429: лимит ключа кончился (им пользуется ещё кто-то) — ждём только его;
+        лимит не кончился — это общий предел EXBO, сбавляем скорость всем."""
+        now = time.time()
+        n = self.members.index(api) + 1
+        spent = e.remaining is not None and e.remaining <= 2
+        cut = None
+        with self._pick_lock:
+            self._last_429 = now
+            if not spent and now - self._cut_at > 15:     # одна волна 429 — одно снижение
+                self._cut_at = now
+                self.rate = max(60.0, self.rate * 0.85)
+                cut = round(self.rate)
+            if not spent:
+                self._gate_next = max(self._gate_next, now + 1.0)
+            # лимит ключа снова кончается сразу после сброса — его постоянно тратит кто-то ещё: ждём дольше
+            streak = self._spent[id(api)] = self._spent.get(id(api), 0) + 1 if spent else 0
+        if spent:
+            until = min(e.reset_at or now + 15, now + 90) + (min(600, 60 * 2 ** (streak - 2)) if streak >= 2 else 0)
+        else:
+            until = now + 3
+        with api._lock:
+            api._next_slot = max(api._next_slot, until)
+        if spent:
+            self._say(f"spent{n}", 300, "Ключ API №%d (Client ID %s) исчерпал лимит раньше конца минуты — им, похоже, "
+                                        "пользуется кто-то ещё (вторая копия трекера, друг, сайт). Беру запросы "
+                                        "другими ключами", n, api.client_id)
+        elif cut is not None:
+            self._say("cut", 60, "EXBO просит сбавить скорость (ответ 429), хотя лимит у ключей не кончился — "
+                                 "общий предел. Снижаю до %d запросов в минуту, потом подниму обратно", cut)
 
     def get(self, path, params):
+        limited = 0
         while True:
+            self._gate()
             api = self._pick()
             try:
-                return Api.get(api, path, params)
+                out = Api.get(api, path, params)
+                if self._spent:
+                    self._spent.pop(id(api), None)
+                return out
+            except RateLimited as e:
+                self._limited(api, e)
+                limited += 1
+                if limited >= 25:
+                    raise RuntimeError(f"API не отвечает (слишком много запросов): {path}") from None
             except AuthError:
-                if api is self and len(self.members) == 1:
+                if len(self.members) == 1:
                     raise
                 with self._pick_lock:
-                    self.dead.add(id(api))
+                    self.dead[id(api)] = time.time() + 900      # через 15 минут попробуем снова
                     left = len(self.alive())
                 n = self.members.index(api) + 1
-                log.warning("Ключ API №%d не пустил (проверь его Client ID и Secret) — работаю без него, осталось %d",
-                            n, left)
+                log.warning("Ключ API №%d (Client ID %s) не пустил — работаю без него, осталось %d. "
+                            "Через 15 минут попробую его снова", n, api.client_id, left)
                 if not left:
                     raise
 

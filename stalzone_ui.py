@@ -1756,12 +1756,12 @@ refresh(); setInterval(refresh, 2000);
 # Новый вид (2.6): как программы Windows 11 — системный шрифт, цвет акцента Windows, навигация как в «Параметрах».
 # Сервер подставляет __TOKEN__, __THEME__ и /*__ACCENT__*/.
 UI_NEW_HTML = r"""<!doctype html>
-<html lang="ru" data-theme="__THEME__">
+<html lang="ru" data-theme="__THEME__" data-scale="__SCALE__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>STALZONE Трекер</title>
-<script>(function(){var r=document.documentElement,m=matchMedia("(prefers-color-scheme: dark)"),t=r.dataset.theme;function a(){r.classList.toggle("dark",t==="dark"||(t!=="light"&&m.matches))}window.__setTheme=function(x){t=x;r.dataset.theme=x;a()};a();try{m.addEventListener("change",a)}catch(e){}})()</script>
+<script>(function(){var r=document.documentElement,m=matchMedia("(prefers-color-scheme: dark)"),t=r.dataset.theme;function a(){r.classList.toggle("dark",t==="dark"||(t!=="light"&&m.matches))}window.__setTheme=function(x){t=x;r.dataset.theme=x;a()};a();try{m.addEventListener("change",a)}catch(e){}var Z={s:0.9,m:1,l:1.15};function f(){var z=Z[r.dataset.scale]||1,w=innerWidth/z,was=r.classList.contains("w1180");r.style.zoom=z;r.style.setProperty("--z",z);[1360,1180,1100].forEach(function(b){r.classList.toggle("w"+b,w<=b)});if(was!==r.classList.contains("w1180"))dispatchEvent(new Event("narrowchange"))}window.__setScale=function(x){r.dataset.scale=x;f()};f();addEventListener("resize",f)})()</script>
 <style>
 /* Новый вид: как программы Windows 11 — системный шрифт, цвет акцента Windows, «Параметры»-навигация.
    Тёмная тема — класс .dark на <html> (его ставит скрипт в <head> до отрисовки, поэтому ничего не мигает). */
@@ -1818,7 +1818,7 @@ h1,h2,h3,p{margin:0}
 ::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
 
 /* ---------- каркас ---------- */
-.app{display:grid;grid-template-columns:240px minmax(0,1fr);height:100vh}
+.app{display:grid;grid-template-columns:240px minmax(0,1fr);height:calc(100vh / var(--z, 1))}   /* --z — размер интерфейса */
 .pane{display:flex;flex-direction:column;padding:6px 4px 8px;min-height:0}
 .who{display:flex;align-items:center;gap:12px;padding:12px 12px 16px}
 .who img{width:32px;height:32px;flex:none}
@@ -2135,7 +2135,17 @@ textarea.field.code{font:12px/18px var(--mono);word-break:break-all}
 .selector button.on:after{content:"";position:absolute;left:50%;bottom:0;width:16px;margin-left:-8px;height:3px;border-radius:2px;background:var(--accent)}
 .selector button em{font-style:normal;color:var(--text-3);margin-left:6px;font-weight:400}
 .selector button:focus-visible{outline:2px solid var(--text);outline-offset:-2px}
-.days svg{display:block;width:100%;height:auto;margin-top:6px}
+.days{min-height:20px}
+.days svg{display:block;margin-top:6px;overflow:visible}
+.pbar{cursor:pointer;outline:none}
+.pbar:hover rect:not(.hit){filter:brightness(1.12)}
+.pbar.on rect.hit,.pbar:focus-visible rect.hit{fill:var(--hover)}
+.kbtn{all:unset;box-sizing:border-box;display:block;cursor:pointer;background:var(--card);border:1px solid var(--stroke);border-radius:8px;padding:10px 14px}
+.kbtn:hover{background:var(--ctrl-h)}
+.kbtn:focus-visible{outline:2px solid var(--text);outline-offset:1px}
+.daychip{display:inline-flex;align-items:center;gap:4px;padding:0 2px 0 10px;height:30px;border-radius:15px;background:var(--accent-bg);color:var(--accent-t);white-space:nowrap}
+.daychip .ib{width:26px;height:26px;color:var(--accent-t)}
+.pcard.hl{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 .pcard{background:var(--card);border:1px solid var(--stroke);border-radius:8px;margin-bottom:8px}
 .prow{display:grid;grid-template-columns:minmax(0,1fr) 116px 136px 128px auto;gap:16px;align-items:center;padding:12px 12px 12px 16px}
 .lbl{font-size:12px;color:var(--text-2);line-height:16px;white-space:nowrap}
@@ -2239,29 +2249,26 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
 @media (prefers-reduced-motion:reduce){.toast{transition:none}}
 
 /* ---------- узкое окно ---------- */
-@media (max-width:1360px){
-  .thead,.tr{grid-template-columns:minmax(0,1fr) 100px 100px 84px 124px 36px;gap:10px}
-  .detail{width:310px}
-  .cmdbar .search{width:200px}
-}
-@media (max-width:1180px){
-  .detail{position:fixed;top:0;right:0;bottom:0;z-index:30;box-shadow:var(--shadow-2);transform:translateX(105%);transition:transform .2s ease;width:360px}
-  .detail.open{transform:none}
-  .detail .x{display:grid}
-  .profit{grid-template-columns:1fr}
-  .cols{grid-template-columns:1fr}
-}
-@media (max-width:1100px){
-  .app{grid-template-columns:52px minmax(0,1fr)}
-  .who{justify-content:center;padding:12px 0 16px}
-  .who div,.nav .lbl,.pane .ver{display:none}
-  .nav button{justify-content:center;padding:0}
-  .nav .cnt{position:absolute;top:2px;right:2px;margin:0}
-  .nav button.on:before{left:0}
-  .prow{grid-template-columns:minmax(0,1fr) 110px 120px;}
-  .prow .acts{grid-column:1/-1;justify-content:flex-start}
-  .pfoot{padding-left:16px}
-}
+/* окно уже 1360 px (с учётом размера интерфейса) — классы ставит скрипт в <head> */
+:root.w1360 #dealsTable .thead,:root.w1360 #dealsTable .tr{grid-template-columns:minmax(0,1fr) 100px 100px 84px 124px 36px;gap:10px}
+:root.w1360 .detail{width:310px}
+:root.w1360 .cmdbar .search{width:200px}
+/* окно уже 1180 px (с учётом размера интерфейса) — классы ставит скрипт в <head> */
+:root.w1180 .detail{position:fixed;top:0;right:0;bottom:0;z-index:30;box-shadow:var(--shadow-2);transform:translateX(105%);transition:transform .2s ease;width:360px}
+:root.w1180 .detail.open{transform:none}
+:root.w1180 .detail .x{display:grid}
+:root.w1180 .profit{grid-template-columns:1fr}
+:root.w1180 .cols{grid-template-columns:1fr}
+/* окно уже 1100 px (с учётом размера интерфейса) — классы ставит скрипт в <head> */
+:root.w1100 .app{grid-template-columns:52px minmax(0,1fr)}
+:root.w1100 .who{justify-content:center;padding:12px 0 16px}
+:root.w1100 .who div,:root.w1100 .nav .lbl,:root.w1100 .pane .ver{display:none}
+:root.w1100 .nav button{justify-content:center;padding:0}
+:root.w1100 .nav .cnt{position:absolute;top:2px;right:2px;margin:0}
+:root.w1100 .nav button.on:before{left:0}
+:root.w1100 .prow{grid-template-columns:minmax(0,1fr) 110px 120px;}
+:root.w1100 .prow .acts{grid-column:1/-1;justify-content:flex-start}
+:root.w1100 .pfoot{padding-left:16px}
 </style>
 </head>
 <body>
@@ -2394,11 +2401,12 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
             <div class="pside">
               <div class="kpi"><span>В товаре сейчас</span><b class="num" id="bInv">0 ₽</b><small id="bInvS">ещё не продано</small></div>
               <div class="kpi"><span>Ожидается ещё</span><b class="num good" id="bExp">0 ₽</b><small>по ценам рынка, после комиссии</small></div>
-              <div class="kpi"><span>Лучшая сделка</span><b class="num" id="bBest">—</b><small id="bBestS">появится после первой продажи</small></div>
+              <button class="kpi kbtn" id="bBestBox" title="Показать эту продажу"><span>Лучшая сделка</span><b class="num" id="bBest">—</b><small id="bBestS">появится после первой продажи</small></button>
             </div>
           </div>
           <div class="cmdbar">
             <div class="selector" id="bSeg"><button data-b="open" class="on">Не проданы<em id="bCntOpen"></em></button><button data-b="sold">Проданы<em id="bCntSold"></em></button><button data-b="all">Все<em id="bCntAll"></em></button></div>
+            <span class="daychip" id="bDayBox" hidden><span id="bDayTxt"></span><button class="ib" id="bDayClear" title="Показать все продажи">✕</button></span>
             <span class="grow"></span>
             <span class="small faint">Купил лот из находок — выбери его и нажми «Я купил».</span>
           </div>
@@ -2450,6 +2458,7 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
 
             <div class="group"><h2>Вид</h2>
               <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="10" cy="10" r="7"/><path d="M10 3a7 7 0 0 1 0 14z" fill="currentColor"/></svg><div class="tx"><div>Тема</div><small>Рамка окна меняется вместе с ней</small></div><div class="ctl"><span class="combo"><select id="sTheme"><option value="system">Как в Windows</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span></div></div>
+              <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M3 15.5 7.5 4h1L13 15.5M4.6 11.5h6.8M13.5 15.5l2.25-6h.5l2.25 6M14.2 13.7h3.1"/></svg><div class="tx"><div>Размер интерфейса</div><small>Текст, кнопки и таблицы — меньше или крупнее. Меняется сразу</small></div><div class="ctl"><span class="combo"><select id="sScale"><option value="s">Маленький</option><option value="m">Средний</option><option value="l">Крупный</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span></div></div>
               <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><path d="M7 3.5v13"/></svg><div class="tx"><div>Вид программы</div><small>Классический — как было в версии 2.5. Переключается сразу, находки и настройки не теряются</small></div><div class="ctl"><span class="combo"><select id="sUi"><option value="new">Новый</option><option value="old">Классический</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span></div></div>
             </div>
 
@@ -2648,7 +2657,9 @@ let hideOld = store.get("hideOld2", true);
 let bFilter = store.get("bFilter", "open"), sellOpen = null, showBarter = store.get("showBarter", false);
 let pPeriod = store.get("pPeriod", "week");
 const optPick = {};
-const narrowMQ = matchMedia("(max-width:1180px)");
+// узкое окно (с учётом размера интерфейса): класс w1180 на <html> ставит скрипт в <head>
+const narrowMQ = {get matches() { return document.documentElement.classList.contains("w1180"); },
+                  addEventListener(_, fn) { window.addEventListener("narrowchange", fn); }};
 
 async function api(path, body) {
   const opt = { headers: { "X-Token": TOKEN } };
@@ -3324,22 +3335,54 @@ async function loadYield() {
 // ---------- мои покупки: общая прибыль ----------
 document.querySelectorAll("#pPeriod button").forEach((b) => b.onclick = () => { pPeriod = b.dataset.p; store.set("pPeriod", pPeriod); renderProfit(true); });
 function dayStart(ts) { const d = new Date(ts * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; }
+let pDay = null, pBars = null;   // выбранный на графике день (или час): какие продажи показать в списке
 function profitBars(sold, from, now) {
   const hourly = pPeriod === "day";
   const step = hourly ? 3600 : 86400, start = hourly ? dayStart(now) : dayStart(Math.max(from, now - 59 * 86400));
   const n = Math.max(1, Math.floor((now - start) / step) + 1);
   const vals = new Array(n).fill(0), cnt = new Array(n).fill(0);
   sold.forEach((p) => { const i = Math.floor((p.sold_at - start) / step); if (i >= 0 && i < n) { vals[i] += p.profit || 0; cnt[i] += 1; } });
+  pBars = null;
   if (!cnt.some(Boolean)) return "";
-  const W = 600, H = 120, T = 8, B = 18, max = Math.max(1, ...vals.map(Math.abs)), hasNeg = vals.some((v) => v < 0);
-  const zero = hasNeg ? T + (H - T - B) / 2 : H - B, scale = (hasNeg ? (H - T - B) / 2 : H - T - B) / max, bw = W / n;
+  // рисуем в настоящих пикселях: подписи не растягиваются на широком окне, столбики не толще 56 пикселей
+  const W = Math.max(280, Math.round($("pDays").clientWidth || 600)), H = 150, T = 10, B = 20;
+  const max = Math.max(1, ...vals.map(Math.abs)), hasNeg = vals.some((v) => v < 0);
+  const zero = hasNeg ? T + (H - T - B) / 2 : H - B, scale = (hasNeg ? (H - T - B) / 2 : H - T - B) / max, bw = W / n, w = Math.max(2, Math.min(56, bw * 0.7));
   const label = (i) => hourly ? `${i}:00` : new Date((start + i * step) * 1000).toLocaleDateString("ru-RU", {day: "2-digit", month: "2-digit"});
-  const bars = vals.map((v, i) => { const h = Math.max(cnt[i] ? 2 : 0, Math.abs(v) * scale);
-    return `<rect x="${(i * bw + bw * 0.15).toFixed(1)}" y="${(v >= 0 ? zero - h : zero).toFixed(1)}" width="${Math.max(1, bw * 0.7).toFixed(1)}" height="${h.toFixed(1)}" rx="2" fill="${v >= 0 ? "var(--good)" : "var(--bad)"}"><title>${label(i)}: ${cnt[i] ? signed(v) + ", продаж " + cnt[i] : "продаж нет"}</title></rect>`; }).join("");
-  const ticks = [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i).map((i) =>
-    `<text x="${(i * bw + bw / 2).toFixed(1)}" y="${H - 3}" font-size="11" fill="var(--text-3)" text-anchor="${i === 0 ? "start" : i === n - 1 ? "end" : "middle"}">${label(i)}</text>`).join("");
-  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Прибыль по ${hourly ? "часам" : "дням"}"><line x1="0" x2="${W}" y1="${zero}" y2="${zero}" stroke="var(--divider)"/>${bars}${ticks}</svg>`;
+  pBars = {start, step, label};
+  const selI = pDay && pDay.step === step ? Math.round((pDay.from - start) / step) : -1;
+  const bars = vals.map((v, i) => { if (!cnt[i]) return "";
+    const h = Math.max(2, Math.abs(v) * scale), x = i * bw + (bw - w) / 2, dim = selI >= 0 && selI !== i;
+    return `<g class="pbar${selI === i ? " on" : ""}" data-i="${i}" tabindex="0" role="button" aria-label="${label(i)}: ${signed(v)}, продаж ${cnt[i]}">
+      <rect class="hit" x="${(i * bw).toFixed(1)}" y="0" width="${bw.toFixed(1)}" height="${H - B}" fill="transparent"/>
+      <rect x="${x.toFixed(1)}" y="${(v >= 0 ? zero - h : zero).toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="3" fill="${v >= 0 ? "var(--good)" : "var(--bad)"}" opacity="${dim ? 0.35 : 1}"/>
+      <title>${label(i)}: ${signed(v)}, продаж ${cnt[i]} — щёлкни, чтобы посмотреть</title></g>`; }).join("");
+  const every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(W / 70))));
+  const ticks = vals.map((_, i) => i).filter((i) => i % every === 0 || i === n - 1).map((i) =>
+    `<text x="${(i * bw + bw / 2).toFixed(1)}" y="${H - 4}" font-size="11" fill="var(--text-3)" text-anchor="middle">${label(i)}</text>`).join("");
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Прибыль по ${hourly ? "часам" : "дням"}"><line x1="0" x2="${W}" y1="${zero}" y2="${zero}" stroke="var(--divider)"/>${bars}${ticks}</svg>`;
 }
+function pickDay(i) {
+  if (!pBars) return;
+  const from = pBars.start + i * pBars.step;
+  pDay = pDay && pDay.from === from && pDay.step === pBars.step ? null : {from, to: from + pBars.step, step: pBars.step, label: pBars.label(i)};
+  if (pDay) { bFilter = "sold"; store.set("bFilter", bFilter); }
+  renderProfit(true); renderPurchases(true);
+  if (pDay) $("bSeg").scrollIntoView({block: "start", behavior: "smooth"});
+}
+$("pDays").addEventListener("click", (e) => { const g = e.target.closest(".pbar"); if (g) pickDay(+g.dataset.i); });
+$("pDays").addEventListener("keydown", (e) => { const g = e.target.closest(".pbar"); if (g && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); pickDay(+g.dataset.i); } });
+try { new ResizeObserver(() => { if (view === "buys" && S) renderProfit(true); }).observe($("pDays")); } catch (e) {}
+$("bDayClear").onclick = () => { pDay = null; renderProfit(true); renderPurchases(true); };
+$("bBestBox").onclick = () => {   // «лучшая сделка» — показать её день
+  const sold = (S.purchases || []).filter((p) => p.status === "sold" && p.sold_at);
+  const best = sold.reduce((b, p) => (!b || (p.profit || 0) > (b.profit || 0) ? p : b), null);
+  if (!best) return;
+  const from = dayStart(best.sold_at);
+  pDay = {from, to: from + 86400, step: 86400, label: new Date(from * 1000).toLocaleDateString("ru-RU", {day: "2-digit", month: "2-digit"}), best: best.id};
+  if (pPeriod === "day" && from < dayStart(S.now)) { pPeriod = "all"; store.set("pPeriod", pPeriod); }
+  bFilter = "sold"; renderProfit(true); renderPurchases(true); $("bSeg").scrollIntoView({block: "start", behavior: "smooth"});
+};
 let lastProfitSig = "";
 function renderProfit(force) {
   const all = S.purchases || [], now = S.now;
@@ -3399,9 +3442,16 @@ function renderPurchases(force) {
   document.querySelectorAll("#bSeg button").forEach((x) => x.classList.toggle("on", x.dataset.b === bFilter));
   $("bCntOpen").textContent = open.length || ""; $("bCntSold").textContent = sold.length || ""; $("bCntAll").textContent = all.length || "";
   $("cntBuys").textContent = open.length || "";
-  const list = all.filter((p) => bFilter === "all" || (bFilter === "open" ? p.status !== "sold" : p.status === "sold"));
+  let list = all.filter((p) => bFilter === "all" || (bFilter === "open" ? p.status !== "sold" : p.status === "sold"));
+  const dayOn = !!pDay && bFilter !== "open";
+  if (dayOn) list = list.filter((p) => p.status === "sold" && p.sold_at >= pDay.from && p.sold_at < pDay.to);
+  $("bDayBox").hidden = !dayOn;
+  if (dayOn) {
+    const s = list.reduce((x, p) => x + (p.profit || 0), 0);
+    $("bDayTxt").textContent = `${pDay.step === 3600 ? "Продажи в " + pDay.label : "Продажи за " + pDay.label}: ${list.length}, ${signed(s)}`;
+  }
   if (document.activeElement && $("bRows").contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
-  const sig = JSON.stringify([list, sellOpen, bFilter, optPick, Math.floor(S.now / 60)]);
+  const sig = JSON.stringify([list, sellOpen, bFilter, optPick, pDay, Math.floor(S.now / 60)]);
   if (!force && sig === lastBuysSig) return;
   lastBuysSig = sig;
   $("bRows").innerHTML = list.map((p) => {
@@ -3410,7 +3460,7 @@ function renderPurchases(force) {
       : sellOpen === p.id ? `<span class="unit" style="width:150px"><input class="field num" id="sellPrice" value="${rubN(unit * p.amount)}" title="За сколько продал весь лот"><i>₽</i></span><button class="btn accent" data-sold="${p.id}">Сохранить</button><button class="btn subtle" data-cancel="1">Отмена</button>`
       : `${p.status === "listed" ? `<button class="btn" data-hold="${p.id}">Снял</button>` : ""}<button class="btn" data-sell="${p.id}">Продал…</button>`;
     const third = p.status === "sold" ? ["Продал за", rub(p.sold_price)] : p.status === "listed" && p.list_price ? ["Выставлен за", rub(p.list_price)] : [p.cur_market ? "Рынок сейчас" : "Оценка при покупке", rub(unit * p.amount)];
-    return `<div class="pcard"><div class="prow">
+    return `<div class="pcard${pDay && pDay.best === p.id ? " hl" : ""}"><div class="prow">
       <div class="it">${slot(p.item_id, p.name, tone(p))}<div class="t"><div class="n">${esc(p.name)}</div><div class="m"><span class="pst ${p.status}">${STATUS_RU[p.status] || p.status}</span>${gradeTag(p)}${p.rare ? `<span class="tag rare">особо редкий</span>` : ""}<span>${p.amount > 1 ? p.amount + " шт, " : ""}куплено ${agoTs(p.bought_at, S.now)}</span></div></div></div>
       <div class="num"><div class="lbl">Купил за</div>${rub(p.paid)}</div>
       <div class="num"><div class="lbl">${third[0]}</div>${third[1]}</div>
@@ -3619,7 +3669,7 @@ function fillForm() {
   setVal("sDiscount", Math.round(c.discount * 100)); setVal("sMinProfit", rubN(c.min_profit));
   setVal("sTgToken", c.telegram_token || ""); setVal("sTgChat", c.telegram_chat_id || "");
   setVal("sRare", c.rare_enabled !== false); setVal("sRareQ", String(c.rare_quality ?? 4)); setVal("sRareProfit", rubN(c.rare_min_profit ?? 5000));
-  setVal("sTheme", c.theme || "system"); setVal("sUi", c.ui || "new"); setVal("sAutostart", !!c.autostart);
+  setVal("sTheme", c.theme || "system"); setVal("sUi", c.ui || "new"); setVal("sScale", c.ui_scale || "m"); setVal("sAutostart", !!c.autostart);
   setVal("sSoundOn", c.sound_on !== false); setVal("sVolume", c.sound_volume ?? 70); $("sVolumeV").textContent = ($("sVolume").value) + "%";
   if (SOUNDS) { setVal("sSound", c.sound); setVal("sSoundRare", c.sound_rare); }
   $("soundSum").textContent = `${soundName(c.sound)}; для особо редких — ${soundName(c.sound_rare)}; громкость ${c.sound_volume ?? 70}%`;
@@ -3651,6 +3701,7 @@ onChange("sRareQ", () => saveSetting({rare_quality: $("sRareQ").value}, "Сох�
 onChange("sRareProfit", () => saveSetting({rare_min_profit: num($("sRareProfit").value)}, "Сохранено"));
 onChange("sAutostart", () => { syncToggleLabels(); saveSetting({autostart: $("sAutostart").checked, autorun_search: $("sAutostart").checked}, true); });
 onChange("sTheme", async () => { window.__setTheme($("sTheme").value); await saveSetting({theme: $("sTheme").value}); });
+onChange("sScale", async () => { window.__setScale($("sScale").value); await saveSetting({ui_scale: $("sScale").value}); });
 onChange("sUi", async () => { if (await saveSetting({ui: $("sUi").value})) location.reload(); });
 onChange("sSoundOn", () => { syncToggleLabels(); saveSetting({sound_on: $("sSoundOn").checked}); });
 onChange("sSound", () => { playSound($("sSound").value, $("sVolume").value / 100); saveSetting({sound: $("sSound").value}); });
@@ -3752,6 +3803,7 @@ function renderKeys() {
   const st = (S && S.status) || {}, n = (S.settings.extra_keys || []).length;
   $("keysInfo").textContent = !n ? "" : st.keys_total
     ? `Ключей в работе: ${st.keys} из ${st.keys_total}` + (st.keys < st.keys_total ? " — какой-то EXBO не пустила, смотри «Журнал»" : ", до " + (st.keys * 380) + " запросов в минуту")
+      + (st.rate && st.max_rate && st.rate < st.max_rate * 0.97 ? `. Сейчас около ${Math.round(st.rate)} в минуту: EXBO ограничивает общую скорость, трекер подстроился` : "")
     : `Ещё ключей: ${n} — заработают после «Начать поиск»`;
 }
 let lastIssuedSig = "";

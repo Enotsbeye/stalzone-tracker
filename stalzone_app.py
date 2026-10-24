@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -139,6 +139,7 @@ DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # н�
                 skills={},                 # уровни навыков убежища — для калькулятора крафта
                 ui="new",                  # вид окна: new — как Windows 11, old — классический (как в 2.5)
                 theme="system",            # тема: system — как в Windows, light, dark
+                ui_scale="m",              # размер интерфейса: s — маленький, m — средний, l — крупный
                 sound_on=True,             # звук при находке
                 sound="builtin:double",    # какой: builtin:… — встроенный, win:… — из звуков Windows, custom:… — свой файл
                 sound_rare="builtin:fanfare",   # для особо редких
@@ -262,10 +263,11 @@ ICON_URL = "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main
 RESTART_DELAY = 3          # сменили ключи — перезапуск через столько секунд после последнего изменения
 RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days", "extra_keys")
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
-              "server_url_override", "ui", "theme", "sound_on", "sound", "sound_rare",
+              "server_url_override", "ui", "theme", "ui_scale", "sound_on", "sound", "sound_rare",
               "sound_volume")   # из-за них новый проход не начинаем — просто запомнить
 UI_MODES = ("new", "old")
 THEMES = ("system", "light", "dark")
+UI_SCALES = ("s", "m", "l")
 BUILTIN_SOUNDS = ("double", "fanfare", "bell", "drop", "sonar", "coin", "alarm")   # рисует сама страница (Web Audio)
 SOUND_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
 SOUND_MAX = 4 * 1024 * 1024    # свой звук — до 4 МБ
@@ -1505,6 +1507,7 @@ class Worker(threading.Thread):
                                    "key_others": getattr(api, "others_last", None), "key_limit": getattr(api, "key_limit", None),
                                    "keys": len(api.alive()) if hasattr(api, "alive") else 1,
                                    "keys_total": len(getattr(api, "members", [api])),
+                                   "rate": getattr(api, "rate", None), "max_rate": getattr(api, "max_rate", None),
                                    "delay": api_delay(fresh_ages),
                                    "delay_min": min(fresh_ages) if fresh_ages else None,
                                    "delay_n": len(fresh_ages),
@@ -2662,7 +2665,8 @@ class State:
             elif kind == "pass":
                 self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"),
                                    key_others=data.get("key_others"), key_limit=data.get("key_limit"),
-                                   keys=data.get("keys"), keys_total=data.get("keys_total"))
+                                   keys=data.get("keys"), keys_total=data.get("keys_total"),
+                                   rate=data.get("rate"), max_rate=data.get("max_rate"))
                 quiet_line = self._quiet_summary(data["time"])
                 if data["delay"] is not None:
                     self.status.update(delay=data["delay"], delay_min=data.get("delay_min"),
@@ -3385,6 +3389,8 @@ class State:
                 cfg["ui"] = data["ui"]
             if "theme" in data:
                 cfg["theme"] = data["theme"] if data["theme"] in THEMES else "system"
+            if "ui_scale" in data:
+                cfg["ui_scale"] = data["ui_scale"] if data["ui_scale"] in UI_SCALES else "m"
             if "sound_on" in data:
                 cfg["sound_on"] = bool(data["sound_on"])
             for key in ("sound", "sound_rare"):
@@ -3472,6 +3478,8 @@ def make_handler(state, token):
         ui = ui if ui in UI_MODES else "new"
         theme = state.cfg.get("theme", "system")
         html = pages[ui].replace("__THEME__", theme if theme in THEMES else "system")
+        scale = state.cfg.get("ui_scale", "m")
+        html = html.replace("__SCALE__", scale if scale in UI_SCALES else "m")
         if ui == "new":
             html = html.replace("/*__ACCENT__*/", accent_css(windows_accent()))
         return html
