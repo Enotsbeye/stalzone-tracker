@@ -10,3 +10,4 @@ journal.log
 market.db*
 api_token.json
 listing_*.json
+version_info.txt

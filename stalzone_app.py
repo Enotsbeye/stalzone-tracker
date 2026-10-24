@@ -41,13 +41,13 @@ from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     import requests
     import stalzone_tracker as eng
     import stalzone_fonts
-    from stalzone_ui import UI_HTML
+    from stalzone_ui import UI_HTML, UI_NEW_HTML
 except ImportError as e:
     print("Ошибка запуска:", e)
     print("Нужен модуль requests (pip install requests) и файлы stalzone_tracker.py, stalzone_ui.py, stalzone_fonts.py рядом.")
@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -136,7 +136,13 @@ DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # н�
                 autostart=False,           # запускать программу вместе с Windows
                 autorun_search=False,      # начинать поиск сразу при запуске программы
                 alerts=True,               # Telegram: трекер встал, компьютер спал, нет связи с сервером, продано, перебили
-                skills={})                 # уровни навыков убежища — для калькулятора крафта
+                skills={},                 # уровни навыков убежища — для калькулятора крафта
+                ui="new",                  # вид окна: new — как Windows 11, old — классический (как в 2.5)
+                theme="system",            # тема: system — как в Windows, light, dark
+                sound_on=True,             # звук при находке
+                sound="builtin:double",    # какой: builtin:… — встроенный, win:… — из звуков Windows, custom:… — свой файл
+                sound_rare="builtin:fanfare",   # для особо редких
+                sound_volume=70)           # громкость, %
 OPEN_LINKS = {
     "api_bot": "https://t.me/stalzone_api_bot",
     "docs": "https://eapi.stalzone.net/overview.html",
@@ -256,7 +262,14 @@ ICON_URL = "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main
 RESTART_DELAY = 3          # сменили ключи — перезапуск через столько секунд после последнего изменения
 RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days", "extra_keys")
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
-              "server_url_override")   # из-за них новый проход не начинаем — просто запомнить
+              "server_url_override", "ui", "theme", "sound_on", "sound", "sound_rare",
+              "sound_volume")   # из-за них новый проход не начинаем — просто запомнить
+UI_MODES = ("new", "old")
+THEMES = ("system", "light", "dark")
+BUILTIN_SOUNDS = ("double", "fanfare", "bell", "drop", "sonar", "coin", "alarm")   # рисует сама страница (Web Audio)
+SOUND_TYPES = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
+SOUND_MAX = 4 * 1024 * 1024    # свой звук — до 4 МБ
+CUSTOM_SOUNDS_MAX = 20
 FEED_PORT = 8790            # сервер для подписчиков слушает только этот компьютер; наружу — через Tailscale Funnel
 FEED_POLL = 15              # подписчик спрашивает сервер раз в столько секунд
 FEED_MIN_INTERVAL = 10      # чаще одного запроса в 10 с с одного кода — отказ
@@ -630,7 +643,7 @@ class Updater:
             ")",
             "exit /b 1",
             ":started",
-            'start "" "%OLD%"',
+            'start "" "%OLD%" --wait-instance',
             'del "%~f0"',
             ""])
         with open(bat, "w", encoding="utf-8") as f:
@@ -664,7 +677,7 @@ class Updater:
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.name == "nt" and os.path.exists(pythonw):
             exe = pythonw   # без чёрного окна консоли
-        _spawn_detached([exe, os.path.join(APP_DIR, "stalzone_app.py")], cwd=APP_DIR)
+        _spawn_detached([exe, os.path.join(APP_DIR, "stalzone_app.py"), "--wait-instance"], cwd=APP_DIR)
 
 
 # ------------------------------ Доступ по кодам ------------------------------
@@ -1370,6 +1383,7 @@ class Worker(threading.Thread):
         cfg = self.cfg
         try:
             api = self.api_factory(cfg)
+            self.api = api      # карточке рецепта — тем же ключом, без второго входа
             names = eng.load_listing(cfg["region"])
             try:
                 self.meta = {e["id"]: e for e in eng.load_catalog(cfg["region"])}
@@ -2030,6 +2044,209 @@ def set_autostart(on):
         return False, f"Не получилось настроить автозапуск ({e})"
 
 
+# ------------------------- Окно как у обычной программы Windows -------------------------
+WINDOW_TITLE = "STALZONE Трекер"
+INSTANCE_MUTEX = "Local\\STALZONE-Tracker-single"
+_instance_handle = None        # держим, пока программа работает: по нему вторая копия видит первую
+
+
+def windows_dark():
+    """Тёмная ли тема приложений в Windows (Параметры → Персонализация → Цвета). Не Windows — False."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return winreg.QueryValueEx(key, "AppsUseLightTheme")[0] == 0
+    except (OSError, ImportError, IndexError, TypeError):
+        return False
+
+
+def is_dark(theme):
+    return theme == "dark" or (theme not in ("light", "dark") and windows_dark())
+
+
+def windows_accent():
+    """Цвет акцента Windows: оттенки, которыми сама Windows рисует кнопки и ссылки в светлой и тёмной теме.
+    None — не Windows или палитра не прочиталась (тогда страница берёт обычный синий)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent") as key:
+            data = bytes(winreg.QueryValueEx(key, "AccentPalette")[0])
+    except (OSError, ImportError, IndexError, TypeError, ValueError):
+        return None
+    if len(data) < 28:
+        return None
+    # 8 цветов RGBA: светлее 3, 2, 1, сам акцент, темнее 1, 2, 3, запасной
+    cols = ["#%02x%02x%02x" % tuple(data[i * 4:i * 4 + 3]) for i in range(7)]
+    return {"light": cols[4], "light_text": cols[5], "dark": cols[1], "dark_text": cols[0]}
+
+
+def _luminance(hex_color):
+    def chan(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * chan(r) + 0.7152 * chan(g) + 0.0722 * chan(b)
+
+
+def text_on(hex_color):
+    """Белый или чёрный текст на кнопке такого цвета — что читается лучше."""
+    lum = _luminance(hex_color)
+    return "#ffffff" if (1.05 / (lum + 0.05)) >= ((lum + 0.05) / 0.05) else "#000000"
+
+
+def accent_css(acc):
+    """Переменные цвета акцента для страницы. Пусто — оставить синий по умолчанию."""
+    if not acc or not all(re.fullmatch(r"#[0-9a-f]{6}", str(acc.get(k, ""))) for k in ("light", "light_text",
+                                                                                        "dark", "dark_text")):
+        return ""
+    return (f":root{{--acc-l:{acc['light']};--acc-l-t:{acc['light_text']};--acc-l-on:{text_on(acc['light'])};"
+            f"--acc-d:{acc['dark']};--acc-d-t:{acc['dark_text']};--acc-d-on:{text_on(acc['dark'])}}}")
+
+
+def window_background(cfg):
+    """Цвет окна до того, как загрузится страница, — чтобы при запуске не мигало чужим цветом."""
+    dark = is_dark(cfg.get("theme"))
+    if cfg.get("ui") == "old":
+        return "#151916" if dark else "#ecefe9"
+    return "#202020" if dark else "#f3f3f3"
+
+
+def window_size():
+    """Размер окна при запуске: побольше на большом экране, но не больше экрана (в логических пикселях)."""
+    w, h = 1366, 768
+    try:
+        import webview
+        screens = webview.screens() if callable(getattr(webview, "screens", None)) else webview.screens
+        if screens:
+            w, h = int(screens[0].width), int(screens[0].height)
+    except Exception:
+        pass
+    return int(min(1500, max(960, w * 0.86))), int(min(940, max(600, (h - 48) * 0.9)))
+
+
+def window_handle(window):
+    """HWND окна pywebview или 0."""
+    try:
+        return int(window.native.Handle.ToInt64())
+    except Exception:
+        pass
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.FindWindowW(None, WINDOW_TITLE) or 0)
+    except Exception:
+        return 0
+
+
+def set_title_bar(hwnd, dark):
+    """Рамка и заголовок окна — тёмные или светлые, как тема программы (Windows 10 1809+ и 11)."""
+    if sys.platform != "win32" or not hwnd:
+        return
+    try:
+        import ctypes
+        value = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE: 20, в ранних сборках Windows 10 — 19
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attr, ctypes.byref(value),
+                                                          ctypes.sizeof(value)) == 0:
+                break
+        # перерисовать рамку сразу, а не при следующем переключении окон
+        ctypes.windll.user32.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)
+    except Exception:
+        pass
+
+
+def single_instance(wait=0.0):
+    """Запущена ли уже программа: True — эта копия первая (или не Windows). wait — сколько секунд ждать,
+    пока прежняя копия закроется (после обновления новая запускается раньше, чем старая успевает выйти)."""
+    global _instance_handle
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        end = time.time() + wait
+        while True:
+            handle = k32.CreateMutexW(None, False, INSTANCE_MUTEX)
+            already = k32.GetLastError() == 183   # ERROR_ALREADY_EXISTS
+            if handle and not already:
+                _instance_handle = handle
+                return True
+            if handle:
+                k32.CloseHandle(ctypes.c_void_p(handle))
+            if time.time() >= end:
+                return False
+            time.sleep(0.5)
+    except Exception:
+        return True
+
+
+def show_running_copy():
+    """Вторая копия не запускается — вместо этого показываем окно первой (развернуть, если свёрнуто)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+        if hwnd:
+            user32.ShowWindow(hwnd, 9 if user32.IsIconic(hwnd) else 5)   # SW_RESTORE или SW_SHOW
+            user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+# ------------------------------------ Звуки ------------------------------------
+SOUNDS_DIR = os.path.join(DATA_DIR, "sounds")
+
+
+def windows_sounds_dir():
+    return os.path.join(os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows", "Media")
+
+
+def windows_sounds():
+    """Звуки самой Windows (C:\\Windows\\Media\\*.wav): [имя файла]. Не Windows — пусто."""
+    folder = windows_sounds_dir()
+    try:
+        names = [n for n in os.listdir(folder) if n.lower().endswith(".wav") and os.path.isfile(os.path.join(folder, n))]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: n.lower())
+
+
+def custom_sounds():
+    try:
+        names = [n for n in os.listdir(SOUNDS_DIR) if os.path.splitext(n)[1].lower() in SOUND_TYPES]
+    except OSError:
+        return []
+    return sorted(names, key=lambda n: n.lower())
+
+
+def safe_sound_name(name):
+    """Имя файла для своего звука: без папок и странных символов, с понятным расширением. None — не звук."""
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    if ext not in SOUND_TYPES:
+        return None
+    stem = re.sub(r"[^\w\- .()]+", "_", stem, flags=re.UNICODE).strip(" ._")[:60] or "звук"
+    return stem + ext
+
+
+def sound_file(kind, name):
+    """Путь к файлу звука для страницы: kind — win или custom. None — нет такого."""
+    folder = windows_sounds_dir() if kind == "win" else SOUNDS_DIR if kind == "custom" else None
+    allowed = windows_sounds() if kind == "win" else custom_sounds() if kind == "custom" else []
+    if folder is None or name not in allowed:
+        return None
+    return os.path.join(folder, name)
+
+
 class State:
     def __init__(self, api_factory=None):
         self.lock = threading.Lock()
@@ -2064,6 +2281,8 @@ class State:
         self.access = Access(self)
         self.exit_requested = threading.Event()
         self.exit_hook = None               # как закрыть окно программы (задаёт main)
+        self.on_theme = None                # сменили тему — перекрасить рамку окна (задаёт main)
+        self._card_api, self._card_cache = None, {}   # карточка рецепта: свой ключ API и лоты за последние минуты
         logging.getLogger("tracker").addHandler(_LogHandler(self))
         logging.getLogger("tracker").setLevel(logging.INFO)
         self.add_log(f"— Запуск {APP_NAME} {APP_VERSION} · данные: {DATA_DIR} —")
@@ -2680,6 +2899,179 @@ class State:
         minutes = max(1, round(len(w.price_queue) / CRAFT_PER_PASS * 0.6))
         return True, f"Узнаю цены {len(todo)} предм. — примерно {minutes} мин, поиск при этом не останавливается"
 
+    # --- карточка рецепта: за сколько выставлять результат и до какой цены брать ингредиенты ---
+    CARD_LOTS_TTL = 180          # лоты для карточки — не чаще раза в 3 минуты на предмет
+
+    def _card_api_get(self):
+        """Ключ API для карточки: тот же, что у работающей проверки, иначе свой (без лишних входов)."""
+        with self.lock:
+            w = self.worker
+        api = getattr(w, "api", None) if isinstance(w, Worker) and w.is_alive() else None
+        if api is not None:
+            return api
+        cfg = self.api_cfg()
+        sig = (cfg.get("base_url"), cfg.get("client_id"), cfg.get("client_secret"), cfg.get("app_token"))
+        if self._card_api and self._card_api[0] == sig:
+            return self._card_api[1]
+        try:
+            api = eng.Api(dict(cfg, share_expected=False))
+        except eng.AuthError:
+            return None
+        self._card_api = (sig, api)
+        return api
+
+    def _card_lots(self, items):
+        """Лоты на аукционе сейчас: ({предмет: [лоты]}, что не так или None). С кэшем на CARD_LOTS_TTL."""
+        if self.subscriber_server():
+            return {}, "По подписке своих запросов к аукциону нет — цены из твоей базы сделок"
+        now, out, todo = time.time(), {}, []
+        for i in items:
+            hit = self._card_cache.get(i)
+            if hit and now - hit[0] < self.CARD_LOTS_TTL:
+                out[i] = hit[1]
+            else:
+                todo.append(i)
+        if not todo:
+            return out, None
+        api = self._card_api_get()
+        if api is None:
+            return out, "Нет ключей API — цены только из базы сделок"
+        region = self.cfg.get("region", "ru")
+
+        def one(item):
+            try:
+                return item, api.lots_top(region, item, min_buyouts=10, max_pages=1), None
+            except eng.ApiError as e:
+                return item, ([] if e.status in (400, 404) else None), None if e.status in (400, 404) else str(e)
+            except eng.AuthError as e:
+                return item, None, str(e)
+            except Exception as e:
+                return item, None, type(e).__name__
+        from concurrent.futures import ThreadPoolExecutor
+        err = None
+        with ThreadPoolExecutor(min(6, len(todo))) as ex:
+            for item, lots, e in ex.map(one, todo):
+                if lots is None:
+                    err = err or ("Аукцион не ответил (" + e + ") — цены из базы сделок" if e else None)
+                    continue
+                self._card_cache[item] = (now, lots)
+                out[item] = lots
+        return out, err
+
+    def _db_market(self, db, region, item_id):
+        """Рынок предмета по своей базе — так же, как его считает проверка."""
+        hours = int(self.cfg.get("history_hours") or 48)
+        long_h = max(hours, eng.LONG_DAYS * 24)
+        now = time.time()
+        long_sales = db.sales(region, item_id, now - long_h * 3600)
+        if not long_sales:
+            return {}, []
+        recent = [s for s in long_sales if s["ts"] >= now - hours * 3600]
+        min_sales = int(self.cfg.get("min_sales") or 5)
+        market = eng.market_prices(recent, min_sales, hours, True, window=db.window_hours(region, item_id, hours))
+        if len(long_sales) > len(recent):
+            longer = eng.market_prices(long_sales, min_sales, long_h, True,
+                                       window=db.window_hours(region, item_id, long_h))
+            if not eng.range_keys(market):
+                market = longer
+            elif longer:
+                market[eng.FALLBACK] = longer
+        return market, long_sales
+
+    @staticmethod
+    def _fill(lots, need):
+        """Сколько за штуку выйдет купить need штук с самых дешёвых лотов (лот берётся целиком).
+        (цена за штуку, хватает ли лотов)."""
+        asks = []
+        for lot in lots or []:
+            a, raw = int(eng._num(lot.get("amount"))), eng._num(lot.get("buyoutPrice"))
+            if a > 0 and raw > 0 and eng.grade_of(lot.get("additional")) is None:
+                asks.append((raw / a, a))
+        asks.sort()
+        got, spent = 0, 0.0
+        for unit, a in asks:
+            if got >= need:
+                break
+            got += a
+            spent += unit * a
+        return (spent / got if got else None), got >= need
+
+    def craft_card(self, recipe_id, live=True):
+        region = self.cfg.get("region", "ru")
+        perks, recipes = eng.load_hideout(region)
+        if perks is None:
+            return {"ok": False, "message": "Рецепты убежища не скачались — проверь интернет"}
+        try:
+            r = next(x for x in recipes if x["id"] == int(recipe_id))
+        except (StopIteration, TypeError, ValueError):
+            return {"ok": False, "message": "Рецепт не найден — обнови вкладку"}
+        fee = float(self.cfg.get("fee", 0.05))
+        with self.lock:
+            meta = dict(self.meta)
+        skills = {k: int(v) for k, v in (self.cfg.get("skills") or {}).items()}
+        items = list(dict.fromkeys(i for i, _ in r["result"] + r["ingredients"]))
+        tradeable = [i for i in items if (meta.get(i) or {}).get("trade", True)]
+        lots, note = self._card_lots(tradeable) if live else ({}, None)
+        db = eng.MarketDB.reader()
+        markets = {}
+        try:
+            for i in items:
+                markets[i] = self._db_market(db, region, i) if db else ({}, [])
+        except sqlite3.Error:
+            markets = {i: ({}, []) for i in items}
+        finally:
+            if db:
+                db.close()
+
+        def basics(item, amount):
+            market, sales = markets.get(item) or ({}, [])
+            found = eng.market_for(market, {}) if market else None
+            item_lots = lots.get(item)
+            fill, enough = self._fill(item_lots, amount) if item_lots is not None else (None, False)
+            fake = {"amount": amount, "buyoutPrice": 0, "additional": {}}
+            return {"id": item, "name": (meta.get(item) or {}).get("name", item), "amount": amount,
+                    "trade": bool((meta.get(item) or {}).get("trade", True)),
+                    "hist": found[0][0] if found else None, "n": found[0][1] if found else 0,
+                    "per_day": found[0][2] if found else None,
+                    "floor": eng.comparable_floor(fake, item_lots, True) if item_lots else None,
+                    "fill": fill, "enough": enough, "live": item_lots is not None,
+                    "lots_n": len(item_lots) if item_lots is not None else None}
+
+        ingredients = [basics(i, n) for i, n in r["ingredients"]]
+        cost = None if any(x["hist"] is None for x in ingredients) else sum(x["hist"] * x["amount"] for x in ingredients)
+        live_ok = ingredients and all(x["fill"] is not None and x["enough"] for x in ingredients)
+        cost_live = sum(x["fill"] * x["amount"] for x in ingredients) if live_ok else None
+        paid = cost_live if cost_live is not None else cost
+        results, revenue = [], 0.0
+        for item, amount in r["result"]:
+            x = basics(item, amount)
+            market, sales = markets.get(item) or ({}, [])
+            pairs = eng.deal_pairs(market, {}) if market else None
+            x["options"] = []
+            if x["hist"] and pairs:
+                trend = eng.price_trend(sales, {}, True)
+                x["trend"] = trend
+                x["options"] = eng.price_options(x["hist"], amount, pairs[0], pairs[1], lots.get(item) or [], {},
+                                                 True, paid=(paid or 0) / max(1, len(r["result"])), fee=fee)
+            best = next((o for o in x["options"] if o["key"] == "best"), x["options"][0] if x["options"] else None)
+            x["sell_unit"] = best["unit"] if best else x["hist"]
+            if revenue is not None:
+                revenue = None if x["sell_unit"] is None else revenue + x["sell_unit"] * amount * (1 - fee)
+            results.append(x)
+        for x in ingredients:   # дороже этой цены за штуку — крафт в минус (остальное — по рынку)
+            others = None if cost is None else cost - x["hist"] * x["amount"]
+            x["ceiling"] = (revenue - others) / x["amount"] if revenue is not None and others is not None else None
+        profit = revenue - cost if revenue is not None and cost is not None else None
+        profit_live = revenue - cost_live if revenue is not None and cost_live is not None else None
+        need = {k: v for k, v in r["perks"].items() if skills.get(k, 0) < v}
+        return {"ok": True, "id": r["id"], "bench": r["bench"], "cat": r["cat"], "sub": r["sub"], "energy": r["energy"],
+                "perks": [{"id": k, "name": perks.get(k, k), "level": v, "have": skills.get(k, 0)} for k, v in r["perks"].items()],
+                "features": r["features"], "available": not need,
+                "result": results, "ingredients": ingredients, "cost": cost, "cost_live": cost_live,
+                "revenue": revenue, "profit": profit, "profit_live": profit_live,
+                "per_energy": (profit / r["energy"] * 1000) if profit is not None and r["energy"] > 0 else None,
+                "live": bool(lots), "note": note, "fee": fee, "at": time.time()}
+
     # --- что приносят предметы списка ---
     def item_yield(self):
         """По каждому предмету своего списка: сколько лотов дешевле рынка видели за неделю, на сколько из них
@@ -2987,6 +3379,24 @@ class State:
                     cfg[key] = bool(data[key])
             if "skills" in data and isinstance(data["skills"], dict):
                 cfg["skills"] = {str(k)[:40]: min(5, max(0, int(float(v or 0)))) for k, v in data["skills"].items()}
+            if "ui" in data:
+                if data["ui"] not in UI_MODES:
+                    return False, "Вид программы: новый или классический"
+                cfg["ui"] = data["ui"]
+            if "theme" in data:
+                cfg["theme"] = data["theme"] if data["theme"] in THEMES else "system"
+            if "sound_on" in data:
+                cfg["sound_on"] = bool(data["sound_on"])
+            for key in ("sound", "sound_rare"):
+                if key in data:
+                    kind, _, name = str(data[key] or "").partition(":")
+                    ok = (kind == "builtin" and name in BUILTIN_SOUNDS) or (kind in ("win", "custom")
+                                                                         and sound_file(kind, name))
+                    if not ok:
+                        return False, "Такого звука нет — выбери другой"
+                    cfg[key] = f"{kind}:{name}"
+            if "sound_volume" in data:
+                cfg["sound_volume"] = min(100, max(0, int(float(data["sound_volume"]))))
             if "update_repo" in data:
                 repo = str(data["update_repo"] or "").strip().strip("/")
                 repo = re.sub(r"^https?://github\.com/", "", repo).strip("/")   # можно вставить и ссылку
@@ -3013,6 +3423,11 @@ class State:
             ok, why = set_autostart(cfg["autostart"])
             if not ok:
                 note = " · " + why
+        if "theme" in changed and self.on_theme:
+            try:
+                self.on_theme(cfg["theme"])
+            except Exception:
+                pass
         if changed & {"min_profit", "discount", "rare_enabled", "rare_min_profit", "rare_quality", "rare_items",
                       "threshold_expected"}:
             with self.lock:
@@ -3047,7 +3462,19 @@ BLANK_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADU
 
 
 def make_handler(state, token):
-    page = UI_HTML.replace("__TOKEN__", token)
+    pages = {"old": UI_HTML.replace("__TOKEN__", token), "new": UI_NEW_HTML.replace("__TOKEN__", token)}
+
+    def page_for(query):
+        """Страница окна: вид из настроек (или ?ui=old|new), тема и цвет акцента Windows — сразу в разметке,
+        чтобы при открытии ничего не мигало."""
+        want = (parse_qs(query).get("ui") or [""])[0]
+        ui = want if want in UI_MODES else state.cfg.get("ui", "new")
+        ui = ui if ui in UI_MODES else "new"
+        theme = state.cfg.get("theme", "system")
+        html = pages[ui].replace("__THEME__", theme if theme in THEMES else "system")
+        if ui == "new":
+            html = html.replace("/*__ACCENT__*/", accent_css(windows_accent()))
+        return html
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -3087,13 +3514,29 @@ def make_handler(state, token):
         def do_GET(self):
             url = urlparse(self.path)
             if url.path in ("/", "/index.html"):
-                body = page.encode("utf-8")
+                body = page_for(url.query).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if url.path.startswith("/sound/"):
+                # звук для <audio>: заголовок с токеном туда не добавить, поэтому токен — в адресе
+                if not secrets.compare_digest((parse_qs(url.query).get("t") or [""])[0], token):
+                    return self.send_json({"error": "forbidden"}, 403)
+                kind, _, name = url.path[7:].partition("/")
+                path = sound_file(kind, unquote(name))
+                data = None
+                if path:
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read(SOUND_MAX + 1)
+                    except OSError:
+                        data = None
+                ctype = SOUND_TYPES.get(os.path.splitext(path or "")[1].lower(), "application/octet-stream")
+                return self.send_file(data if data and len(data) <= SOUND_MAX else None, ctype, 3600)
             if url.path.startswith("/icon/") and url.path.endswith(".png"):
                 data = state.icon(url.path[6:-4])
                 # нет картинки — прозрачный пиксель (страница покажет букву); попробуем снова через 10 минут
@@ -3112,6 +3555,12 @@ def make_handler(state, token):
                                        "ranks": eng.RANK_NAMES})
             if url.path == "/api/craft":
                 return self.send_json(state.craft())
+            if url.path == "/api/craft/card":
+                q = parse_qs(url.query)
+                return self.send_json(state.craft_card((q.get("id") or [""])[0], live=(q.get("live") or ["1"])[0] != "0"))
+            if url.path == "/api/sounds":
+                return self.send_json({"builtin": list(BUILTIN_SOUNDS), "windows": windows_sounds(),
+                                       "custom": custom_sounds()})
             if url.path == "/api/yield":
                 return self.send_json(state.item_yield())
             if url.path == "/api/item_stats":
@@ -3127,7 +3576,42 @@ def make_handler(state, token):
             if not self.authorized():
                 return self.send_json({"error": "forbidden"}, 403)
             path = urlparse(self.path).path
+            if path == "/api/sound/upload":   # свой звук: тело — сам файл, имя — в заголовке
+                n = int(self.headers.get("Content-Length") or 0)
+                name = safe_sound_name(unquote(self.headers.get("X-Filename") or ""))
+                if not name:
+                    return self.send_json({"ok": False, "message": "Нужен звук в формате wav, mp3, ogg или m4a"})
+                if n <= 0 or n > SOUND_MAX:
+                    if n > 0:
+                        self.rfile.read(min(n, SOUND_MAX + 1))
+                    return self.send_json({"ok": False, "message": "Файл больше 4 МБ — выбери звук покороче"})
+                data = self.rfile.read(n)
+                if len(custom_sounds()) >= CUSTOM_SOUNDS_MAX and name not in custom_sounds():
+                    return self.send_json({"ok": False, "message": f"Своих звуков уже {CUSTOM_SOUNDS_MAX} — удали ненужные"})
+                try:
+                    os.makedirs(SOUNDS_DIR, exist_ok=True)
+                    target = os.path.join(SOUNDS_DIR, name)
+                    with open(target + ".part", "wb") as f:
+                        f.write(data)
+                    os.replace(target + ".part", target)
+                except OSError as e:
+                    return self.send_json({"ok": False, "message": f"Не получилось сохранить звук ({e})"})
+                return self.send_json({"ok": True, "id": "custom:" + name, "message": "Звук добавлен: " + name})
             data = self.body_json()
+            if path == "/api/sound/remove":
+                kind, _, name = str(data.get("id") or "").partition(":")
+                target = sound_file("custom", name) if kind == "custom" else None
+                if not target:
+                    return self.send_json({"ok": False, "message": "Такого звука нет"})
+                try:
+                    os.remove(target)
+                except OSError as e:
+                    return self.send_json({"ok": False, "message": f"Не получилось удалить ({e})"})
+                fix = {k: "builtin:double" if k == "sound" else "builtin:fanfare"
+                       for k in ("sound", "sound_rare") if state.cfg.get(k) == "custom:" + name}
+                if fix:
+                    state.update_settings(fix)
+                return self.send_json({"ok": True, "message": "Звук удалён"})
             if path == "/api/purchases/add":
                 ok, msg = state.buy(data.get("deal_id"), data.get("paid"))
                 return self.send_json({"ok": ok, "message": msg})
@@ -3258,6 +3742,10 @@ def start_server(state):
 
 
 def main():
+    # вторая копия не нужна (два поиска одним ключом мешали бы друг другу) — показываем окно первой
+    if not single_instance(wait=30 if "--wait-instance" in sys.argv else 0):
+        show_running_copy()
+        return
     state = State()
     server, port = start_server(state)
     url = f"http://127.0.0.1:{port}/"
@@ -3274,10 +3762,29 @@ def main():
     windowed = False
     try:
         import webview  # окно приложения (pip install pywebview)
-        window = webview.create_window("STALZONE Трекер", url, width=1320, height=840,
-                                       min_size=(1080, 680), background_color="#0d1012",
+        width, height = window_size()
+        window = webview.create_window(WINDOW_TITLE, url, width=width, height=height,
+                                       min_size=(960, 600), background_color=window_background(state.cfg),
                                        minimized=autostarted)
         state.exit_hook = window.destroy   # чтобы обновление могло закрыть окно
+
+        def paint_frame(theme=None):
+            """Рамка окна в цвет темы программы. «Как в Windows» pywebview красит сам."""
+            theme = theme or state.cfg.get("theme", "system")
+            if theme in ("light", "dark"):
+                set_title_bar(window_handle(window), theme == "dark")
+            elif theme == "system":
+                set_title_bar(window_handle(window), windows_dark())
+
+        def on_shown():
+            paint_frame()
+            try:   # Windows сменила тему — pywebview перекрасит рамку по системе; если в программе своя — вернём
+                from Microsoft.Win32 import SystemEvents
+                SystemEvents.UserPreferenceChanged += lambda *_: threading.Timer(0.3, paint_frame).start()
+            except Exception:
+                pass
+        window.events.shown += on_shown
+        state.on_theme = paint_frame
         webview.start()
         windowed = True
     except Exception as e:  # нет pywebview или окно не открылось (например, нет WebView2) — откроем браузер

@@ -37,7 +37,7 @@
 ## Для разработки
 
 Код: `stalzone_tracker.py` — движок (API, база сделок, поиск, шанс продажи), `stalzone_app.py` — окно, сервер,
-доступ, `stalzone_ui.py` — страница окна, `stalzone_fonts.py` — шрифты Golos Text и Unbounded
+доступ, `stalzone_ui.py` — страница окна (новый вид `UI_NEW_HTML` и классический `UI_HTML`), `make_version_info.py` — название и версия в свойствах .exe, `stalzone_fonts.py` — шрифты Golos Text и Unbounded
 (лицензия SIL OFL 1.1, `FONTS-OFL.txt`).
 
 `pip install requests pywebview cryptography`, затем `python stalzone_app.py`.

@@ -31,7 +31,8 @@ echo [2/3] Проверяю логику трекера...
 "%PYEXE%" stalzone_tracker.py --selftest >"%TEMP%\stalzone-selftest.txt" 2>&1
 if errorlevel 1 goto selftest_failed
 echo [3/3] Собираю программу, это 1-2 минуты...
-"%PYEXE%" -m PyInstaller --noconfirm --onefile --windowed --log-level WARN --name "STALZONE Tracker" --icon stalzone.ico stalzone_app.py
+"%PYEXE%" make_version_info.py >nul
+"%PYEXE%" -m PyInstaller --noconfirm --onefile --windowed --noupx --log-level WARN --name "STALZONE Tracker" --icon stalzone.ico --version-file version_info.txt stalzone_app.py
 if errorlevel 1 goto fail
 echo.
 echo Готово: папка dist, файл "STALZONE Tracker.exe". Его можно отправить другу.
