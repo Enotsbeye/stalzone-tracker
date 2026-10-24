@@ -204,6 +204,8 @@ table.craft th:nth-child(-n+2),table.craft td:nth-child(-n+2){text-align:left}
 table.craft tr.loss{opacity:.6}
 .noprice{color:var(--faint)}
 .tag.bad{color:var(--bad);background:var(--bad-soft)}
+.warncard{border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
+.warncard h3{color:var(--bad)}
 .nr.gone .n{text-decoration:line-through}
 .lot-side .btn{margin-top:4px;margin-right:-8px}
 .profit{font:600 19px/1.2 var(--display);color:var(--good);white-space:nowrap}
@@ -501,13 +503,12 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="card">
             <h3>Категории целиком</h3>
             <div class="sub">Трекер сам проверит все предметы категории, даже если их нет в твоём списке.</div>
-            <div class="catrow all-head"><div><b>Весь аукцион</b><small id="allSub">всё, что продаётся: свой список — каждый проход, остальное — по очереди</small></div><label class="switch"><input type="checkbox" id="sAllMarket"><i></i></label></div>
             <div class="catrow art-head"><div><b>Артефакты</b><small id="artSub">все артефакты из базы игры</small></div><label class="switch"><input type="checkbox" id="sAllArts" data-cat="artefact"><i></i></label></div>
             <div class="catrow"><div><b>Броня</b><small data-cnt="armor"></small></div><label class="switch"><input type="checkbox" data-cat="armor"><i></i></label></div>
             <div class="catrow"><div><b>Оружие</b><small data-cnt="weapon"></small></div><label class="switch"><input type="checkbox" data-cat="weapon"><i></i></label></div>
             <div class="catrow"><div><b>Запчасти</b><small data-cnt="parts"></small></div><label class="switch"><input type="checkbox" data-cat="parts"><i></i></label></div>
             <div class="catrow"><div><b>Инструменты</b><small data-cnt="tools"></small></div><label class="switch"><input type="checkbox" data-cat="tools"><i></i></label></div>
-            <div class="note" id="catNote">«Весь аукцион» не тормозит твой список: он проверяется каждый проход (~1 мин), остальное — по очереди. Первый обход всего аукциона — около 10 минут (трекер узнаёт цены), дальше быстрее. Цена брони и оружия зависит от заточки — такие находки проверяй в игре.</div>
+            <div class="note" id="catNote">Каждый предмет — 1–2 запроса к API за круг (лимит EXBO — 400 в минуту). Чем больше предметов, тем длиннее круг. Цена брони и оружия зависит от заточки — такие находки проверяй в игре.</div>
           </div>
         </div>
       </div>
@@ -627,9 +628,9 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
         <div class="col">
           <div class="card">
             <h3>Этот компьютер</h3>
-            <div class="sub">По коду запроса владелец выдаёт код доступа. Код работает только на этом компьютере.</div>
+            <div class="sub">Вставь код от владельца — больше ничего не нужно: компьютер привяжется сам.</div>
             <div class="idrow"><b class="num" id="accMachine">—</b><button class="btn" id="accCopyId">Копировать код запроса</button></div>
-            <div class="muted small" style="margin:-4px 0 8px">Код запроса = ID компьютера + его ключ. С ним владелец может вложить в код доступа свой ключ API — тогда свои ключи не нужны.</div>
+            <div class="muted small" style="margin:-4px 0 8px">Код запроса нужен, только если владелец сам его попросит.</div>
             <div class="note" id="accStatus"></div>
             <div id="accCodeBox">
               <div class="row wide"><label>Новый код доступа<small>если владелец прислал новый или продлил старый</small></label><textarea class="field code" id="accCode" placeholder="SZ1-…"></textarea></div>
@@ -648,14 +649,20 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           </div>
         </div>
         <div class="col">
+          <div class="card warncard" id="keyWarn" hidden>
+            <h3>Твой ключ API тратит ещё кто-то</h3>
+            <div class="sub" id="keyWarnText"></div>
+            <div class="linkrow"><button class="btn" data-open="api_bot">Открыть @stalzone_api_bot</button><button class="btn" data-goto="settings">Вписать новый секрет</button></div>
+          </div>
           <div class="card" id="serverCard" hidden>
             <h3>Сервер для подписчиков</h3>
-            <div class="sub">Твоя программа ищет находки твоим ключом EXBO и раздаёт их подписчикам — им ключи не нужны. Пока сервер работает, компьютер должен быть включён.</div>
+            <div class="sub">Один поиск — для всех: твоя программа раздаёт найденное из памяти, подписчики лимит EXBO не тратят, и твой поиск не замедляется, сколько бы их ни было. Пока сервер работает, компьютер должен быть включён.</div>
             <div class="row"><label>Раздавать находки подписчикам</label><label class="switch"><input type="checkbox" id="srvOn"><i></i></label></div>
             <div class="row wide"><label>Публичный адрес<small>его даёт Tailscale Funnel, например https://мой-пк.xxxx.ts.net — он вписывается в новые коды</small></label><input class="field" id="srvUrl" placeholder="https://…ts.net" autocomplete="off"></div>
             <div class="note" id="srvStatus"></div>
-            <div class="linkrow"><button class="btn primary" id="srvSave">Сохранить</button><button class="btn" id="srvTest">Проверить адрес</button></div>
-            <details class="note howto"><summary>Как открыть сервер в интернет — бесплатно, без настройки роутера</summary>
+            <div class="linkrow"><button class="btn primary" id="srvFunnel">Открыть доступ из интернета</button><button class="btn" id="srvLink" hidden>Открыть ссылку Tailscale</button></div>
+            <div class="linkrow"><button class="btn" id="srvSave">Сохранить</button><button class="btn" id="srvTest">Проверить адрес</button></div>
+            <details class="note howto"><summary>Если кнопка не помогла — то же вручную</summary>
               <ol>
                 <li>Скачай и установи Tailscale: tailscale.com/download → Windows. Войди через Google или Microsoft.</li>
                 <li>Открой «Командную строку» (Win+R → <b>cmd</b> → Enter) и выполни: <code id="funnelCmd">tailscale funnel --bg 8790</code></li>
@@ -666,20 +673,24 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           </div>
           <div class="card" id="ownerIssue" hidden>
             <h3>Выдать доступ</h3>
-            <div class="sub">Друг запускает программу, жмёт «Копировать код запроса» и присылает тебе. Если включён сервер для подписчиков, друг получает твои находки и ключи EXBO ему не нужны.</div>
-            <div class="row wide"><label>Имя<small>по нему потом можно отозвать доступ</small></label><input class="field" id="isName" autocomplete="off"></div>
-            <div class="row wide"><label>Код запроса друга<small>друг копирует его в своей программе: «Копировать код запроса»</small></label><input class="field" id="isMachine" placeholder="SZR1-…" autocomplete="off"></div>
-            <div class="row"><label>Вложить мой ключ API<small>другу не нужны свои ключи, но лимит EXBO (400 в минуту) делится между вами — твой поиск станет медленнее вдвое. Лучше сервер для подписчиков.</small></label><label class="switch"><input type="checkbox" id="isShare"><i></i></label></div>
+            <div class="sub">Код можно просто отправить: компьютер подписчика привяжется сам при первом подключении. Для группы или канала поставь больше мест — каждый новый компьютер займёт одно.</div>
+            <div class="note warn" id="isWarn" hidden>Сервер ещё не открыт в интернет — по новому коду находки не придут. Нажми «Открыть доступ из интернета» в карточке сервера.</div>
+            <div class="row wide"><label>Кому<small>имя человека или название группы — по нему потом можно отключить</small></label><input class="field" id="isName" autocomplete="off"></div>
+            <div class="row"><label>Мест<small>1 — один человек; больше — один код на группу</small></label><input class="field num" id="isSeats" value="1" inputmode="numeric"></div>
             <div class="row"><label>Срок<small>дней, 0 — бессрочно</small></label><input class="field num" id="isDays" value="30" inputmode="numeric"></div>
+            <details class="note howto"><summary>Привязать к конкретному компьютеру сразу</summary>
+              <div class="row wide" style="margin-top:8px"><label>Код запроса<small>подписчик копирует его в своей программе: «Копировать код запроса»</small></label><input class="field" id="isMachine" placeholder="SZR1-…" autocomplete="off"></div>
+            </details>
             <div class="linkrow"><button class="btn primary" id="isBtn">Создать код</button></div>
             <div id="isResult" hidden>
-              <div class="row wide"><label>Код для друга<small>отправь целиком, вместе со ссылкой на программу</small></label><textarea class="field code" id="isCode" readonly></textarea></div>
-              <div class="linkrow"><button class="btn" id="isCopy">Копировать код</button><button class="btn" id="isCopyLink">Копировать ссылку на программу</button></div>
+              <div class="row wide"><label>Сообщение подписчику<small>ссылка на программу, код и что сделать — отправь целиком</small></label><textarea class="field code" id="isMsg" readonly style="min-height:150px"></textarea></div>
+              <textarea id="isCode" hidden readonly></textarea>
+              <div class="linkrow"><button class="btn primary" id="isCopy">Скопировать сообщение</button><button class="btn" id="isCopyCode">Скопировать только код</button></div>
             </div>
           </div>
           <div class="card" id="ownerList" hidden>
             <h3>Подписчики</h3>
-            <div class="sub">«+30 дн.» создаёт новый код с продлением от конца оплаченного срока и копирует его — отправь подписчику. «Отключить» сразу закрывает ему находки с сервера.</div>
+            <div class="sub">«+30 дн.» — новый код с продлением от конца оплаченного срока (места переходят на него). «Освободить» — если подписчик сменил компьютер. «Отключить» сразу закрывает находки.</div>
             <div class="issued" id="issuedList"></div>
             <div class="linkrow"><button class="btn" data-open="revoked_new">Создать revoked.txt</button><button class="btn" data-open="revoked_edit">Изменить revoked.txt</button></div>
             <div class="muted small" style="margin-top:6px">revoked.txt — для тех, кто пользуется программой без сервера: впиши имя или номер кода, программа у него закроется в течение трёх часов.</div>
@@ -1288,11 +1299,7 @@ function renderChips(force) {
     : cats.length ? "Свой список пуст — проверяются только категории целиком." : "Список пуст.";
   $("watchCnt").textContent = list.length ? "· " + list.length : "";
   $("cntItems").textContent = watchTotal() || "";
-  const all = !!S.settings.all_market;
-  $("sAllMarket").checked = all;
-  const tradable = Object.values(S.cat_counts || {}).reduce((x, n) => x + n, 0);
-  $("allSub").textContent = tradable ? `все ${tradable.toLocaleString("ru-RU")} предметов, что продаются: свой список — каждый проход, остальное — по очереди` : $("allSub").textContent;
-  document.querySelectorAll("[data-cat]").forEach((el) => { el.checked = all || cats.includes(el.dataset.cat); el.disabled = all; });
+  document.querySelectorAll("[data-cat]").forEach((el) => el.checked = cats.includes(el.dataset.cat));
   const arts = S.cat_counts.artefact || S.artifacts;
   $("artSub").textContent = arts ? `все ${arts} ${plural(arts, ["артефакт", "артефакта", "артефактов"])} из базы игры` : "все артефакты из базы игры";
   document.querySelectorAll("[data-cnt]").forEach((el) => {
@@ -1301,12 +1308,6 @@ function renderChips(force) {
   });
   if (CAT && view === "items") renderCatalog();
 }
-$("sAllMarket").onchange = async () => {
-  const on = $("sAllMarket").checked;
-  const r = await api("/api/settings", {all_market: on});
-  toast(r.ok ? (on ? "Весь аукцион включён — первый обход займёт дольше: трекер узнаёт цены всех предметов" : "Весь аукцион выключен") : r.message, !r.ok);
-  refresh();
-};
 document.querySelectorAll("[data-cat]").forEach((el) => el.onchange = async () => {
   const cats = [...document.querySelectorAll("[data-cat]")].filter((x) => x.checked).map((x) => x.dataset.cat);
   const r = await api("/api/settings", {auto_categories: cats});
@@ -1559,12 +1560,29 @@ $("accCodeBtn").onclick = async () => { if (await enterCode($("accCode").value))
 $("osCreate").onclick = async () => { const r = await api("/api/access/owner_key", {}); toast(r.message, !r.ok); refresh(); };
 $("osCopy").onclick = () => copyText($("osPub").value, "Открытый ключ скопирован");
 $("isBtn").onclick = async () => {
-  const r = await api("/api/access/issue", {name: $("isName").value, machine: $("isMachine").value, days: $("isDays").value, share: $("isShare").checked});
+  const r = await api("/api/access/issue", {name: $("isName").value, machine: $("isMachine").value, days: $("isDays").value, seats: $("isSeats").value});
   toast(r.message, !r.ok);
-  if (r.ok) { $("isCode").value = r.code; $("isResult").hidden = false; $("isName").value = ""; $("isMachine").value = ""; }
+  if (r.ok) { showInvite(r.code, +$("isDays").value || 0); $("isName").value = ""; $("isMachine").value = ""; }
   refresh();
 };
-$("isCopy").onclick = () => copyText($("isCode").value, "Код скопирован — отправь его другу");
+function inviteText(code, days) {
+  return `Доступ к STALZONE Трекеру${days ? ` на ${days} дн.` : ""}:\n1. Скачай программу: ${RELEASES_URL}\n2. Запусти и вставь этот код:\n${code}\n\nКлючи EXBO не нужны — находки приходят с моего сервера.`;
+}
+function showInvite(code, days) {
+  $("isCode").value = code; $("isMsg").value = inviteText(code, days); $("isResult").hidden = false;
+}
+$("isCopy").onclick = () => copyText($("isMsg").value, "Сообщение скопировано — отправь его подписчику");
+$("isCopyCode").onclick = () => copyText($("isCode").value, "Код скопирован");
+let funnelLink = null;
+$("srvFunnel").onclick = async () => {
+  toast("Открываю доступ через Tailscale…");
+  const r = await api("/api/server/funnel", {});
+  toast(r.message, !r.ok);
+  funnelLink = r.link || null; $("srvLink").hidden = !funnelLink;
+  if (r.ok) srvDirty = false;
+  refresh();
+};
+$("srvLink").onclick = () => { if (funnelLink) api("/api/open", {url: funnelLink}); };
 let srvDirty = false;
 $("srvSave").onclick = async () => {
   const r = await api("/api/settings", {server_enabled: $("srvOn").checked, server_url: $("srvUrl").value});
@@ -1578,7 +1596,6 @@ function onlineText(t) {
   const m = (S.now - t) / 60;
   return m < 2 ? `<span class="dotx on"></span>онлайн` : `<span class="dotx"></span><span class="muted">${ago(new Date(t * 1000).toISOString(), S.now)}</span>`;
 }
-$("isCopyLink").onclick = () => copyText(RELEASES_URL, "Ссылка на программу скопирована");
 function renderAccess() {
   const a = S.access || {};
   const locked = !!(a.required && !a.ok);
@@ -1602,6 +1619,15 @@ function renderAccess() {
   const owner = a.owner && a.embedded;
   $("ownerIssue").hidden = !owner; $("ownerList").hidden = !owner; $("serverCard").hidden = !owner;
   const sv = S.server || {};
+  const kw = keyLoad();
+  $("keyWarn").hidden = !kw;
+  if (kw) {
+    const names = (a.issued || []).filter((d) => d.shared && !d.renewed && !d.expired).map((d) => d.name);
+    $("keyWarnText").textContent = `Сейчас твоим ключом пользуется ещё кто-то: ~${kw.others} запросов в минуту из ${kw.limit}. Твой поиск от этого медленнее. `
+      + (names.length ? `Коды с твоим ключом: ${names.join(", ")}. ` : "Так бывает, если ключ вписан во вторую копию программы или на сайт. ")
+      + "Как вернуть скорость: смени Client Secret в @stalzone_api_bot и впиши новый в «Настройки» — старые коды с ключом сразу перестанут работать. Подписчикам выдай новые коды: они получают находки с твоего сервера и лимит не тратят.";
+  }
+  $("isWarn").hidden = !owner || !!(sv.enabled && sv.url);
   if (owner) {
     if (!srvDirty) { $("srvOn").checked = !!sv.enabled; $("srvUrl").value = sv.url || ""; }
     $("funnelCmd").textContent = "tailscale funnel --bg " + (sv.port || 8790);
@@ -1612,14 +1638,17 @@ function renderAccess() {
       : `Не запустился: ${esc(sv.error || "")}`;
     const list = (a.issued || []).filter((d) => !d.renewed || d.blocked);
     $("issuedList").innerHTML = list.length ? ["<span class='muted'>Кто</span><span class='muted'>Оплачено до</span><span class='muted'>Сейчас</span><span></span>"]
-      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${esc(d.machine)} · № ${esc(d.id)}</span>${d.shared ? ` <span class="tag" title="С твоим ключом API">ключ API</span>` : ""}${d.blocked ? ` <span class="tag" style="color:var(--bad)">отключён</span>` : ""}</span>`
+      .concat(list.map((d) => `<span>${esc(d.name)} <span class="muted">${d.machine === "*" ? `мест занято ${d.taken || 0} из ${d.seats || 1}` : esc(d.machine)} · № ${esc(d.id)}</span>${d.shared ? ` <span class="tag bad" title="Код с твоим ключом API: его программа тратит твой лимит. Смени Client Secret, и такой код перестанет работать">ключ API — тратит твой лимит</span>` : ""}${d.blocked ? ` <span class="tag" style="color:var(--bad)">отключён</span>` : ""}</span>`
         + `<span style="${d.expired ? "color:var(--bad)" : ""}">${esc(d.expires_text)}</span><span>${onlineText(d.last_seen)}</span>`
-        + `<span class="act"><button class="btn sm" data-renew="${esc(d.id)}">+30 дн.</button><button class="btn sm ghost" data-block="${esc(d.id)}" data-on="${d.blocked ? 0 : 1}">${d.blocked ? "Включить" : "Отключить"}</button></span>`)).join("")
+        + `<span class="act"><button class="btn sm" data-renew="${esc(d.id)}">+30 дн.</button>${d.machine === "*" && d.taken ? `<button class="btn sm ghost" data-free="${esc(d.id)}" title="Подписчик сменил компьютер — место освободится, привяжется заново">Освободить</button>` : ""}<button class="btn sm ghost" data-block="${esc(d.id)}" data-on="${d.blocked ? 0 : 1}">${d.blocked ? "Включить" : "Отключить"}</button></span>`)).join("")
       : "<span class='muted' style='grid-column:1/-1'>Пока никому не выдавал.</span>";
     $("issuedList").querySelectorAll("[data-renew]").forEach((b) => b.onclick = async () => {
       const r = await api("/api/access/renew", {id: b.dataset.renew, days: 30});
-      if (r.ok) { copyText(r.code, r.message); $("isCode").value = r.code; $("isResult").hidden = false; } else toast(r.message, true);
+      if (r.ok) { showInvite(r.code, 30); copyText($("isMsg").value, "Новый код и сообщение скопированы — отправь подписчику"); } else toast(r.message, true);
       refresh();
+    });
+    $("issuedList").querySelectorAll("[data-free]").forEach((b) => b.onclick = async () => {
+      const r = await api("/api/access/free_seats", {id: b.dataset.free}); toast(r.message, !r.ok); refresh();
     });
     $("issuedList").querySelectorAll("[data-block]").forEach((b) => b.onclick = async () => {
       const r = await api("/api/access/block", {id: b.dataset.block, blocked: b.dataset.on === "1"}); toast(r.message, !r.ok); refresh();
@@ -1629,6 +1658,10 @@ function renderAccess() {
   $("feedNote").hidden = !sub; $("subItemsNote").hidden = !sub;
 }
 
+function keyLoad() {
+  const st = (S && S.status) || {}, o = st.key_others, lim = st.key_limit || 400;
+  return o != null && o >= lim * 0.1 ? {others: Math.round(o), limit: lim} : null;
+}
 // ---------- состояние: одно понятное предложение вместо приборной панели ----------
 function renderStatus() {
   const st = S.status, run = st.running, sv = st.server;
@@ -1654,10 +1687,10 @@ function renderStatus() {
   else h = run ? (near.length ? "По твоим порогам пока ничего — ищу дальше" : "Пока ничего выгодного — ищу дальше") : "Поиск остановлен";
   if (subscriber) sub = !sv ? "Находки придут с сервера владельца после «Начать поиск»." : sv.ok ? `Сервер владельца на связи${sv.server_pass ? ", его последняя проверка " + ago(new Date(sv.server_pass * 1000).toISOString(), S.now) : ""}.` : (sv.error || "Сервер владельца не отвечает.");
   else if (run) {
-    sub = st.coverage
-      ? `Свой список (${st.core}) — каждый проход, ~${Math.max(1, Math.round(st.took))} с; весь аукцион (${(st.auto || 0).toLocaleString("ru-RU")}) обхожу примерно за ${Math.max(1, Math.round(st.coverage))} мин.`
-      : `Проверяю ${items} ${plural(items, ["предмет", "предмета", "предметов"])} по кругу${st.took ? `, круг занимает ~${Math.max(1, Math.round(st.took))} с` : ""}.`;
+    sub = `Проверяю ${items} ${plural(items, ["предмет", "предмета", "предметов"])} по кругу${st.took ? `, круг занимает ~${Math.max(1, Math.round(st.took))} с` : ""}.`;
     if (st.delay !== null && st.delay !== undefined) sub += ` Новые лоты аукцион отдаёт через API примерно через ${Math.max(1, Math.round(st.delay))} мин после выставления — так у всех, кто смотрит через API.`;
+    const kl = keyLoad();
+    if (kl) sub += ` Твоим ключом API пользуется ещё кто-то (~${kl.others} запр./мин) — поиск медленнее, подробнее во вкладке «Доступ».`;
     if (!active.length && near.length) sub = `Дешевле рынка есть ${near.length} ${plural(near.length, ["лот", "лота", "лотов"])} с меньшей выгодой, чем в твоих порогах, — смотри «Почти находки» ниже. ` + sub;
   }
   else sub = active.length ? "Это находки с прошлого поиска. Нажми «Начать поиск», чтобы искать дальше." : "Нажми «Начать поиск» — трекер будет проверять аукцион без остановки и покажет здесь лоты дешевле рынка.";

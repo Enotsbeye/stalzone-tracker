@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -266,11 +266,6 @@ NEAR_MIN_PROFIT = 3000      # …с прибылью от 3 000 ₽, котор�
 NEAR_KEEP = 30 * 60         # «почти находка» видна, пока лот на аукционе, но не дольше получаса без новых проверок
 NEAR_MAX = 40
 QUIET_SUMMARY = 30 * 60     # столько без находок — пишем в журнал, что было отсеяно порогами
-ROTATE_MIN = 40             # «весь аукцион»: столько предметов «целиком» и меньше — обходим все каждый проход
-ROTATE_MAX = 900            # больше за проход не берём
-PASS_TARGET_MIN = 1.0       # проход со своим списком и частью остальных — около минуты
-HOT_HEAT = 3.0              # новых лотов в час — такой предмет из «всего аукциона» проверяем каждый проход
-HOT_MAX = 60
 CRAFT_PER_PASS = 15         # цены для калькулятора крафта: столько предметов за проход (≈ 20–40 запросов в минуту)
 STALL_ALERT = 10 * 60       # поиск идёт, а проходов нет столько секунд — сообщить в Telegram
 
@@ -624,6 +619,9 @@ OWNER_PUBLIC_KEY = "8jFXVw8KRA87j0EZ51KzGtDkzun5eXuanTy2Q05b_5Y"
 REVOKED_URL = "https://raw.githubusercontent.com/Enotsbeye/stalzone-tracker-releases/main/revoked.txt"
 OWNER_KEY_FILE = os.path.join(DATA_DIR, "owner_key.pem")      # личный ключ — только у владельца
 ISSUED_FILE = os.path.join(DATA_DIR, "issued_codes.json")     # кому владелец выдавал коды
+SEATS_FILE = os.path.join(DATA_DIR, "code_seats.json")        # какие компьютеры заняли места по кодам без привязки
+ANY_MACHINE = "*"           # код без привязки: компьютер привязывается сам при первом подключении к серверу
+MAX_SEATS = 1000
 ACCESS_FILE = os.path.join(DATA_DIR, "access_state.json")     # отозванные и «самая поздняя дата»
 DEVICE_KEY_FILE = os.path.join(DATA_DIR, "device_key.pem")     # ключ этого компьютера — для ключа API владельца
 CODE_PREFIX = "SZ1-"
@@ -873,15 +871,26 @@ class Access:
             self._save_state()
 
     # --- коды ---
-    def issue(self, name, request, days, share=False, creds=None, server=None, base_day=None):
+    def issue(self, name, request, days, share=False, creds=None, server=None, base_day=None, seats=1):
+        """Код доступа. Без кода запроса — код не привязан: компьютер (или до seats компьютеров) привязывается
+        сам при первом подключении к серверу. Так код можно просто отправить — или выложить для группы."""
         if not self.is_owner() or not OWNER_PUBLIC_KEY:
             return False, "Выдавать коды может только владелец программы", None
         name = re.sub(r"\s+", " ", str(name or "")).strip()[:40]
-        machine, dev_pub = self.parse_request(request)
         if not name:
-            return False, "Впиши имя — по нему потом можно отозвать доступ", None
-        if not machine:
-            return False, "Вставь код запроса из программы друга (начинается с SZR1-) или ID его компьютера", None
+            return False, "Впиши имя — по нему потом можно отключить доступ", None
+        if str(request or "").strip():
+            machine, dev_pub = self.parse_request(request)
+            if not machine:
+                return False, "Это не код запроса и не ID компьютера — оставь поле пустым, код привяжется сам", None
+        else:
+            machine, dev_pub = ANY_MACHINE, None
+        try:
+            seats = max(1, min(MAX_SEATS, int(float(seats or 1))))
+        except (TypeError, ValueError):
+            return False, "Мест — число", None
+        if machine != ANY_MACHINE:
+            seats = 1
         creds = {k: v for k, v in (creds or {}).items() if v}
         if share:
             if not dev_pub:
@@ -897,6 +906,8 @@ class Access:
         today = self.today()
         start = max(today, int(base_day or 0))     # продление: считаем от конца прошлого срока
         payload = {"n": name, "m": machine, "e": start + days if days else 0, "i": secrets.token_hex(3), "t": today}
+        if seats > 1:
+            payload["c"] = seats
         server = str(server or "").strip().rstrip("/")
         if server:   # куда подписчику ходить за находками
             payload["s"] = server
@@ -906,15 +917,17 @@ class Access:
         code = CODE_PREFIX + _b64e(data) + "." + _b64e(self.owner_key.sign(data))
         issued = self.issued()
         issued.insert(0, {"name": name, "machine": machine, "id": payload["i"], "expires": payload["e"],
-                          "issued": today, "code": code, "shared": bool(share), "server": bool(server)})
+                          "issued": today, "code": code, "shared": bool(share), "server": bool(server), "seats": seats})
         try:
             write_json(ISSUED_FILE, issued[:300])
         except OSError:
             pass
-        self.state.add_log(f"Выдан код доступа: {name} ({machine}), "
+        self.state.add_log(f"Выдан код доступа: {name} ("
+                           + (machine if machine != ANY_MACHINE else "без привязки" + (f", мест: {seats}" if seats > 1 else ""))
+                           + "), "
                            + (f"до {day_text(payload['e'])}" if days else "бессрочно") + f", № {payload['i']}"
                            + (", с твоим ключом API" if share else ""))
-        return True, "Код создан — отправь его другу", code
+        return True, "Код создан — отправь его подписчику", code
 
     def _save_issued(self, issued):
         try:
@@ -942,7 +955,16 @@ class Access:
         old = next((d for d in self.issued() if d.get("id") == code_id), None)
         if not old:
             return False, "Код не найден", None
-        ok, msg, code = self.issue(old["name"], old["machine"], days, server=server, base_day=old.get("expires") or 0)
+        anyone = old.get("machine") == ANY_MACHINE
+        ok, msg, code = self.issue(old["name"], "" if anyone else old["machine"], days, server=server,
+                                   base_day=old.get("expires") or 0, seats=old.get("seats") or 1)
+        if ok and anyone:   # занятые места переходят на новый код
+            new_id = self.parse(code)[0]["i"]
+            with self.lock:
+                seats = self._seats()
+                if seats.get(code_id):
+                    seats[new_id] = dict(seats[code_id])
+                    self._save_seats(seats)
         if ok:
             issued = self.issued()
             for d in issued:
@@ -954,6 +976,52 @@ class Access:
 
     def blocked_ids(self):
         return {str(d.get("id")) for d in self.issued() if d.get("blocked")}
+
+    @staticmethod
+    def _seats():
+        try:
+            with open(SEATS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _save_seats(seats):
+        try:
+            write_json(SEATS_FILE, seats)
+        except OSError:
+            pass
+
+    def take_seat(self, payload, machine):
+        """Код без привязки: компьютер занимает место при первом подключении. Ошибка — все места заняты."""
+        machine = norm_machine(machine)
+        if not machine:
+            return "Нет ID компьютера — обнови программу"
+        cid, limit = str(payload["i"]), max(1, int(payload.get("c") or 1))
+        with self.lock:
+            seats = self._seats()
+            taken = seats.setdefault(cid, {})
+            if machine in taken:
+                return None
+            if len(taken) >= limit:
+                return (f"По этому коду уже подключены все компьютеры ({limit}) — попроси владельца освободить "
+                        "место или выдать новый код")
+            taken[machine] = time.time()
+            self._save_seats(seats)
+        self.state.add_log(f"Новый компьютер по коду «{payload['n']}» (№ {cid}): {machine}, мест занято "
+                           f"{len(taken)} из {limit}")
+        return None
+
+    def free_seats(self, code_id):
+        """Освободить места кода: компьютеры привяжутся заново при следующем подключении."""
+        if not self.is_owner():
+            return False, "Только владелец"
+        with self.lock:
+            seats = self._seats()
+            n = len(seats.pop(str(code_id), {}) or {})
+            self._save_seats(seats)
+        return True, f"Освобождено мест: {n}"
 
     def shared_names(self):
         """Кому выданы действующие коды с ключом API владельца — они и делят с ним лимит."""
@@ -967,7 +1035,8 @@ class Access:
         payload, err = self.parse(code)
         if err:
             return None, err
-        if norm_machine(payload["m"]) != norm_machine(machine):
+        anyone = payload["m"] == ANY_MACHINE
+        if not anyone and norm_machine(payload["m"]) != norm_machine(machine):
             return None, "Код выдан для другого компьютера"
         expires = int(payload.get("e") or 0)
         if expires and self.today() > expires:
@@ -977,6 +1046,10 @@ class Access:
             revoked = str(payload["n"]).lower() in self.revoked or cid.lower() in self.revoked
         if revoked or cid in self.blocked_ids():
             return None, "Владелец отключил этот доступ"
+        if anyone:
+            err = self.take_seat(payload, machine)
+            if err:
+                return None, err
         return payload, None
 
     def server_url(self):
@@ -1036,7 +1109,7 @@ class Access:
         info = dict(base, name=name, expires=expires, expires_text=day_text(expires) if expires else "бессрочно",
                     code_id=str(payload["i"]))
         info["server"] = str(payload.get("s") or "")
-        if norm_machine(payload["m"]) != self.machine:
+        if payload["m"] != ANY_MACHINE and norm_machine(payload["m"]) != self.machine:
             return dict(info, ok=False, mode="locked",
                         reason="Этот код выдан для другого компьютера. Отправь владельцу свой ID — он выдаст новый")
         if expires and self.today() > expires:
@@ -1058,10 +1131,12 @@ class Access:
         info["shared_api"] = bool(info["ok"] and info.get("mode") == "code" and self.shared_api())
         if info["owner"] and OWNER_PUBLIC_KEY:
             today, seen = self.today(), self.state.subscribers_seen()
+            with self.lock:
+                seats = self._seats()
             info["issued"] = [dict({k: v for k, v in d.items() if k != "code"},
                                    expires_text=day_text(d["expires"]) if d.get("expires") else "бессрочно",
                                    expired=bool(d.get("expires") and today > d["expires"]),
-                                   last_seen=seen.get(d.get("id")))
+                                   last_seen=seen.get(d.get("id")), taken=len(seats.get(d.get("id"), {})))
                               for d in self.issued()[:100]]
         return info
 
@@ -1245,17 +1320,14 @@ class Worker(threading.Thread):
                 setattr(scanner, attr, self.shared.setdefault(attr, set()))
             first_pass, announce, last_line = True, True, None
             heat, heat_at, acc_at = {}, 0.0, 0.0
-            rotation, per_item, coverage = deque(), 1.5, None   # «весь аукцион»: по частям за проход
             while not self.stop_event.is_set():
                 if self._take_pending():
                     items, auto, hold_ids, cats, scan_cfg = self._plan(names)
                     scanner.cfg, scanner.quiet = scan_cfg, auto | hold_ids
                     announce = True
-                    rotation.clear()
                 if announce:
                     announce = False
-                    scanner.quiet_label = ("Весь аукцион" if self.cfg.get("all_market") else
-                                           "Все артефакты" if cats == ["artefact"] else "Категории целиком")
+                    scanner.quiet_label = "Все артефакты" if cats == ["artefact"] else "Категории целиком"
                     line = (eng.watching_line([x for x in items if x[0] not in hold_ids], auto, cats) if items else
                             "Список предметов пуст — добавь предметы во вкладке «Предметы», проверка продолжится сама")
                     if self.serving:
@@ -1282,25 +1354,7 @@ class Worker(threading.Thread):
                         heat, heat_at = db.new_lot_rates(cfg["region"]), started
                     except Exception:
                         heat, heat_at = {}, started
-                core = [it for it in items if it[0] not in auto]
-                rest = [it for it in items if it[0] in auto]
-                if len(rest) > ROTATE_MIN:
-                    # много предметов «целиком»: свой список и «горячие» — каждый проход, остальные — по очереди,
-                    # столько, чтобы проход занимал около минуты. Так свои предметы не ждут, пока обойдём всё.
-                    hot = sorted((it for it in rest if heat.get(it[0], 0) >= HOT_HEAT),
-                                 key=lambda it: -heat.get(it[0], 0))[:HOT_MAX]
-                    hot_ids = {i for i, _ in hot}
-                    if not rotation:
-                        rotation.extend(sorted((it for it in rest if it[0] not in hot_ids),
-                                               key=lambda it: -heat.get(it[0], 0)))
-                    budget = 60 / max(api.min_gap, 0.005) * PASS_TARGET_MIN
-                    n = int(max(ROTATE_MIN, min(ROTATE_MAX, budget / per_item - len(core) - len(hot))))
-                    chunk = [rotation.popleft() for _ in range(min(n, len(rotation)))]
-                    order = eng.pass_order(core, heat) + hot + chunk
-                    rest_n = len(rest) - len(hot)
-                else:
-                    order, n, rest_n = eng.pass_order(items, heat), None, 0
-                sent_before = getattr(api, "sent", 0)
+                order = eng.pass_order(items, heat)
 
                 def on_progress(i, item_id, name):
                     self.emit("progress", {"text": f"Проверяю {name}", "done": i, "total": len(order)})
@@ -1354,15 +1408,11 @@ class Worker(threading.Thread):
 
                 # сеть — параллельно, обработка — по порядку (см. eng.scan_pass)
                 eng.scan_pass(scanner, order, on_item, self.stop_event.is_set, on_progress)
-                took = time.time() - started
-                cost = (getattr(api, "sent", 0) - sent_before) / max(1, len(order))
-                per_item = min(6.0, max(0.3, 0.6 * per_item + 0.4 * cost)) if order else per_item
-                coverage = (rest_n / max(1, n) * took / 60) if n else None   # за сколько минут обходим всё
                 eng.save_seen(seen)
                 if first_pass and not self.stop_event.is_set() and scanner.summary():
                     self.emit("log", scanner.summary())
-                self.emit("pass", {"time": time.time(), "found": found[0], "took": took,
-                                   "core": len(core), "auto": len(rest), "coverage": coverage,
+                self.emit("pass", {"time": time.time(), "found": found[0], "took": time.time() - started,
+                                   "key_others": getattr(api, "others_last", None), "key_limit": getattr(api, "key_limit", None),
                                    "delay": api_delay(fresh_ages),
                                    "delay_min": min(fresh_ages) if fresh_ages else None,
                                    "delay_n": len(fresh_ages),
@@ -1757,16 +1807,17 @@ def make_feed_handler(state):
             if err:
                 return self._json(403, {"error": err})
             cid, now = str(payload["i"]), time.time()
+            skey = cid if payload["m"] != ANY_MACHINE else f"{cid}:{norm_machine(machine)}"   # у кода на группу — по компьютерам
             first = False
             with state.lock:
-                sub = state.subscribers.get(cid)
+                sub = state.subscribers.get(skey)
                 if sub and now - sub["last"] < FEED_MIN_INTERVAL:
                     too_fast = True
                 else:
                     too_fast = False
                     first = sub is None
-                    state.subscribers[cid] = {
-                        "name": payload["n"], "machine": payload["m"], "last": now,
+                    state.subscribers[skey] = {
+                        "cid": cid, "name": payload["n"], "machine": norm_machine(machine) or payload["m"], "last": now,
                         "requests": (sub or {}).get("requests", 0) + 1,
                         "version": str(self.headers.get("X-App-Version") or "")[:20],
                         "ip": str(self.headers.get("X-Forwarded-For") or self.client_address[0])[:60]}
@@ -1794,6 +1845,61 @@ def make_feed_handler(state):
 
 # --------------------------------- Состояние ---------------------------------
 AUTOSTART_NAME = "STALZONE Tracker"
+TAILSCALE_PATHS = (r"C:\Program Files\Tailscale\tailscale.exe", r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+                   "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+TAILSCALE_DOWNLOAD = "https://tailscale.com/download"
+
+
+def tailscale_exe():
+    """Где программа tailscale (её ставит обычный установщик Tailscale). None — не установлена."""
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    return next((p for p in TAILSCALE_PATHS if os.path.exists(p)), None)
+
+
+def _run_quiet(args, timeout):
+    """Запустить команду без чёрного окна: (код, вывод). Код None — не дождались (вывод — что успела написать)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=flags,
+                           encoding="utf-8", errors="replace")
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or b""
+        err = e.stderr or b""
+        dec = lambda x: x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+        return None, dec(out) + dec(err)
+    except OSError as e:
+        return 1, str(e)
+
+
+def funnel_open(port, exe=None, run=None):
+    """Открыть сервер для подписчиков в интернет через Tailscale Funnel — одной кнопкой.
+    (ok, адрес или что сделать, ссылка, которую надо открыть, или None)."""
+    run = run or _run_quiet
+    exe = exe or tailscale_exe()
+    if not exe:
+        return False, "Tailscale не установлен. Скачай его (бесплатно), установи и войди через Google или Microsoft — потом нажми ещё раз.", TAILSCALE_DOWNLOAD
+    code, out = run([exe, "status", "--json"], 15)
+    try:
+        info = json.loads(out[out.index("{"):]) if "{" in out else {}
+    except ValueError:
+        info = {}
+    state = str(info.get("BackendState") or "")
+    if state in ("NeedsLogin", "NoState", "Stopped") or (code not in (0, None) and not info):
+        return False, "Tailscale установлен, но не вошёл в аккаунт: открой Tailscale (значок у часов) и войди — потом нажми ещё раз.", None
+    dns = str((info.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    code, out = run([exe, "funnel", "--bg", str(int(port))], 40)
+    link = re.search(r"https://login\.tailscale\.com/\S+", out)
+    if link and (code != 0 or "not enabled" in out.lower()):
+        return False, "Tailscale просит разрешить Funnel: открой ссылку, нажми «Enable» — и нажми эту кнопку ещё раз.", link.group(0)
+    found = re.search(r"https://[A-Za-z0-9.-]+\.ts\.net", out)
+    url = found.group(0) if found else (f"https://{dns}" if dns.endswith(".ts.net") else "")
+    if code == 0 and url:
+        return True, url, None
+    tail = " ".join(out.split())[:300]
+    return False, f"Tailscale не открыл доступ{': ' + tail if tail else ''}", None
 
 
 def keep_awake():
@@ -2085,8 +2191,13 @@ class State:
             return self._feed_cache
 
     def subscribers_seen(self):
+        """№ кода → когда последний раз приходил кто-то из его компьютеров."""
         with self.lock:
-            return {cid: s["last"] for cid, s in self.subscribers.items()}
+            out = {}
+            for key, s in self.subscribers.items():
+                cid = s.get("cid") or key
+                out[cid] = max(out.get(cid, 0), s["last"])
+            return out
 
     def serving(self):
         return bool(self.cfg.get("server_enabled") and self.access.is_owner() and OWNER_PUBLIC_KEY)
@@ -2113,6 +2224,20 @@ class State:
             self.feed_server, self.feed_error = srv, ""
             self.add_log(f"Сервер для подписчиков работает: 127.0.0.1:{port}. Наружу его выводит Tailscale Funnel "
                          f"(команда: tailscale funnel {port})")
+
+    def open_funnel(self):
+        """Кнопка «Открыть доступ из интернета»: Tailscale Funnel, адрес — сразу в настройки, сервер — включить."""
+        if not self.access.is_owner():
+            return False, "Только владелец", None
+        port = int(self.cfg.get("server_port") or FEED_PORT)
+        ok, msg, link = funnel_open(port)
+        if not ok:
+            return False, msg, link
+        ok2, why = self.update_settings({"server_enabled": True, "server_url": msg})
+        if not ok2:
+            return False, why, None
+        self.add_log(f"Сервер для подписчиков открыт в интернет: {msg}")
+        return True, f"Готово: {msg} — новые коды будут вести сюда", None
 
     def test_public_url(self):
         """Владелец проверяет, видно ли его сервер из интернета по публичному адресу."""
@@ -2192,7 +2317,7 @@ class State:
                 self.status["starting"] = False
             elif kind == "pass":
                 self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"),
-                                   core=data.get("core"), auto=data.get("auto"), coverage=data.get("coverage"))
+                                   key_others=data.get("key_others"), key_limit=data.get("key_limit"))
                 quiet_line = self._quiet_summary(data["time"])
                 if data["delay"] is not None:
                     self.status.update(delay=data["delay"], delay_min=data.get("delay_min"),
@@ -2691,8 +2816,6 @@ class State:
                 cfg["bid_window_minutes"] = min(720, max(5, int(float(data["bid_window_minutes"]))))
             if "bids" in data:
                 cfg["bids"] = bool(data["bids"])
-            if "all_market" in data:
-                cfg["all_market"] = bool(data["all_market"])
             if "all_artifacts" in data:
                 cfg["all_artifacts"] = bool(data["all_artifacts"])
                 cats = [c for c in cfg.get("auto_categories") or [] if c != "artefact"]
@@ -2903,12 +3026,18 @@ def make_handler(state, token):
                 own = {"id": state.cfg.get("client_id"), "secret": state.cfg.get("client_secret"),
                        "token": state.cfg.get("app_token")}
                 ok, msg, code = state.access.issue(data.get("name"), data.get("machine"), data.get("days"),
-                                                   share=bool(data.get("share")), creds=own,
-                                                   server=state.cfg.get("server_url") if state.serving() else None)
+                                                   share=bool(data.get("share")), creds=own, seats=data.get("seats") or 1,
+                                                   server=state.cfg.get("server_url") or None)
                 return self.send_json({"ok": ok, "message": msg, "code": code})
+            if path == "/api/access/free_seats":
+                ok, msg = state.access.free_seats(data.get("id"))
+                return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/server/funnel":
+                ok, msg, link = state.open_funnel()
+                return self.send_json({"ok": ok, "message": msg, "link": link})
             if path == "/api/access/renew":
                 ok, msg, code = state.access.renew(data.get("id"), data.get("days") or 30,
-                                                   server=state.cfg.get("server_url") if state.serving() else None)
+                                                   server=state.cfg.get("server_url") or None)
                 return self.send_json({"ok": ok, "message": msg, "code": code})
             if path == "/api/access/block":
                 ok, msg = state.access.set_blocked(data.get("id"), bool(data.get("blocked")))
@@ -2965,6 +3094,9 @@ def make_handler(state, token):
                 return self.send_json({"ok": True})
             if path == "/api/open":
                 url = OPEN_LINKS.get(data.get("link"))
+                extra = str(data.get("url") or "")
+                if not url and extra.startswith(("https://login.tailscale.com/", TAILSCALE_DOWNLOAD)):
+                    url = extra   # ссылка, которую попросил открыть Tailscale (разрешить Funnel, скачать)
                 if url:
                     webbrowser.open(url)
                 return self.send_json({"ok": bool(url)})
