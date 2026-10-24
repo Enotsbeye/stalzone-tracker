@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -128,8 +128,15 @@ MIGRATED = migrate_old_files()
 
 PROD_URL = "https://eapi.stalzone.com"
 DEMO_URL = "https://dapi.stalzone.com"
-SETTINGS_VERSION = 3
-DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[])   # новый пользователь начинает с пустого списка
+SETTINGS_VERSION = 4
+DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # новый пользователь начинает с пустого списка
+                calibrate=True,            # поправлять оценку перепродажи по сверке с фактическими продажами
+                threshold_expected=False,  # порог прибыли — по «прибыль × шанс продажи»
+                keep_awake=True,           # не давать компьютеру уснуть, пока идёт поиск
+                autostart=False,           # запускать программу вместе с Windows
+                autorun_search=False,      # начинать поиск сразу при запуске программы
+                alerts=True,               # Telegram: трекер встал, компьютер спал, нет связи с сервером, продано, перебили
+                skills={})                 # уровни навыков убежища — для калькулятора крафта
 OPEN_LINKS = {
     "api_bot": "https://t.me/stalzone_api_bot",
     "docs": "https://eapi.stalzone.net/overview.html",
@@ -163,6 +170,11 @@ def load_settings():
         # 2.1: проверка без пауз между проходами — если стояло прежнее значение по умолчанию (1 мин)
         if float(cfg.get("poll_minutes") or 0) == 1:
             cfg["poll_minutes"] = 0
+        cfg["settings_version"] = SETTINGS_VERSION
+    if saved and saved.get("settings_version", 1) < 4:
+        # 2.2: эти настройки убраны из окна — ставим значения по умолчанию, чтобы невидимое ничего не меняло
+        cfg.update(poll_minutes=0, history_hours=eng.CONFIG["history_hours"], notify_min_chance=0,
+                   threshold_expected=False, calibrate=True, keep_awake=True, alerts=True)
         cfg["settings_version"] = SETTINGS_VERSION
     if str(cfg.get("update_repo") or "").strip("/") in OLD_UPDATE_REPOS:
         cfg["update_repo"] = ""     # код теперь закрыт — обновления берём из открытого репозитория
@@ -254,6 +266,17 @@ NEAR_MIN_PROFIT = 3000      # …с прибылью от 3 000 ₽, котор�
 NEAR_KEEP = 30 * 60         # «почти находка» видна, пока лот на аукционе, но не дольше получаса без новых проверок
 NEAR_MAX = 40
 QUIET_SUMMARY = 30 * 60     # столько без находок — пишем в журнал, что было отсеяно порогами
+CRAFT_PER_PASS = 15         # цены для калькулятора крафта: столько предметов за проход (≈ 20–40 запросов в минуту)
+STALL_ALERT = 10 * 60       # поиск идёт, а проходов нет столько секунд — сообщить в Telegram
+
+
+def deal_value(rec, cfg):
+    """С чем сравнивать порог прибыли: сама прибыль или (если так в настройках) ожидаемая — прибыль × шанс
+    продать за сутки. Без оценки шанса — просто прибыль."""
+    profit = float(rec.get("profit") or 0)
+    if cfg.get("threshold_expected") and rec.get("chance") is not None:
+        return profit * float(rec["chance"])
+    return profit
 
 
 def meets_thresholds(rec, cfg, rare):
@@ -262,7 +285,7 @@ def meets_thresholds(rec, cfg, rare):
     min_profit = float(cfg.get("min_profit", 0))
     if rare and cfg.get("rare_enabled", True):
         min_profit = min(min_profit, float(cfg.get("rare_min_profit", min_profit)))
-    if float(rec.get("profit") or 0) < min_profit:
+    if deal_value(rec, cfg) < min_profit:
         return False
     if rec.get("kind") == "bid":
         return bool(cfg.get("bids", True))
@@ -298,7 +321,7 @@ def why_text(why):
     parts = []
     for w in why or []:
         if w.get("what") == "profit":
-            parts.append(f"твой порог прибыли {eng.fmt_rub(w['need'])}")
+            parts.append(f"твой порог {'ожидаемой ' if w.get('expected') else ''}прибыли {eng.fmt_rub(w['need'])}")
         elif w.get("what") == "pct":
             parts.append(f"нужно дешевле рынка на {w['need']:.0f}%")
     return ", ".join(parts) or "не прошла пороги"
@@ -310,8 +333,9 @@ def near_reason(rec, cfg, rare):
     if rare and cfg.get("rare_enabled", True):
         min_profit = min(min_profit, float(cfg.get("rare_min_profit", min_profit)))
     why = []
-    if float(rec.get("profit") or 0) < min_profit:
-        why.append({"what": "profit", "need": min_profit})
+    if deal_value(rec, cfg) < min_profit:
+        why.append({"what": "profit", "need": min_profit, "expected": bool(cfg.get("threshold_expected"))
+                    and rec.get("chance") is not None})
     need = float(cfg.get("discount", 0.15)) * 100
     if near_pct(rec) < need - 1e-6:
         why.append({"what": "pct", "need": need})
@@ -1078,6 +1102,11 @@ class Worker(threading.Thread):
         self.meta = {}
         # что уже писали в журнал за этот запуск программы (строки рынка и т. п.) — после перезапуска не повторяем
         self.shared = shared if shared is not None else {}
+        self.price_queue = deque()         # предметы, чьи цены нужны калькулятору крафта (история без лотов)
+        self.resale_factor = 1.0           # поправка оценки перепродажи по сверке прогнозов с фактом
+        self._predicted = set()            # какие лоты уже записаны в сверку прогнозов
+        self._undercut = {}                # покупка → самый дешёвый конкурент, о котором уже сообщили
+        self._own_seen = set()             # покупки, чей выставленный лот трекер видел на аукционе
 
     def stop(self):
         self.stop_event.set()
@@ -1121,12 +1150,69 @@ class Worker(threading.Thread):
         if self.serving:   # для подписчиков ищем ещё шире — у каждого свои пороги, отсеют у себя
             scan_cfg["min_profit"] = min(float(cfg["min_profit"]), 1000.0)
             scan_cfg["find_min_profit"] = min(scan_cfg["find_min_profit"], 1000.0)
+        scan_cfg["resale_factor"] = self.resale_factor if cfg.get("calibrate", True) else 1.0
         return items, auto, hold_ids, cats, scan_cfg
 
     def telegram(self, text):
         ok, msg = send_telegram(self.cfg, text)
         if not ok and msg:
             self.emit("log", msg)
+
+    def predict(self, rec, kind):
+        """Запомнить оценку находки — через сутки сверим её с тем, за сколько такие лоты продавали."""
+        if self.db is None or rec.get("lot_key") in self._predicted:
+            return
+        self._predicted.add(rec["lot_key"])
+        try:
+            self.db.record_predictions([(self.cfg["region"], rec["item_id"], rec["lot_key"], time.time(),
+                                         rec["quality"] if rec.get("exact") and rec.get("quality") is not None else -1,
+                                         rec["ptn"] if rec.get("exact") and rec.get("ptn") is not None else -1,
+                                         int(rec["amount"]), float(rec["unit"]), float(rec.get("market_raw") or rec["market"]),
+                                         float(rec.get("hist") or 0), rec.get("chance"), kind)])
+        except Exception:
+            pass
+
+    def check_accuracy(self, db):
+        """Сверка прогнозов: показать в окне и вернуть поправку оценки перепродажи (или None — не по чему)."""
+        try:
+            acc = db.accuracy(self.cfg["region"])
+        except Exception:
+            return None
+        factor = eng.calibration_factor(acc)
+        old, self.resale_factor = self.resale_factor, factor
+        info = None
+        if acc:
+            names = {i: e.get("name", i) for i, e in self.meta.items()}
+            rows = sorted(acc["rows"], key=lambda r: r[4], reverse=True)[:8]
+            info = {"n": acc["n"], "ratio": acc["ratio"], "hit": acc["hit"], "factor": factor,
+                    "by_kind": {k: list(v) for k, v in acc["by_kind"].items()},
+                    "rows": [{"item_id": i, "name": names.get(i, i), "kind": k, "pred": p, "fact": f, "ts": t}
+                             for i, k, p, f, t in rows], "at": time.time()}
+        self.emit("accuracy", info)
+        if acc and abs(factor - old) >= 0.01 and self.cfg.get("calibrate", True):
+            if factor < 1:
+                self.emit("log", f"Сверка прогнозов: по {acc['n']} находкам такие лоты продавали в среднем за "
+                                 f"{acc['ratio'] * 100:.0f}% от оценки — снижаю оценку перепродажи на "
+                                 f"{(1 - factor) * 100:.0f}%")
+            else:
+                self.emit("log", f"Сверка прогнозов: оценки сбываются (по {acc['n']} находкам) — поправка не нужна")
+        return factor
+
+    def fetch_prices(self, api, db, limit):
+        """История сделок для калькулятора крафта — по нескольку предметов за проход."""
+        region = self.cfg["region"]
+        for _ in range(min(limit, len(self.price_queue))):
+            item_id = self.price_queue.popleft()
+            try:
+                stop = db.stop_point(region, item_id, eng.LONG_DAYS * 24)
+                records, how = api.history_since(region, item_id, stop, max_pages=2)
+                db.store(region, item_id, records, how)
+            except eng.AuthError:
+                raise
+            except Exception as e:
+                if not (isinstance(e, eng.ApiError) and e.status in (400, 404)):
+                    self.price_queue.append(item_id)   # сеть подвела — попробуем позже
+            self.emit("craft_progress", {"left": len(self.price_queue)})
 
     def run(self):
         cfg = self.cfg
@@ -1153,7 +1239,7 @@ class Worker(threading.Thread):
             for attr in ("described", "mismatched", "fields_logged"):   # раз за запуск программы, а не проверки
                 setattr(scanner, attr, self.shared.setdefault(attr, set()))
             first_pass, announce, last_line = True, True, None
-            heat, heat_at = {}, 0.0
+            heat, heat_at, acc_at = {}, 0.0, 0.0
             while not self.stop_event.is_set():
                 if self._take_pending():
                     items, auto, hold_ids, cats, scan_cfg = self._plan(names)
@@ -1175,6 +1261,14 @@ class Worker(threading.Thread):
                     continue
                 started = time.time()
                 fresh_ages, found = [], [0]
+                if started - acc_at > 1800:   # сверка прогнозов с фактом — раз в полчаса
+                    acc_at = started
+                    factor = self.check_accuracy(db)
+                    if (factor is not None and self.cfg.get("calibrate", True)
+                            and abs(factor - scanner.cfg.get("resale_factor", 1.0)) > 1e-9):
+                        scanner.cfg = dict(scanner.cfg, resale_factor=factor)
+                if self.price_queue:          # цены для калькулятора крафта — понемногу, не мешая поиску
+                    self.fetch_prices(api, db, CRAFT_PER_PASS)
                 if started - heat_at > 600:   # где чаще появляются новые лоты — раз в 10 минут
                     try:
                         heat, heat_at = db.new_lot_rates(cfg["region"]), started
@@ -1222,7 +1316,10 @@ class Worker(threading.Thread):
                                 # что отсеяно и почему: «0 находок» не должно быть загадкой
                                 if is_near(rec):
                                     self.emit("near", dict(rec, rare=bool(rare), why=near_reason(rec, cfg, rare)))
+                                    self.predict(rec, "near")
                                 continue
+                            if kind == "buyout":
+                                self.predict(rec, "deal")
                             if key not in shown:
                                 shown.add(key)
                                 found[0] += 1
@@ -1280,30 +1377,79 @@ class Worker(threading.Thread):
                 del self.tracked[lot_key]
 
     def update_holdings(self, scanner, item_id, name, lot_list):
-        """Текущая цена и шанс продажи того, что ты купил."""
+        """Купленное: текущая цена и шанс продажи, за сколько выставить, перебили ли твой лот, продан ли он."""
         cached = scanner.market_cache.get(item_id)
         market = cached[1] if cached else None
         if not market:
             return
         total = scanner.fmt.total("lots", lot_list, "buyoutPrice", name)
-        for h in self.holdings:
+        cap = scanner.last_cap.get(item_id, math.inf)
+        for h in list(self.holdings):
             if h.get("item_id") != item_id or h.get("status") == "sold":
                 continue
             add = h.get("additional") or {}
+            amount = int(h.get("amount", 1) or 1)
+            listed = h.get("status") == "listed" and float(h.get("list_price") or 0) > 0
+            state = eng.listing_state(lot_list, amount, float(h["list_price"]), add, total) if listed else None
+            others = lot_list
+            if state and state["own"]:   # свой лот — не конкурент самому себе
+                self._own_seen.add(h["id"])
+                own_total = float(h["list_price"])
+                skip = [True]
+                def not_own(lot, skip=skip):
+                    a, raw = int(eng._num(lot.get("amount"))), eng._num(lot.get("buyoutPrice"))
+                    if skip[0] and a == amount and abs((raw if total else raw * a) - own_total) < 1 \
+                            and eng.grade_of(lot.get("additional")) == eng.grade_of(add):
+                        skip[0] = False
+                        return False
+                    return True
+                others = [lot for lot in lot_list if not_own(lot)]
+            if listed and state and not state["own"] and h["id"] in self._own_seen \
+                    and float(h["list_price"]) / amount < cap and self.db is not None \
+                    and self.db.find_sale(self.cfg["region"], item_id, amount, float(h["list_price"]),
+                                          float(h.get("listed_at") or 0) - 60):
+                self._own_seen.discard(h["id"])     # лот пропал, и в истории есть сделка ровно на него — продан
+                h["status"] = "sold"
+                self.emit("holding_sold", {"id": h["id"], "price": float(h["list_price"])})
+                continue
             found = eng.market_for(market, add)
             if not found:
-                self.emit("holding", {"id": h["id"], "market": None, "updated": time.time()})
+                self.emit("holding", {"id": h["id"], "market": None, "updated": time.time(), "list_state": state})
                 continue
             hist = found[0][0]
-            fake = {"amount": h.get("amount", 1), "buyoutPrice": 0, "additional": add}
-            resale, floor = eng.resale_price(fake, lot_list, hist, total)
+            fake = {"amount": amount, "buyoutPrice": 0, "additional": add}
+            resale, floor = eng.resale_price(fake, others, hist, total)
             pairs = eng.deal_pairs(market, add)
-            chance = eng.sale_chance(resale, h.get("amount", 1), pairs[0], pairs[1],
-                                     eng.competitors(fake, lot_list, resale, total),
-                                     supply=eng.competitors(fake, lot_list, resale, total, spread=0.3),
+            chance = eng.sale_chance(resale, amount, pairs[0], pairs[1],
+                                     eng.competitors(fake, others, resale, total),
+                                     supply=eng.competitors(fake, others, resale, total, spread=0.3),
                                      rates=scanner.rates_for(item_id, resale, hist)) if pairs else None
+            options = eng.price_options(hist, amount, pairs[0], pairs[1], others, add, total,
+                                        paid=float(h.get("paid") or 0), fee=self.cfg["fee"],
+                                        rates_fn=lambda p, hist=hist: scanner.rates_for(item_id, p, hist)) if pairs else []
             self.emit("holding", {"id": h["id"], "market": resale, "hist": hist, "floor": floor,
-                                  "chance": chance, "updated": time.time()})
+                                  "chance": chance, "options": options, "list_state": state, "updated": time.time()})
+            if state and state["cheaper"]:
+                self.undercut_alert(h, name, state)
+            else:
+                self._undercut.pop(h["id"], None)
+
+    def undercut_alert(self, h, name, state):
+        """Твой лот перебили — сообщить, если появился лот дешевле прежнего (не чаще, чем цена падает)."""
+        best = state["best"]
+        said = self._undercut.get(h["id"])
+        if said is not None and best >= said - 0.5:
+            return
+        self._undercut[h["id"]] = best
+        amount = int(h.get("amount", 1) or 1)
+        mine = float(h["list_price"]) / amount
+        text = (f"⚠ Твой лот перебили: {name}\nУ тебя {eng.fmt_rub(mine)}/шт, появился лот за "
+                f"{eng.fmt_rub(best)}/шт" + (f" (дешевле тебя — {state['cheaper']})" if state["cheaper"] > 1 else "")
+                + (f"\nЧтобы продать первым, выставь за {eng.fmt_rub(state['suggest'])}/шт" if state.get("suggest") else ""))
+        self.emit("log", text.replace("\n", ". ").replace("⚠ ", ""))
+        self.emit("undercut", {"id": h["id"], "best": best, "suggest": state.get("suggest")})
+        if self.cfg.get("alerts", True):
+            self.telegram(text)
 
     def record(self, item_id, name, d, kind, key, meta=None):
         """Находка в том виде, в каком она уходит в таблицу и подписчикам. (запись, текст для Telegram)."""
@@ -1342,6 +1488,8 @@ class Worker(threading.Thread):
             "cat": meta.get("cat"), "rank": meta.get("rank"),
             "additional": {k: v for k, v in (lot.get("additional") or {}).items() if k in ("qlt", "ptn")},
             "chance": chance["chance"] if chance else None, "sell_hours": chance.get("hours") if chance else None,
+            "exp_profit": profit * chance["chance"] if chance else None,     # прибыль × шанс продать за сутки
+            "market_raw": d.get("market_raw", d["market"]),                  # оценка до поправки по сверке
             "chance_info": chance,
             "quality": (grade or b or (None, None))[0], "ptn": (grade or b or (None, None))[1],
             "exact": bool(grade),
@@ -1614,6 +1762,41 @@ def make_feed_handler(state):
 
 
 # --------------------------------- Состояние ---------------------------------
+AUTOSTART_NAME = "STALZONE Tracker"
+
+
+def keep_awake():
+    """Windows: сбросить таймер сна — пока поиск идёт, компьютер не уснёт (экран гаснуть может).
+    Действует до следующего ухода в сон по таймеру, поэтому вызываем каждые 30 секунд."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x00000001)   # ES_SYSTEM_REQUIRED
+    except Exception:
+        pass
+
+
+def set_autostart(on):
+    """Запуск вместе с Windows — строка в HKCU\\...\\Run. Только у программы-.exe. (ok, текст ошибки)."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return False, "Автозапуск работает только у программы .exe (при запуске из исходников — нет)"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                            winreg.KEY_SET_VALUE) as key:
+            if on:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, f'"{sys.executable}" --autostart')
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except OSError as e:
+        return False, f"Не получилось настроить автозапуск ({e})"
+
+
 class State:
     def __init__(self, api_factory=None):
         self.lock = threading.Lock()
@@ -1639,6 +1822,7 @@ class State:
         self.feed_server, self.feed_error = None, ""
         self.near = {}                      # «почти находки»: ключ лота → запись с причиной, почему не прошла пороги
         self.quiet_since = None             # с какого момента нет находок — для сводки в журнале
+        self._alerted = {}                  # текст оповещения → когда отправили (одно и то же — не чаще раза в 30 мин)
         self.status = {"running": False, "starting": False, "progress": None, "last_pass": None,
                        "delay": None, "delay_min": None, "delay_n": 0, "found_total": 0, "took": None,
                        "error": None, "error_id": 0, "db": None, "total": None, "server": None}
@@ -1725,8 +1909,19 @@ class State:
                 if "paid" in data:
                     p["paid"] = max(0.0, float(data["paid"]))
                     p["unit_paid"] = p["paid"] / max(p["amount"], 1)
+                if data.get("list_price") not in (None, ""):
+                    price = float(str(data["list_price"]).replace(" ", "").replace(",", "."))
+                    if price <= 0:
+                        raise ValueError
+                    p.update(list_price=price, listed_at=time.time(), status="listed")
+                    p.pop("undercut", None)
                 if data.get("status") in ("holding", "listed", "sold"):
                     p["status"] = data["status"]
+                    if data["status"] == "holding":
+                        p.pop("list_state", None)
+                        p.pop("undercut", None)
+                    if data["status"] == "listed" and not p.get("listed_at"):
+                        p["listed_at"] = time.time()
                     if data["status"] == "sold":
                         p["sold_price"] = float(data.get("sold_price") or 0) or p.get("sold_price")
                         if not p["sold_price"]:
@@ -1736,10 +1931,96 @@ class State:
                     else:
                         p["sold_price"] = p["sold_at"] = None
                         p.pop("profit", None)
+                    if data["status"] != "sold":
+                        p.pop("auto_sold", None)
             except (TypeError, ValueError):
-                return False, "Впиши, за сколько продал (за весь лот), — только цифры"
+                return False, ("Впиши цену за весь лот — только цифры" if "list_price" in data
+                               else "Впиши, за сколько продал (за весь лот), — только цифры")
         self.save_purchases()
+        self._sync_holdings()
         return True, "Сохранено"
+
+    def _sync_holdings(self):
+        """Работающей проверке — свежий список того, что куплено и не продано (выставил, снял, продал)."""
+        with self.lock:
+            w, holdings = self.worker, [dict(p) for p in self.purchases if p.get("status") != "sold"]
+        if w is not None and hasattr(w, "holdings"):
+            w.holdings = holdings
+
+    def alert(self, text, dedupe=False):
+        """Сообщение о важном (продано, перебили, поиск встал) — в Telegram, если он настроен и не выключен.
+        Сеть сразу после сна может ещё не подняться — три попытки с паузой. dedupe — одно и то же не чаще
+        раза в 30 минут."""
+        if not self.cfg.get("alerts", True):
+            return
+        cfg = dict(self.cfg)
+        if not (str(cfg.get("telegram_token") or "").strip() and str(cfg.get("telegram_chat_id") or "").strip()):
+            return
+        now = time.time()
+        if dedupe:
+            if now - self._alerted.get(text, 0) < 1800:
+                return
+            self._alerted[text] = now
+
+        def send():
+            for attempt in range(3):
+                ok, msg = send_telegram(cfg, text)
+                if ok:
+                    return
+                if attempt == 2 or (msg and "не ответил" not in msg):
+                    if msg:
+                        self.add_log(msg)
+                    return
+                time.sleep(30)
+        threading.Thread(target=send, daemon=True).start()
+
+    def watchdog(self):
+        """Раз в 30 секунд: не давать компьютеру уснуть во время поиска; заметить, что он всё-таки спал,
+        что проверка встала или подписчик потерял связь с сервером, — и сообщить в Telegram."""
+        last, stall_said, server_bad = time.time(), False, None
+        while not self.exit_requested.wait(30):
+            now = time.time()
+            gap, last = now - last, now
+            st = self.status
+            running = st.get("running")
+            if running and self.cfg.get("keep_awake", True):
+                keep_awake()
+            if gap > 150:      # часы прыгнули вперёд — компьютер спал
+                fmt = lambda t: datetime.fromtimestamp(t).strftime("%H:%M")
+                line = f"Компьютер спал с {fmt(now - gap)} до {fmt(now)} — поиск в это время не шёл"
+                if running and self.feed_server:
+                    line += ", подписчики не получали находок"
+                self.add_log(line)
+                if running:
+                    self.alert("😴 " + line)
+                continue
+            lp = st.get("last_pass")
+            subscriber = isinstance(self.worker, FeedWorker)
+            if running and not subscriber and not st.get("starting") and lp and now - lp > STALL_ALERT:
+                if not stall_said:
+                    stall_said = True
+                    err = st.get("error")
+                    line = ("Поиск включён, но проверка аукциона не проходит уже больше 10 минут"
+                            + (f": {err}" if err else " — проверь интернет"))
+                    self.add_log(line)
+                    self.alert("⚠ " + line)
+            elif stall_said and lp and now - lp < 300:
+                stall_said = False
+                self.add_log("Проверка аукциона снова идёт")
+                self.alert("✅ Проверка аукциона снова идёт")
+            sv = st.get("server") or {}
+            if running and subscriber and sv and not sv.get("ok"):
+                server_bad = server_bad or now
+                if now - server_bad > 300 and server_bad > 0:
+                    line = "Нет связи с сервером владельца больше 5 минут" + (f": {sv.get('error')}" if sv.get("error") else "")
+                    self.add_log(line)
+                    self.alert("⚠ " + line)
+                    server_bad = -1          # сообщили — ждём, пока связь вернётся
+            elif sv.get("ok") and server_bad:
+                if server_bad == -1:
+                    self.add_log("Связь с сервером владельца восстановилась")
+                    self.alert("✅ Связь с сервером владельца восстановилась")
+                server_bad = None
 
     def remove_purchase(self, pid):
         with self.lock:
@@ -1749,6 +2030,7 @@ class State:
                     d["bought"] = None
         self.save_purchases()
         self.save_deals()
+        self._sync_holdings()
         return True, "Удалено"
 
     # --- сервер для подписчиков (владелец) ---
@@ -1855,7 +2137,7 @@ class State:
                 "Пороги — в «Настройках», такие лоты видно в «Почти находках»")
 
     def emit(self, kind, data):
-        quiet_line = None
+        quiet_line = sold_line = None
         with self.lock:
             if kind == "deal":
                 data["id"] = self.next_id
@@ -1944,15 +2226,42 @@ class State:
                         p.update({"cur_market": data.get("market"), "cur_hist": data.get("hist"),
                                   "cur_floor": data.get("floor"), "cur_chance": data.get("chance"),
                                   "cur_at": data.get("updated")})
+                        if "options" in data:
+                            p["options"] = data["options"]
+                        p["list_state"] = data.get("list_state")
+                        if not (data.get("list_state") or {}).get("cheaper"):
+                            p.pop("undercut", None)
+            elif kind == "undercut":     # твой выставленный лот перебили
+                for p in self.purchases:
+                    if p["id"] == data["id"]:
+                        p["undercut"] = dict(data, at=time.time())
+            elif kind == "holding_sold":   # выставленный лот пропал, а в истории есть сделка ровно на него
+                for p in self.purchases:
+                    if p["id"] == data["id"] and p.get("status") != "sold":
+                        p.update(status="sold", sold_price=data["price"], sold_at=time.time(), auto_sold=True,
+                                 profit=data["price"] * (1 - self.cfg["fee"]) - p["paid"])
+                        p.pop("undercut", None)
+                        sold_line = (f"Продано: {p['name']} за {eng.fmt_rub(data['price'])} — прибыль "
+                                     f"{'+' if p['profit'] >= 0 else '−'}{eng.fmt_rub(abs(p['profit']))} (по истории сделок; "
+                                     "если это не ты — нажми «Вернуть» в «Моих покупках»)")
+            elif kind == "accuracy":
+                self.status["accuracy"] = data
+            elif kind == "craft_progress":
+                self.status["craft_left"] = data["left"]
             elif kind == "stopped":
                 self.status.update(running=False, starting=False, progress=None)
                 self.quiet_since = None
+        if sold_line:
+            self.add_log(sold_line)
+            self.save_purchases()
+            self.alert("💰 " + sold_line.split(" (по истории")[0])
         if kind == "log":
             self.add_log(data)
         elif kind == "deal":
             self.add_log(f"Найдено: {data['name']} — прибыль ~{eng.fmt_rub(data['profit'])}")
         elif kind == "error":
             self.add_log("ОШИБКА: " + data)
+            self.alert("⚠ Трекер: " + data, dedupe=True)
         elif kind in ("pass", "stopped"):
             if quiet_line:
                 self.add_log(quiet_line)
@@ -2018,6 +2327,114 @@ class State:
         except OSError:
             pass
         return data
+
+    # --- калькулятор крафта ---
+    def craft(self):
+        """Рецепты убежища с ценами аукциона: прибыль за крафт и на 1000 энергии, что откроет следующий
+        уровень навыка. Цены — медиана последних сделок из своей базы (за 7 дней)."""
+        region = self.cfg.get("region", "ru")
+        perks, recipes = eng.load_hideout(region)
+        if perks is None:
+            return {"ok": False, "message": "Рецепты убежища не скачались — проверь интернет и открой вкладку ещё раз."}
+        skills = {k: int(v) for k, v in (self.cfg.get("skills") or {}).items()}
+        items = {i for r in recipes for i, _ in r["result"] + r["ingredients"]}
+        db = eng.MarketDB.reader()
+        try:
+            raw = db.unit_prices(region, items) if db else {}
+        finally:
+            if db:
+                db.close()
+        prices = {i: v[0] for i, v in raw.items()}
+        rows = eng.craft_rows(recipes, prices, skills, fee=self.cfg.get("fee", 0.05))
+        advice = eng.skill_advice(rows, skills, perks)
+        with self.lock:
+            meta = dict(self.meta)
+            w = self.worker
+        queued = len(w.price_queue) if isinstance(w, Worker) else 0
+        trade = {i: bool((meta.get(i) or {}).get("trade", True)) for i in items}
+        return {"ok": True, "perks": [{"id": k, "name": v, "level": skills.get(k, 0)} for k, v in perks.items()],
+                "rows": [{k: r[k] for k in ("id", "bench", "cat", "sub", "result", "ingredients", "energy", "perks",
+                                            "features", "cost", "value", "profit", "per_energy", "available", "need",
+                                            "missing")} for r in rows],
+                "advice": advice, "prices": {i: [round(v[0], 2), v[1], v[2]] for i, v in raw.items()},
+                "names": {i: (meta.get(i) or {}).get("name", i) for i in items}, "trade": trade,
+                "queued": queued, "running": isinstance(w, Worker) and w.is_alive()}
+
+    def craft_fetch(self, only_available=True):
+        """Поставить в очередь цены, которых не хватает калькулятору: предметы, что продаются на аукционе,
+        без сделок в базе или с последней сделкой старше суток. Качает работающая проверка, понемногу."""
+        with self.lock:
+            w, meta = self.worker, dict(self.meta)
+        if isinstance(w, FeedWorker) or self.subscriber_server():
+            return False, "По подписке своей базы цен нет — калькулятору крафта нужны свои ключи API"
+        if not (isinstance(w, Worker) and w.is_alive()):
+            return False, "Цены качаются вместе с поиском — нажми «Начать поиск»"
+        region = self.cfg.get("region", "ru")
+        perks, recipes = eng.load_hideout(region)
+        if perks is None:
+            return False, "Рецепты убежища не скачались"
+        skills = {k: int(v) for k, v in (self.cfg.get("skills") or {}).items()}
+        if only_available:
+            recipes = [r for r in recipes if all(skills.get(k, 0) >= v for k, v in r["perks"].items())]
+        items = {i for r in recipes for i, _ in r["result"] + r["ingredients"] if (meta.get(i) or {}).get("trade", True)}
+        db = eng.MarketDB.reader()
+        try:
+            have = db.unit_prices(region, items) if db else {}
+        finally:
+            if db:
+                db.close()
+        fresh = {i for i, v in have.items() if time.time() - v[2] < 86400}
+        todo = [i for i in sorted(items) if i not in fresh and i not in w.price_queue]
+        w.price_queue.extend(todo)
+        with self.lock:
+            self.status["craft_left"] = len(w.price_queue)
+        if not todo:
+            return True, "Все нужные цены уже есть"
+        minutes = max(1, round(len(w.price_queue) / CRAFT_PER_PASS * 0.6))
+        return True, f"Узнаю цены {len(todo)} предм. — примерно {minutes} мин, поиск при этом не останавливается"
+
+    # --- что приносят предметы списка ---
+    def item_yield(self):
+        """По каждому предмету своего списка: сколько лотов дешевле рынка видели за неделю, на сколько из них
+        можно было успеть (висели 3+ минуты), сколько было находок. Пустые — кандидаты на удаление."""
+        names = self.names_map()
+        items, auto = eng.watch_items(self.cfg, names)
+        db = eng.MarketDB.reader()
+        try:
+            y = db.item_yield(self.cfg.get("region", "ru"), cheap=1 - float(self.cfg.get("discount", 0.15))) if db else {}
+        finally:
+            if db:
+                db.close()
+        now, rows = time.time(), []
+        if not y:      # своей базы лотов нет (подписка или поиск ещё не запускали) — нечего показать
+            return {"ok": True, "rows": [], "total": len(items), "auto": len(auto)}
+        for item_id, name in items:
+            if item_id in auto:
+                continue
+            v = y.get(item_id) or {}
+            span = (now - v["first"]) / 3600 if v.get("first") else 0
+            good = v.get("catch", 0) or v.get("deal", 0)
+            status = "good" if good else "empty" if span >= 24 and v.get("lots", 0) and not v.get("cheap") else "new"
+            rows.append({"id": item_id, "name": name, "lots": v.get("lots", 0), "cheap": v.get("cheap", 0),
+                         "catch": v.get("catch", 0), "deal": v.get("deal", 0), "near": v.get("near", 0),
+                         "hours": round(span, 1), "status": status})
+        rows.sort(key=lambda r: (-r["catch"] - r["deal"], -r["cheap"], r["name"].lower()))
+        return {"ok": True, "rows": rows, "total": len(items), "auto": len(auto)}
+
+    def names_map(self):
+        try:
+            return eng.load_listing(self.cfg.get("region", "ru"))
+        except Exception:
+            return {}
+
+    def remove_watch_ids(self, ids):
+        """Убрать предметы из своего списка по id (записи в списке — названия или id)."""
+        ids = set(ids or [])
+        names = self.names_map()
+        keep = [w for w in self.cfg.get("watch") or [] if not any(i in ids for i, _ in eng.resolve_watch([w], names))]
+        removed = len(self.cfg.get("watch") or []) - len(keep)
+        ok, msg = self.update_settings({"watch": keep})
+        return ok, (f"Убрал {removed} {plural_ru(removed, ('предмет', 'предмета', 'предметов'))}" if ok else msg)
 
     def item_stats(self, item_id, quality=None, ptn=None):
         """Для карточки находки: цена по дням за неделю и в какие часы предмет покупают."""
@@ -2271,6 +2688,11 @@ class State:
                 cfg["server_url_override"] = str(data["server_url_override"] or "").strip().rstrip("/")
             if "notify_min_chance" in data:
                 cfg["notify_min_chance"] = min(90.0, max(0.0, float(data["notify_min_chance"])))
+            for key in ("calibrate", "threshold_expected", "keep_awake", "autostart", "autorun_search", "alerts"):
+                if key in data:
+                    cfg[key] = bool(data[key])
+            if "skills" in data and isinstance(data["skills"], dict):
+                cfg["skills"] = {str(k)[:40]: min(5, max(0, int(float(v or 0)))) for k, v in data["skills"].items()}
             if "update_repo" in data:
                 repo = str(data["update_repo"] or "").strip().strip("/")
                 repo = re.sub(r"^https?://github\.com/", "", repo).strip("/")   # можно вставить и ссылку
@@ -2292,14 +2714,20 @@ class State:
         save_settings(cfg)
         self.sync_feed_server()
         changed = {k for k in set(old) | set(cfg) if old.get(k) != cfg.get(k)}
-        if changed & {"min_profit", "discount", "rare_enabled", "rare_min_profit", "rare_quality", "rare_items"}:
+        note = ""
+        if "autostart" in changed:
+            ok, why = set_autostart(cfg["autostart"])
+            if not ok:
+                note = " · " + why
+        if changed & {"min_profit", "discount", "rare_enabled", "rare_min_profit", "rare_quality", "rare_items",
+                      "threshold_expected"}:
             with self.lock:
                 self.near = {}              # пороги другие — «почти находки» пересчитает следующий проход
         if changed & set(RESTART_KEYS):
             self.restart_if_running()       # другие ключи API — нужен новый вход
         elif changed:                       # остальное — на ходу, без перезапуска
             self.reconfigure_worker(wake=bool(changed - set(QUIET_KEYS)))
-        return True, "Сохранено"
+        return True, "Сохранено" + note
 
     def suggest(self, q):
         q = eng.norm(q or "")
@@ -2388,6 +2816,10 @@ def make_handler(state, token):
                     items = [e for e in state.catalog]
                 return self.send_json({"items": items, "names": eng.CATEGORY_NAMES, "auto": list(eng.AUTO_CATEGORIES),
                                        "ranks": eng.RANK_NAMES})
+            if url.path == "/api/craft":
+                return self.send_json(state.craft())
+            if url.path == "/api/yield":
+                return self.send_json(state.item_yield())
             if url.path == "/api/item_stats":
                 q = parse_qs(url.query)
                 one = lambda k: (q.get(k) or [None])[0]
@@ -2477,6 +2909,12 @@ def make_handler(state, token):
                     state.deals = [d for d in state.deals if d["id"] != data.get("id")]
                 state.save_deals()
                 return self.send_json({"ok": True})
+            if path == "/api/craft/fetch":
+                ok, msg = state.craft_fetch(bool(data.get("only_available", True)))
+                return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/watch/remove":
+                ok, msg = state.remove_watch_ids(data.get("ids") or [])
+                return self.send_json({"ok": ok, "message": msg})
             if path == "/api/deals/clear":
                 with state.lock:
                     state.deals = []
@@ -2520,12 +2958,22 @@ def main():
     state = State()
     server, port = start_server(state)
     url = f"http://127.0.0.1:{port}/"
-    threading.Thread(target=state.load_names, daemon=True).start()
+    autostarted = "--autostart" in sys.argv
+
+    def boot():
+        state.load_names()
+        if state.cfg.get("autorun_search"):   # «начинать поиск сразу» — и при обычном запуске, и при автозапуске
+            state.start()
+    threading.Thread(target=boot, daemon=True).start()
+    threading.Thread(target=state.watchdog, daemon=True).start()
+    if state.cfg.get("autostart"):
+        set_autostart(True)   # программу могли перенести в другую папку — обновим путь
     windowed = False
     try:
         import webview  # окно приложения (pip install pywebview)
         window = webview.create_window("STALZONE Трекер", url, width=1320, height=840,
-                                       min_size=(1080, 680), background_color="#0d1012")
+                                       min_size=(1080, 680), background_color="#0d1012",
+                                       minimized=autostarted)
         state.exit_hook = window.destroy   # чтобы обновление могло закрыть окно
         webview.start()
         windowed = True

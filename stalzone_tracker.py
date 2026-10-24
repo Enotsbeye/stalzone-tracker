@@ -282,6 +282,107 @@ def barter_ids(region):
     return ids
 
 
+HIDEOUT_URL = ("https://raw.githubusercontent.com/EXBO-Studio/"
+               "stalzone-database/main/{region}/hideout_recipes.json")   # рецепты крафта в убежище
+_hideout_cache = {}
+_hideout_failed = {"at": 0.0}
+
+
+def _tr(x):
+    """Русская строка из перевода базы EXBO ({"lines": {"ru": …}})."""
+    return ((x or {}).get("lines") or {}).get("ru") or "" if isinstance(x, dict) else str(x or "")
+
+
+def load_hideout(region):
+    """Рецепты убежища из базы EXBO (скачиваются раз в неделю): (навыки {id: название}, рецепты).
+    Рецепт: {id, bench, cat, sub, result [(item, шт)], ingredients [(item, шт)], energy, perks {навык: уровень},
+    features [улучшения убежища]}. (None, []) — рецепты не удалось получить."""
+    path = os.path.join(HERE, f"hideout_{region}.json")
+    stale = not os.path.exists(path) or time.time() - os.path.getmtime(path) > 7 * 86400
+    if stale and not os.environ.get("STALZONE_OFFLINE") and time.time() - _hideout_failed["at"] > 600:
+        try:
+            r = requests.get(HIDEOUT_URL.format(region=region), timeout=30)
+            r.raise_for_status()
+            json.loads(r.text)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.write(r.text)
+            os.replace(path + ".tmp", path)
+        except (requests.RequestException, ValueError, OSError) as e:
+            _hideout_failed["at"] = time.time()
+            log.info("Рецепты убежища не скачались (%s)", type(e).__name__)
+    if not os.path.exists(path):
+        return None, []
+    mtime = os.path.getmtime(path)
+    cached = _hideout_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        perks = {str(p["id"]): _tr(p.get("name")) or str(p["id"]) for p in data.get("perks") or []}
+        recipes = []
+        for i, r in enumerate(data.get("recipes") or []):
+            req = r.get("requirements") or {}
+            res = [(str(x["item"]), int(_num(x.get("amount")) or 1)) for x in r.get("result") or [] if x.get("item")]
+            if not res:
+                continue
+            recipes.append({
+                "id": i, "bench": str(r.get("bench") or ""), "cat": _tr(r.get("category")), "sub": _tr(r.get("subcategory")),
+                "result": res,
+                "ingredients": [(str(x["item"]), int(_num(x.get("amount")) or 1)) for x in r.get("ingredients") or []
+                                if x.get("item")],
+                "energy": _num(r.get("energy")),
+                "perks": {str(k): int(_num(v)) for k, v in (req.get("perks") or {}).items()},
+                "features": [str(f) for f in req.get("features") or []]})
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
+        return None, []
+    _hideout_cache[path] = (mtime, (perks, recipes))
+    return perks, recipes
+
+
+def craft_rows(recipes, prices, skills, fee=0.05):
+    """Прибыль рецептов по ценам аукциона. prices — {item_id: цена за шт}; нет цены — предмета нет в словаре.
+    Выручка — после комиссии аукциона. Для каждого рецепта: cost, value, profit (None, если каких-то цен нет),
+    на 1000 энергии, доступен ли по навыкам и чего не хватает."""
+    out = []
+    for r in recipes:
+        missing, cost, value = [], 0.0, 0.0
+        for item, n in r["ingredients"]:
+            if item in prices:
+                cost += prices[item] * n
+            else:
+                missing.append(item)
+        for item, n in r["result"]:
+            if item in prices:
+                value += prices[item] * n * (1 - fee)
+            else:
+                missing.append(item)
+        need = {k: v for k, v in r["perks"].items() if int(skills.get(k, 0) or 0) < v}
+        profit = None if missing else value - cost
+        out.append(dict(r, cost=None if missing else cost, value=None if missing else value, profit=profit,
+                        per_energy=(profit / r["energy"] * 1000) if profit is not None and r["energy"] > 0 else None,
+                        available=not need, need=need, missing=missing))
+    return out
+
+
+def skill_advice(rows, skills, perks):
+    """Какой навык поднять: для каждого навыка — самый прибыльный рецепт, который откроется на следующем
+    уровне (остальные требования уже выполнены), и сколько прибыльных рецептов откроется."""
+    out = []
+    for perk, name in (perks or {}).items():
+        level = int(skills.get(perk, 0) or 0)
+        if level >= 5:
+            continue
+        opens = [r for r in rows if r["profit"] is not None and r["profit"] > 0 and r["perks"].get(perk) == level + 1
+                 and all(int(skills.get(k, 0) or 0) >= v for k, v in r["perks"].items() if k != perk)]
+        best = max(opens, key=lambda r: r["profit"], default=None)
+        out.append({"perk": perk, "name": name, "level": level, "count": len(opens),
+                    "best": {"id": best["id"], "result": best["result"], "profit": best["profit"],
+                             "per_energy": best["per_energy"]} if best else None})
+    out.sort(key=lambda a: -(a["best"]["profit"] if a["best"] else 0))
+    return out
+
+
 def load_catalog(region):
     """Все предметы: [{id, name, cat, rank, trade, barter}] — для поиска по категориям и «категорий целиком».
     trade — может попасть на аукцион; barter — получают бартером у торговцев."""
@@ -1210,6 +1311,95 @@ def resale_price(lot, lots, m, total=True):
     return (min(m, floor * UNDERCUT) if floor else m), floor
 
 
+CALIBRATE_MIN = 15            # столько сверенных находок — и можно поправлять оценку перепродажи
+CALIBRATE_FLOOR = 0.88        # сильнее, чем на 12%, не занижаем: дальше это скорее падение рынка, чем ошибка
+
+
+def calibration_factor(acc):
+    """Поправка оценки перепродажи по сверке с фактом (только вниз): 0,94 — продавали на 6% дешевле оценки."""
+    if not acc or acc.get("n", 0) < CALIBRATE_MIN:
+        return 1.0
+    return min(1.0, max(CALIBRATE_FLOOR, float(acc["ratio"])))
+
+
+def _nice_price(x):
+    """Цена, которую удобно вписать в игре: до рубля, у дорогих — до десятков."""
+    return float(round(x)) if x < 100000 else float(round(x / 10) * 10)
+
+
+def price_options(hist, amount, pairs, window_h, lots, additional, total=True, paid=0.0, fee=0.05,
+                  rates_fn=None, trend=None):
+    """За сколько выставить купленное: варианты цены за штуку с шансом продать за сутки и примерным сроком.
+    hist — рынок по сделкам; lots — лоты на аукционе сейчас (свой выставленный лот — уже без него).
+    Возвращает до трёх вариантов: «быстро» (самый высокий шанс), «выгодно» (больше всего прибыли с учётом
+    шанса) и «дороже» (больше прибыли, если готов подождать). Пусто — оценить не по чему."""
+    if not pairs or hist <= 0 or amount <= 0:
+        return []
+    fake = {"amount": amount, "buyoutPrice": 0, "additional": additional or {}}
+    floor = comparable_floor(fake, lots, total)
+    cands = {_nice_price(hist * k) for k in (0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2)}
+    if floor:
+        cands |= {_nice_price(floor * UNDERCUT), float(max(1, math.floor(floor) - 1))}
+    rows = []
+    for unit in sorted(c for c in cands if c > 0):
+        comp = competitors(fake, lots, unit, total)
+        supply = competitors(fake, lots, unit, total, spread=0.3)
+        c = sale_chance(unit, amount, pairs, window_h, comp, trend, supply=supply,
+                        rates=rates_fn(unit) if rates_fn else None)
+        if not c:
+            continue
+        profit = unit * amount * (1 - fee) - paid
+        rows.append({"unit": unit, "total": unit * amount, "chance": c["chance"], "hours": c["hours"],
+                     "profit": profit, "cheapest": floor is None or unit < floor})
+    if not rows:
+        return []
+    wait = lambda r: r["hours"] if r["hours"] else 24 * 30
+    # шанс за сутки упирается в потолок 90%, поэтому «быстро» — по ожидаемому времени продажи,
+    # а «выгодно» — прибыль с учётом шанса, поделённая на (1 + дней ожидания): деньги в товаре тоже стоят
+    score = lambda r: r["profit"] * r["chance"] / (1 + wait(r) / 24)
+    quickest = min(wait(r) for r in rows)
+    fast = max((r for r in rows if wait(r) <= quickest * 1.3 + 0.5), key=lambda r: r["unit"])   # почти так же быстро — дороже
+    best = max(rows, key=lambda r: (score(r), r["unit"]))
+    slow = [r for r in rows if r["unit"] > best["unit"] and r["chance"] >= 0.2 and r["profit"] > best["profit"]]
+    out = [dict(fast, key="fast")]
+    if best["unit"] != fast["unit"]:
+        out.append(dict(best, key="best"))
+    else:
+        out[0]["key"] = "best"   # самый быстрый и есть самый выгодный
+    if slow:
+        out.append(dict(max(slow, key=score), key="slow"))
+    return out
+
+
+def listing_state(lots, amount, list_total, additional, total=True):
+    """Твой выставленный лот среди лотов предмета: виден ли он (то же количество, та же цена, та же
+    корзина), сколько таких же или лучших лотов дешевле и самый дешёвый из них (за штуку)."""
+    if amount <= 0 or list_total <= 0:
+        return None
+    list_unit = list_total / amount
+    grade = grade_of(additional or {})
+    own, cheaper = False, []
+    for lot in lots:
+        a, raw = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
+        if a <= 0 or raw <= 0:
+            continue
+        og = grade_of(lot.get("additional"))
+        lot_total = raw if total else raw * a
+        if not own and a == amount and abs(lot_total - list_total) < 1 and og == grade:
+            own = True
+            continue
+        if grade is None:
+            if og is not None:
+                continue
+        elif og is None or og[0] < grade[0] or og[1] < grade[1]:
+            continue
+        unit = raw / a if total else raw
+        if unit < list_unit - 0.5:
+            cheaper.append(unit)
+    return {"own": own, "cheaper": len(cheaper), "best": min(cheaper) if cheaper else None,
+            "suggest": _nice_price(min(cheaper) * UNDERCUT) if cheaper else None}
+
+
 def lot_age_minutes(lot, now=None):
     try:
         now = now or datetime.now(timezone.utc)
@@ -1235,6 +1425,8 @@ def find_deals(lots, market, cfg, total=True):
         if unit > hist * (1 - cfg["discount"]):
             continue  # не дешевле прошлых сделок — дальше не считаем
         resale, floor = resale_price(lot, lots, hist, total)
+        raw_resale = resale
+        resale *= min(1.0, float(cfg.get("resale_factor") or 1.0))   # поправка по сверке прогнозов с фактом
         if unit > resale * (1 - cfg["discount"]):
             continue  # рядом висят такие же почти по той же цене — это не скидка
         cost = unit * amount              # сколько заплатить за весь лот
@@ -1242,7 +1434,7 @@ def find_deals(lots, market, cfg, total=True):
         if profit < cfg["min_profit"]:
             continue
         deals.append({"lot": lot, "bucket": b, "grade": grade_of(lot.get("additional")),
-                      "unit": unit, "market": resale, "hist": hist, "floor": floor, "n": n,
+                      "unit": unit, "market": resale, "market_raw": raw_resale, "hist": hist, "floor": floor, "n": n,
                       "per_day": per_day, "pct": (1 - unit / resale) * 100, "profit": profit,
                       "amount": amount, "buyout": cost, "cost": cost, "age": lot_age_minutes(lot),
                       "window_h": window_h})
@@ -1277,6 +1469,7 @@ def find_bid_deals(lots, market, cfg, now=None, total=True):
         if buyout and buyout <= need:
             continue  # выгоднее просто выкупить — это поймает обычный режим
         m, floor = resale_price(lot, lots, hist, total)
+        m *= min(1.0, float(cfg.get("resale_factor") or 1.0))
         max_bid = m * (1 - cfg["fee"]) * amount - cfg["min_profit"]
         if need >= max_bid:
             continue
@@ -1417,6 +1610,12 @@ class MarketDB:
             ratio REAL,                                 -- цена за шт / рыночная, когда увидели
             gone_ts REAL, outcome TEXT, sold_ts REAL,   -- пропал; sold / expired / removed
             PRIMARY KEY (region, item_id, lot_key));
+        CREATE TABLE IF NOT EXISTS predictions (    -- оценки находок: потом сверяем с тем, за сколько продавали
+            region TEXT NOT NULL, item_id TEXT NOT NULL, lot_key TEXT NOT NULL, ts REAL NOT NULL,
+            qlt INTEGER NOT NULL, ptn INTEGER NOT NULL, amount INTEGER NOT NULL,
+            unit REAL NOT NULL, resale REAL NOT NULL, hist REAL NOT NULL, chance REAL,
+            kind TEXT NOT NULL,                         -- deal — показана, near — «почти находка»
+            PRIMARY KEY (region, lot_key));
     """
 
     def __init__(self, path=None, keep_days=14):
@@ -1426,6 +1625,17 @@ class MarketDB:
         self.con.execute("PRAGMA journal_mode=WAL")   # чтение не мешает записи
         self.con.executescript(self.SCHEMA)
         self.cleanup()
+
+    @classmethod
+    def reader(cls, path=None):
+        """База только для чтения — для окна программы, пока проверка пишет в неё. None — базы ещё нет."""
+        path = path or os.path.join(HERE, "market.db")
+        if not os.path.exists(path):
+            return None
+        self = cls.__new__(cls)
+        self.path, self.keep_days = path, 14
+        self.con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        return self
 
     def close(self):
         try:
@@ -1439,6 +1649,7 @@ class MarketDB:
         with self.con:
             self.con.execute("DELETE FROM sales WHERE ts < ?", (cutoff,))
             self.con.execute("DELETE FROM lots WHERE last_seen < ?", (cutoff,))
+            self.con.execute("DELETE FROM predictions WHERE ts < ?", (cutoff,))
             self.con.execute("UPDATE coverage SET covered_from = ? WHERE covered_from < ?", (cutoff, cutoff))
 
     def coverage(self, region, item_id):
@@ -1621,6 +1832,91 @@ class MarketDB:
             elif gone is None and last - start >= 86400:   # сами видели, что висит дольше суток
                 total += 1
         return sold, total
+
+    # --- прогноз против факта ---
+    def record_predictions(self, rows):
+        """Запомнить оценки находок. rows — (region, item_id, lot_key, ts, qlt, ptn, amount, unit, resale, hist,
+        chance, kind). Важна первая оценка лота — повторные не перезаписываем."""
+        if not rows:
+            return
+        with self.con:
+            self.con.executemany(
+                "INSERT OR IGNORE INTO predictions (region, item_id, lot_key, ts, qlt, ptn, amount, unit, resale, "
+                "hist, chance, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+
+    def accuracy(self, region, now=None, days=7, min_age_h=3, horizon_h=24, limit=400):
+        """Сбылась ли оценка перепродажи: для каждой находки — медиана цен за штуку таких же лотов (предмет,
+        качество, заточка той же корзины), проданных за horizon_h часов после находки, кроме самой находки.
+        Возвращает {"n", "ratio" — медиана «факт / прогноз», "hit" — доля, где факт ≥ 97% прогноза,
+        "by_kind": {deal|near: (n, ratio)}, "rows": [(item_id, kind, прогноз, факт, ts)]} или None."""
+        now = now or time.time()
+        preds = self.con.execute(
+            "SELECT item_id, lot_key, ts, qlt, ptn, amount, unit, resale, kind FROM predictions "
+            "WHERE region = ? AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?",
+            (region, now - days * 86400, now - min_age_h * 3600, limit)).fetchall()
+        rows = []
+        for item_id, key, ts, qlt, ptn, amount, unit, resale, kind in preds:
+            if resale <= 0:
+                continue
+            if qlt < 0:
+                cond, args = "qlt = -1", ()
+            else:
+                lo = min(ptn - ptn % 5, 15)
+                cond, args = "qlt = ? AND ptn BETWEEN ? AND ?", (qlt, lo, lo + 4 if lo < 15 else 99)
+            prices, own = [], False
+            for a, p in self.con.execute(
+                    f"SELECT amount, price FROM sales WHERE region = ? AND item_id = ? AND ts > ? AND ts <= ? AND {cond}",
+                    (region, item_id, ts, ts + horizon_h * 3600) + args):
+                if a <= 0:
+                    continue
+                u = p / a
+                if not own and a == amount and abs(u - unit) <= unit * 0.005:
+                    own = True          # сама находка — её купили по её цене, это не перепродажа
+                    continue
+                prices.append(u)
+            if prices:
+                rows.append((item_id, kind, resale, statistics.median(prices), ts))
+        if not rows:
+            return None
+        ratios = [fact / pred for _, _, pred, fact, _ in rows]
+        by_kind = {}
+        for kind in ("deal", "near"):
+            r = [fact / pred for _, k, pred, fact, _ in rows if k == kind]
+            if r:
+                by_kind[kind] = (len(r), statistics.median(r))
+        return {"n": len(rows), "ratio": statistics.median(ratios),
+                "hit": sum(1 for x in ratios if x >= 0.97) / len(ratios), "by_kind": by_kind, "rows": rows}
+
+    def item_yield(self, region, now=None, days=7, cheap=0.9, live_s=180):
+        """Что приносят предметы: {item_id: {lots — лотов видели, cheap — дешевле рынка (цена/рынок < cheap),
+        catch — из них висели хотя бы live_s секунд (на такие успеваешь), first/last — когда видели}}."""
+        now = now or time.time()
+        out = {}
+        for item, n, c, k, first, last in self.con.execute(
+                "SELECT item_id, COUNT(*), SUM(ratio < ?), "
+                "SUM(ratio < ? AND COALESCE(sold_ts, gone_ts, last_seen) - first_seen >= ?), "
+                "MIN(first_seen), MAX(last_seen) FROM lots WHERE region = ? AND first_seen >= ? GROUP BY item_id",
+                (cheap, cheap, live_s, region, now - days * 86400)):
+            out[item] = {"lots": n, "cheap": int(c or 0), "catch": int(k or 0), "first": first, "last": last}
+        for item, kind, n in self.con.execute(
+                "SELECT item_id, kind, COUNT(*) FROM predictions WHERE region = ? AND ts >= ? GROUP BY item_id, kind",
+                (region, now - days * 86400)):
+            out.setdefault(item, {"lots": 0, "cheap": 0, "catch": 0, "first": None, "last": None})[kind] = n
+        return out
+
+    def unit_prices(self, region, item_ids, now=None, days=7, max_sales=60):
+        """Цена за штуку по последним сделкам — медиана, обычное качество и без заточки:
+        {item_id: (цена, сделок, время последней)}. Предметов без сделок в ответе нет."""
+        now = now or time.time()
+        out = {}
+        for item in item_ids:
+            rows = self.con.execute(
+                "SELECT amount, price, ts FROM sales WHERE region = ? AND item_id = ? AND ts >= ? AND qlt <= 0 "
+                "AND ptn <= 0 ORDER BY ts DESC LIMIT ?", (region, item, now - days * 86400, max_sales)).fetchall()
+            units = [p / a for a, p, _ in rows if a > 0 and p > 0]
+            if units:
+                out[item] = (statistics.median(units), len(units), rows[0][2])
+        return out
 
     def window_hours(self, region, item_id, hours):
         """Сколько часов из последних hours покрыто непрерывной историей."""
@@ -2450,9 +2746,59 @@ def selftest():
         sold_b, hours_b = table[(rate_bin(0.9, RATIO_BINS), rate_bin(liq["x"], LIQ_BINS))]
         assert sold_b == 1 and hours_b > 0, table
         assert db_l.new_lot_rates("ru", now=t0 + 60)["x"] > 0
+        # --- что приносят предметы: «a» (0,9) и «b» (0,95) — дешевле 0,97; на «a» успевали: висел до сделки ---
+        y = db_l.item_yield("ru", now=t0 + 3 * 3600, cheap=0.97, live_s=30)
+        assert y["x"]["lots"] == 4 and y["x"]["cheap"] == 2 and y["x"]["catch"] >= 1, y
+        # --- прогноз против факта: оценили перепродажу в 100, а такие лоты потом продавали по 90 ---
+        preds = [("ru", "y", f"y|{i}", t0 - 10 * 3600 - i, -1, -1, 1, 70.0, 100.0, 100.0, 0.5, "deal") for i in range(16)]
+        db_l.record_predictions(preds)
+        db_l.record_predictions(preds[:1])                            # повтор — не дублируется
+        db_l.store("ru", "y", [{"amount": 1, "price": 90 + k % 3, "time": iso(datetime.fromtimestamp(
+            t0 - 9 * 3600 + k * 60, timezone.utc))} for k in range(5)]
+            + [{"amount": 1, "price": 70, "time": iso(datetime.fromtimestamp(t0 - 9 * 3600 + 400, timezone.utc))}], "stop")
+        acc = db_l.accuracy("ru", now=t0)
+        assert acc["n"] == 16 and 0.89 < acc["ratio"] < 0.92 and acc["hit"] == 0, acc
+        assert abs(calibration_factor(acc) - acc["ratio"]) < 1e-9 and calibration_factor({"n": 3, "ratio": 0.5}) == 1.0
+        assert calibration_factor({"n": 40, "ratio": 0.5}) == CALIBRATE_FLOOR
+        assert db_l.item_yield("ru", now=t0)["y"]["deal"] == 16
+        assert abs(db_l.unit_prices("ru", ["y", "nope"], now=t0)["y"][0] - 90) < 1.01
     finally:
         db_l.close()
         shutil.rmtree(tmp_l, ignore_errors=True)
+    # --- поправка оценки: та же находка с оценкой ниже на 10% — прибыль меньше, слабая отсеивается ---
+    mk_lot = lambda price, start_h=0.1: {"amount": 1, "buyoutPrice": price, "startTime": iso(now - timedelta(hours=start_h)),
+                                         "endTime": iso(now + timedelta(hours=20))}
+    mkt = market_prices([{"amount": 1, "price": 100000, "time": iso(now - timedelta(hours=i))} for i in range(10)], 5)
+    d1 = find_deals([mk_lot(80000)], mkt, dict(CONFIG, min_profit=10000))
+    d2 = find_deals([mk_lot(80000)], mkt, dict(CONFIG, min_profit=10000, resale_factor=0.9))
+    assert d1 and d1[0]["market"] == 100000 and not d2, (d1, d2)
+    d3 = find_deals([mk_lot(70000)], mkt, dict(CONFIG, min_profit=10000, resale_factor=0.9))
+    assert d3 and d3[0]["market"] == 90000 and d3[0]["market_raw"] == 100000
+    # --- помощник продажи: варианты цены и «твой лот перебили» ---
+    pairs = [(100000.0, 1)] * 30
+    others = [mk_lot(98000), mk_lot(105000), mk_lot(120000)]
+    opts = price_options(100000, 1, pairs, 48, others, {}, paid=80000)
+    assert opts and opts[0]["key"] in ("fast", "best") and all(o["chance"] > 0 for o in opts), opts
+    fast = opts[0]
+    assert fast["unit"] < 98000 and fast["cheapest"], opts   # быстрее всего — дешевле самого дешёвого конкурента
+    assert len({o["unit"] for o in opts}) == len(opts)
+    assert price_options(100000, 1, [], 48, others, {}) == []
+    st = listing_state(others + [mk_lot(97000)], 1, 97000, {})
+    assert st["own"] and st["cheaper"] == 0
+    st = listing_state(others + [mk_lot(99000)], 1, 99000, {})
+    assert st["own"] and st["cheaper"] == 1 and st["best"] == 98000 and st["suggest"] < 98000, st
+    assert not listing_state(others, 1, 99500, {})["own"]
+    # --- калькулятор крафта: прибыль рецепта, недостающие цены, совет по навыку ---
+    recs = [{"id": 1, "bench": "w", "cat": "", "sub": "", "result": [("r1", 2)], "ingredients": [("i1", 3), ("i2", 1)],
+             "energy": 500.0, "perks": {"medicine": 2}, "features": []},
+            {"id": 2, "bench": "w", "cat": "", "sub": "", "result": [("r2", 1)], "ingredients": [("i9", 1)],
+             "energy": 100.0, "perks": {"medicine": 1}, "features": []}]
+    rows = craft_rows(recs, {"r1": 1000.0, "i1": 100.0, "i2": 200.0, "r2": 50.0}, {"medicine": 1}, fee=0.05)
+    assert rows[0]["cost"] == 500 and rows[0]["value"] == 1900 and rows[0]["profit"] == 1400 and not rows[0]["available"]
+    assert rows[0]["per_energy"] == 2800 and rows[0]["need"] == {"medicine": 2}
+    assert rows[1]["profit"] is None and rows[1]["missing"] == ["i9"] and rows[1]["available"]
+    adv = skill_advice(rows, {"medicine": 1}, {"medicine": "Медицина", "cooking": "Кулинария"})
+    assert adv[0]["perk"] == "medicine" and adv[0]["count"] == 1 and adv[0]["best"]["profit"] == 1400, adv
     # --- один ключ на несколько программ: делим лимит по остатку из ответов API ---
     class _R:
         def __init__(self, remaining, reset):

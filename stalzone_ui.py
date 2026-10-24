@@ -125,7 +125,6 @@ select.field{padding:8px 10px;cursor:pointer}
 .toggle.on{border-color:color-mix(in srgb,var(--amber) 60%,transparent);background:var(--amber-soft);color:var(--text)}
 .toggle.rare.on{border-color:color-mix(in srgb,var(--q3) 55%,transparent);background:color-mix(in srgb,var(--q3) 14%,transparent)}
 .check{display:inline-flex;align-items:center;gap:7px;font-size:14px;color:var(--muted);cursor:pointer}
-.listbar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin:-6px 0 -8px}
 .field.bare{border-color:transparent;background:transparent;padding-left:2px;font-weight:600;color:var(--text)}
 .field.bare:hover{background:var(--surface)}
 .btn.copy{background:transparent;color:var(--muted);border-color:transparent;padding:4px 8px}
@@ -170,6 +169,41 @@ select.field{padding:8px 10px;cursor:pointer}
 .nr-side{display:flex;flex-direction:column;align-items:flex-end;gap:2px;text-align:right;font-size:13.5px}
 .nr-side b{font-weight:650}
 .nr.gone{opacity:.5}
+.lot-side .exp{color:var(--good);font-weight:600}
+tr.sellrow td{padding-top:0;background:var(--surface-2);white-space:normal;text-align:left}
+.sell{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:8px 0 4px}
+.sell .opts{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.opt{all:unset;cursor:pointer;display:flex;flex-direction:column;gap:1px;padding:5px 10px;border-radius:10px;border:1px solid var(--line);background:var(--surface);font-size:13px}
+.opt:hover{border-color:var(--line-2)}
+.opt span{color:var(--muted);font-size:12px}
+.opt.best{box-shadow:inset 0 0 0 1px var(--amber)}
+.ls{flex-basis:100%;font-size:13.5px;color:var(--muted)}
+.ls.bad{color:var(--bad);font-weight:600}
+.ls.good{color:var(--good)}
+.acc{margin-top:16px}
+.acc p{margin:0 0 10px}
+.accrows{display:flex;flex-direction:column;border-top:1px solid var(--line)}
+.accrows div{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:14px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.neg{color:var(--bad)}
+.pos{color:var(--good)}
+table.craft td.profit,table.craft td.neg{font-size:15px}
+.ylist{display:flex;flex-direction:column;gap:2px;margin-bottom:10px}
+.yrow{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line)}
+.yrow .n{font-weight:550}
+.skills{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px}
+.skill{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:14px}
+.skill .field{width:84px;padding:5px 8px}
+.advice{display:flex;flex-direction:column;gap:8px}
+.adv{display:flex;flex-direction:column;gap:1px;font-size:14px}
+.adv span{color:var(--muted)}
+table.craft{table-layout:fixed}
+table.craft td{vertical-align:top;white-space:normal}
+table.craft td.num{white-space:nowrap}
+table.craft th{white-space:normal}
+table.craft th:nth-child(-n+2),table.craft td:nth-child(-n+2){text-align:left}
+table.craft tr.loss{opacity:.6}
+.noprice{color:var(--faint)}
+.tag.bad{color:var(--bad);background:var(--bad-soft)}
 .nr.gone .n{text-decoration:line-through}
 .lot-side .btn{margin-top:4px;margin-right:-8px}
 .profit{font:600 19px/1.2 var(--display);color:var(--good);white-space:nowrap}
@@ -282,11 +316,6 @@ select.field{padding:8px 10px;cursor:pointer}
 .chip .star{font-size:15px;padding:0}
 .chip > button:last-child{all:unset;cursor:pointer;width:20px;height:20px;border-radius:50%;display:grid;place-items:center;color:var(--muted);font-size:12px}
 .chip > button:last-child:hover{background:var(--bad-soft);color:var(--bad)}
-.presets{display:flex;flex-direction:column;gap:10px}
-.preset{all:unset;cursor:pointer;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
-.preset:hover{border-color:var(--line-2)}
-.preset b{display:block}
-.preset span{color:var(--muted);font-size:13.5px}
 .catrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
 .catrow:last-of-type{border-bottom:0}
 .catrow b{font-weight:600}
@@ -388,6 +417,7 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
       <button data-view="deals" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2M8.5 11.5l2 2 3.5-4"/></svg><span class="lbl">Находки</span><span class="cnt" id="cntDeals"></span></button>
       <button data-view="items"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><path d="M17 14v6M14 17h6"/></svg><span class="lbl">Предметы</span><span class="cnt quiet" id="cntItems"></span></button>
       <button data-view="buys"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h14l-1.2 11.2a2 2 0 01-2 1.8H8.2a2 2 0 01-2-1.8z"/><path d="M9 8V6a3 3 0 016 0v2"/><path d="M9.5 14l2 2 3.5-4"/></svg><span class="lbl">Мои покупки</span><span class="cnt ok" id="cntBuys"></span></button>
+      <button data-view="craft"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v6.2L4.8 18.4A1.8 1.8 0 006.4 21h11.2a1.8 1.8 0 001.6-2.6L14 9.2V3"/><path d="M7.5 15h9"/></svg><span class="lbl">Крафт</span></button>
       <button data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg><span class="lbl">Настройки</span></button>
       <button data-view="access"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></svg><span class="lbl">Доступ</span></button>
       <button data-view="log"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span class="lbl">Журнал</span></button>
@@ -429,18 +459,10 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
       </div>
       <div class="toolbar">
         <input class="field search" id="search" placeholder="Найти в находках" autocomplete="off">
-        <div class="seg" id="kindSeg"><button data-k="all" class="on">Все</button><button data-k="buyout">Выкуп</button><button data-k="bid">Ставки</button></div>
-        <select class="field" id="fCat" title="Категория"><option value="all">Все категории</option><option value="artefact">Артефакты</option><option value="armor">Броня</option><option value="weapon">Оружие</option><option value="parts">Запчасти</option><option value="tools">Инструменты</option><option value="other">Остальное</option></select>
-        <select class="field" id="fChance" title="Шанс продать за сутки"><option value="0">Любой шанс</option><option value="30">Шанс от 30%</option><option value="50">Шанс от 50%</option><option value="70">Шанс от 70%</option></select>
-        <input class="field small num" id="fProfit" placeholder="Прибыль от, ₽" inputmode="numeric">
+        <select class="field" id="fSort" title="Порядок"><option value="exp">Сначала самая ожидаемая прибыль</option><option value="profit">Сначала самые прибыльные</option><option value="chance">Сначала самые надёжные</option><option value="listed">Сначала самые свежие</option><option value="pct">Сначала с самой большой скидкой</option><option value="name">По названию</option></select>
         <button class="toggle rare" id="fRare" title="Только особо редкие находки">💎 Редкие</button>
-        <button class="toggle" id="fFresh" title="Выставлены меньше 30 минут назад">Свежие</button>
-      </div>
-      <div class="listbar">
-        <select class="field bare" id="fSort" title="Порядок"><option value="profit">Сначала самые прибыльные</option><option value="chance">Сначала самые надёжные</option><option value="listed">Сначала самые свежие</option><option value="pct">Сначала с самой большой скидкой</option><option value="name">По названию</option></select>
         <div class="spacer"></div>
-        <label class="check"><input type="checkbox" id="hideOld" checked> Скрывать проданные и снятые</label>
-        <button class="btn ghost sm" id="fReset">Сбросить фильтры</button>
+        <label class="check"><input type="checkbox" id="hideOld" checked> Скрывать проданные</label>
         <button class="btn ghost sm" id="clearBtn" title="Убрать все находки из списка">Очистить список</button>
       </div>
       <div class="lots" id="rows"></div>
@@ -465,6 +487,11 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="muted small" id="catMore" style="margin-top:8px"></div>
         </div>
         <div class="col">
+          <div class="card" id="yieldBox" hidden>
+            <h3>Что приносит находки</h3>
+            <div class="sub" id="yieldSub"></div>
+            <div id="yieldBody"></div>
+          </div>
           <div class="card">
             <h3>Мой список <span class="muted" id="watchCnt" style="font-weight:500"></span></h3>
             <div class="note ok" id="subItemsNote" hidden>Подписка: список и категории — это фильтр. Показываю находки сервера только по ним, а если пусто — все.</div>
@@ -480,15 +507,6 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
             <div class="catrow"><div><b>Запчасти</b><small data-cnt="parts"></small></div><label class="switch"><input type="checkbox" data-cat="parts"><i></i></label></div>
             <div class="catrow"><div><b>Инструменты</b><small data-cnt="tools"></small></div><label class="switch"><input type="checkbox" data-cat="tools"><i></i></label></div>
             <div class="note" id="catNote">Каждый предмет — 1–2 запроса к API за круг (лимит EXBO — 400 в минуту). Чем больше предметов, тем длиннее круг. Цена брони и оружия зависит от заточки — такие находки проверяй в игре.</div>
-          </div>
-          <div class="card">
-            <h3>Готовые наборы</h3>
-            <div class="sub">Добавляет предметы к списку, повторы не появятся.</div>
-            <div class="presets">
-              <button class="preset" data-preset="craft"><b>Ингредиенты твоих крафтов</b><span>Морфин, Янтарная полынь, Хлорид алюминия, Теломераза, Мутаген, Коагулянт, Чертоцвет, Полимеры, Помидор</span></button>
-              <button class="preset" data-preset="arts"><b>Ходовые артефакты</b><span>Ледяной ежик, Вихрь, Змеиный глаз, Гелий, Спираль, Батарейка</span></button>
-              <button class="preset" data-preset="hot"><b>Ходовые материалы</b><span>Огромный артефактный фрагмент, Моток медной проволоки, Аммиак, Набор специй, Полимеры</span></button>
-            </div>
           </div>
         </div>
       </div>
@@ -513,6 +531,42 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
         </table>
       </div>
       <div class="empty" id="bEmpty"><div><div class="radar"></div><h3 id="bEmptyH">Пока нет покупок</h3><div id="bEmptyT">Купил лот из находок — открой его и нажми «Я купил». Трекер будет следить за его ценой и шансом продажи.</div></div></div>
+      <div class="card acc" id="accBox">
+        <h3>Сбываются ли прогнозы</h3>
+        <div class="sub" id="accSub">Трекер запоминает свою оценку каждой находки и через несколько часов сравнивает её с тем, за сколько такие лоты реально продавали.</div>
+        <div id="accBody"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-craft">
+      <div class="grid2 craft-top">
+        <div class="card">
+          <h3>Мои навыки в убежище</h3>
+          <div class="sub">Уровни навыков — по ним видно, какие рецепты тебе доступны. Сохраняются сами.</div>
+          <div class="skills" id="skills"></div>
+        </div>
+        <div class="card">
+          <h3>Какой навык качать</h3>
+          <div class="sub">Что откроет следующий уровень каждого навыка — по сегодняшним ценам аукциона.</div>
+          <div id="advice" class="advice"><div class="muted">Загружаю рецепты…</div></div>
+        </div>
+      </div>
+      <div class="toolbar" style="margin-top:16px">
+        <input class="field search" id="crSearch" placeholder="Найти рецепт или ингредиент" autocomplete="off">
+        <label class="check"><input type="checkbox" id="crMine" checked> Только доступные мне</label>
+        <select class="field" id="crSort"><option value="profit">Сначала самые прибыльные</option><option value="energy">Больше прибыли на 1000 энергии</option><option value="name">По названию</option></select>
+        <div class="spacer"></div>
+        <span class="muted small" id="crPrices"></span>
+        <button class="btn" id="crFetch">Узнать цены</button>
+      </div>
+      <div class="tablewrap">
+        <table class="craft">
+          <colgroup><col style="width:30%"><col style="width:32%"><col><col><col><col></colgroup>
+          <thead><tr><th>Что получится</th><th>Из чего</th><th>Стоимость</th><th>Продать за</th><th>Прибыль</th><th>На 1000 энергии</th></tr></thead>
+          <tbody id="crRows"></tbody>
+        </table>
+      </div>
+      <div class="muted small" style="margin-top:10px">Цены — медиана сделок за неделю из твоей базы, продажа — после комиссии 5%. Прибыль не учитывает улучшения убежища, которых может не быть: они показаны серым под рецептом.</div>
     </section>
 
     <section class="view" id="view-settings">
@@ -522,8 +576,11 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="sub">Лот попадёт в находки, только если выполнены оба условия.</div>
           <div class="row"><label>Дешевле рынка минимум на<small>в процентах</small></label><input class="field num" id="sDiscount" inputmode="numeric"></div>
           <div class="row"><label>Минимальная прибыль<small>после комиссии 5%, ₽</small></label><input class="field num" id="sMinProfit" inputmode="numeric"></div>
-          <div class="row"><label>Пауза между кругами<small>минут; 0 — проверять без остановки (быстрее всего). Новые лоты API показывает с задержкой ~10 мин.</small></label><input class="field num" id="sPoll" inputmode="numeric"></div>
-          <div class="row"><label>Рыночная цена по сделкам за<small>часов</small></label><input class="field num" id="sHist" inputmode="numeric"></div>
+        </div>
+        <div class="card">
+          <h3>Надёжность</h3>
+          <div class="sub">Пока идёт поиск, компьютер не уснёт (экран гаснуть может). О важном — продано, твой лот перебили, поиск встал, компьютер спал — трекер напишет в Telegram, если он настроен ниже.</div>
+          <div class="row"><label>Запускать вместе с Windows<small>окно откроется свёрнутым, поиск начнётся сам</small></label><label class="switch"><input type="checkbox" id="sAutostart"><i></i></label></div>
         </div>
         <div class="card">
           <h3>Доступ к API</h3>
@@ -533,14 +590,12 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="row" id="demoRow"><label>Демо-режим<small>Тестовые данные EXBO, ключи не нужны</small></label><label class="switch"><input type="checkbox" id="sDemo"><i></i></label></div>
           <div class="row wide"><label>Client ID</label><input class="field" id="sClientId" autocomplete="off"></div>
           <div class="row wide"><label>Client Secret</label><input class="field" id="sClientSecret" type="password" autocomplete="off"></div>
-          <div class="row wide"><label>Токен (необязательно)<small>Только если EXBO выдала готовый токен</small></label><input class="field" id="sToken" type="password" autocomplete="off"></div>
           <div class="linkrow"><button class="btn" data-open="api_bot">Получить доступ</button><button class="btn" data-open="docs">Документация</button></div>
         </div>
         <div class="card">
           <h3>Уведомления</h3>
           <div class="sub">Звук в программе и сообщение в Telegram о каждой новой находке.</div>
           <div class="row"><label>Звук при находке<small>сохраняется на этом компьютере</small></label><label class="switch"><input type="checkbox" id="sSound"><i></i></label></div>
-          <div class="row"><label>Только если шанс продажи от<small>%, особо редкие — всегда; 0 — обо всех</small></label><input class="field num" id="sMinChance" inputmode="numeric"></div>
           <div class="row wide"><label>Токен бота Telegram<small>создай бота у @BotFather</small></label><input class="field" id="sTgToken" type="password" autocomplete="off"></div>
           <div class="row wide"><label>Chat ID<small>число от @userinfobot; у своего бота нажми Start</small></label><input class="field" id="sTgChat" autocomplete="off"></div>
           <div class="linkrow"><button class="btn" id="tgTestBtn">Проверить Telegram</button><button class="btn" data-open="botfather">Открыть @BotFather</button></div>
@@ -554,19 +609,11 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="note">Ещё особо редкими считаются снаряжение ранга «Легенда» и всё, что отмечено звёздочкой ★ во вкладке «Предметы».</div>
         </div>
         <div class="card">
-          <h3>Ставки</h3>
-          <div class="sub">Лоты со ставками, которые скоро закончатся, а ставка сильно ниже рынка.</div>
-          <div class="row"><label>Искать выгодные ставки</label><label class="switch"><input type="checkbox" id="sBids"><i></i></label></div>
-          <div class="row"><label>Лоты, что закончатся в ближайшие<small>минут</small></label><input class="field num" id="sBidWin" inputmode="numeric"></div>
-        </div>
-        <div class="card">
           <h3>Программа и данные</h3>
           <div class="sub">Версия <span id="appVer"></span>. Ключи, настройки, находки и журнал хранятся отдельно от программы — обновление их не сотрёт.</div>
           <div class="row w2"><label>Тема<small>меняется сразу</small></label><select class="field" id="sTheme"><option value="system">Как в Windows</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></div>
           <div class="row wide"><label>Папка с данными<small id="dataDir" style="word-break:break-all"></small></label></div>
-          <div class="row"><label>Хранить историю сделок<small>дней, от 3 до 90: больше — точнее оценка редких артефактов</small></label><input class="field num" id="sKeep" inputmode="numeric"></div>
           <div class="muted small" id="dbInfo" style="margin-top:10px">База сделок пока пустая — начнёт копиться после запуска.</div>
-          <div class="row wide" style="margin-top:6px"><label>Обновления с GitHub<small>репозиторий «владелец/имя» — программа сама проверит, скачает и поставит новую версию</small></label><input class="field" id="sUpdRepo" placeholder="например, ivan/stalzone-tracker" autocomplete="off"></div>
           <div class="muted small" id="updInfo" style="margin-top:8px"></div>
           <div class="linkrow"><button class="btn" id="updCheckBtn">Проверить обновления</button><button class="btn" id="openDataBtn">Открыть папку</button></div>
         </div>
@@ -660,12 +707,7 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
 <script>
 const TOKEN = "__TOKEN__";
 const QN = ["обычный","необычный","особый","редкий","исключительный","легендарный"];
-const PRESETS = {
-  craft: ["Морфин","Янтарная полынь","Хлорид алюминия","Теломераза","Мутаген","Коагулянт","Чертоцвет","Полимеры","Помидор"],
-  arts: ["Ледяной ежик","Вихрь","Змеиный глаз","Гелий","Спираль","Батарейка"],
-  hot: ["Огромный артефактный фрагмент","Моток медной проволоки","Аммиак","Набор специй","Полимеры"],
-};
-const TITLES = {deals:"Находки", items:"Предметы", buys:"Мои покупки", settings:"Настройки", access:"Доступ", log:"Журнал"};
+const TITLES = {deals:"Находки", items:"Предметы", buys:"Мои покупки", craft:"Крафт в убежище", settings:"Настройки", access:"Доступ", log:"Журнал"};
 const FILTER_CATS = ["artefact", "armor", "weapon", "parts", "tools"];
 const RANK_RU = {RANK_NEWBIE: "Новичок", RANK_STALKER: "Сталкер", RANK_VETERAN: "Ветеран", RANK_MASTER: "Мастер", RANK_LEGEND: "Легенда"};
 const RANK_Q = {RANK_NEWBIE: 1, RANK_STALKER: 2, RANK_VETERAN: 3, RANK_MASTER: 4, RANK_LEGEND: 5};
@@ -678,7 +720,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"
 const store = { get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
                 set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
 let CAT = null, CATMAP = {}, CATNAMES = {}, catTab = store.get("catTab", "all"), catLoading = 0;
-let F = Object.assign({cat: "all", chance: 0, profit: "", rare: false, fresh: false, sort: "profit"}, store.get("filters", {}));
+let F = Object.assign({rare: false, sort: "exp"}, store.get("filters", {}), {cat: "all", chance: 0, profit: "", fresh: false});
 let bFilter = store.get("bFilter", "open"), sellOpen = null, showBarter = store.get("showBarter", false);
 
 // ---------- тема ----------
@@ -831,6 +873,8 @@ function go(v) {
   $("viewTitle").textContent = TITLES[v];
   if (v !== "deals") closeDrawer();
   if (v === "items" && CAT) renderCatalog(true);
+  if (v === "items") loadYield();
+  if (v === "craft") loadCraft();
 }
 document.querySelectorAll(".nav button").forEach((b) => b.onclick = () => go(b.dataset.view));
 document.querySelectorAll("[data-goto]").forEach((b) => b.onclick = (e) => { e.preventDefault(); go(b.dataset.goto); });
@@ -859,23 +903,17 @@ $("runBtn").onclick = async () => {
 };
 
 // ---------- находки ----------
-$("kindSeg").onclick = (e) => { const b = e.target.closest("button"); if (!b) return; kind = b.dataset.k; [...$("kindSeg").children].forEach((x) => x.classList.toggle("on", x === b)); renderDeals(true); };
 $("search").oninput = () => renderDeals(true);
 $("hideOld").onchange = () => { renderDeals(true); renderNear(true); };
 $("clearBtn").onclick = async () => { await api("/api/deals/clear", {}); closeDrawer(); refresh(); };
 function catGroup(c) { return FILTER_CATS.includes(c) ? c : "other"; }
 function saveFilters() { store.set("filters", F); }
 function syncFilters() {
-  $("fCat").value = F.cat; $("fChance").value = String(F.chance || 0); $("fProfit").value = F.profit || ""; $("fSort").value = F.sort || "profit";
-  $("fRare").classList.toggle("on", !!F.rare); $("fFresh").classList.toggle("on", !!F.fresh);
+  $("fSort").value = F.sort || "exp";
+  $("fRare").classList.toggle("on", !!F.rare);
 }
-$("fCat").onchange = () => { F.cat = $("fCat").value; saveFilters(); renderDeals(true); };
-$("fChance").onchange = () => { F.chance = +$("fChance").value; saveFilters(); renderDeals(true); };
-$("fProfit").oninput = () => { F.profit = $("fProfit").value.replace(/\D/g, ""); saveFilters(); renderDeals(true); };
 $("fSort").onchange = () => { F.sort = $("fSort").value; saveFilters(); renderDeals(true); };
 $("fRare").onclick = () => { F.rare = !F.rare; saveFilters(); syncFilters(); renderDeals(true); };
-$("fFresh").onclick = () => { F.fresh = !F.fresh; saveFilters(); syncFilters(); renderDeals(true); };
-$("fReset").onclick = () => { F = {cat: "all", chance: 0, profit: "", rare: false, fresh: false, sort: "profit"}; $("search").value = ""; saveFilters(); syncFilters(); renderDeals(true); };
 syncFilters();
 function chanceCls(c) { return c >= 0.7 ? "hi" : c >= 0.4 ? "mid" : "lo"; }
 function chanceWords(c) { return c >= 0.7 ? "Продастся быстро" : c >= 0.4 ? "Может повисеть" : "Продать будет трудно"; }
@@ -912,7 +950,8 @@ function visibleDeals() {
     && (!F.fresh || (d.listed && now - Date.parse(d.listed) / 1000 < 1800))
     && (!$("hideOld").checked || d.bought || (!d.gone && (!d.ends || Date.parse(d.ends) / 1000 > now))));
   const key = F.sort || "profit";
-  const val = (d) => key === "listed" ? Date.parse(d.listed || 0) : key === "chance" ? (d.chance == null ? -1 : d.chance) : key === "name" ? d.name : d[key];
+  const val = (d) => key === "listed" ? Date.parse(d.listed || 0) : key === "chance" ? (d.chance == null ? -1 : d.chance)
+    : key === "exp" ? (d.exp_profit == null ? d.profit * 0.3 : d.exp_profit) : key === "name" ? d.name : d[key];
   list.sort((a, b) => { const x = val(a), y = val(b); return key === "name" ? String(x).localeCompare(y, "ru") : (y - x); });
   return list;
 }
@@ -928,6 +967,7 @@ function dealCard(d, now) {
     </div>
     <div class="lot-side">
       <div class="profit num">+${rub(d.profit)}</div>
+      ${d.exp_profit != null ? `<div class="small num exp" title="Прибыль × шанс продать за сутки">ожидаемо +${rub(d.exp_profit)}</div>` : ""}
       <div class="muted small num">дешевле рынка на ${Math.round(d.pct)}%</div>
       <button class="btn sm copy" data-copy="${d.id}" title="Вставь в поиск аукциона в игре"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 00-2-2H6a2 2 0 00-2 2v8a2 2 0 002 2h2"/></svg>Скопировать название</button>
     </div>
@@ -1264,12 +1304,6 @@ document.querySelectorAll("[data-cat]").forEach((el) => el.onchange = async () =
   else toast(el.checked ? (el.dataset.cat === "artefact" ? "Все артефакты включены" : name + ": включено целиком") : (el.dataset.cat === "artefact" ? "Все артефакты выключены" : name + ": выключено"));
   refresh();
 });
-document.querySelectorAll("[data-preset]").forEach((b) => b.onclick = () => {
-  const list = watch(), add = PRESETS[b.dataset.preset].filter((n) => !list.some((x) => normName(entryName(x)) === normName(n)));
-  if (!add.length) return toast("Всё из набора уже в списке");
-  saveWatch(list.concat(add), "Добавлено: " + add.length);
-});
-
 // ---------- мои покупки ----------
 $("bSeg").onclick = (e) => { const b = e.target.closest("button"); if (!b) return; bFilter = b.dataset.b; store.set("bFilter", bFilter); renderPurchases(true); };
 function pUnit(p) { return p.cur_market || p.target; }
@@ -1306,14 +1340,20 @@ function renderPurchases(force) {
       <td class="num">${p.status === "sold" ? rub(p.sold_price) + `<small class="muted" style="display:block;font-size:12px">продал за весь лот</small>` : rub(unit) + "/шт" + fresh}</td>
       <td class="num ${profit >= 0 ? "profit" : "neg"}" style="font-size:16px">${profit >= 0 ? "+" : "−"}${rub(Math.abs(profit))}</td>
       <td>${p.status === "sold" ? "" : chanceCell(c ? c.chance : null, c ? c.hours : null)}</td>
-      <td><span class="inline">${actions}<button class="btn sm ghost" data-del="${p.id}" title="Удалить запись">✕</button></span></td></tr>`;
+      <td><span class="inline">${actions}<button class="btn sm ghost" data-del="${p.id}" title="Удалить запись">✕</button></span></td></tr>`
+      + (p.status === "sold" ? "" : sellHelp(p));
   }).join("");
   const empty = !list.length;
   $("bEmpty").style.display = empty ? "grid" : "none";
   if (empty && all.length) { $("bEmptyH").textContent = bFilter === "sold" ? "Пока ничего не продано" : "Всё продано"; $("bEmptyT").textContent = "Переключи фильтр сверху, чтобы увидеть остальные."; }
   else if (empty) { $("bEmptyH").textContent = "Пока нет покупок"; $("bEmptyT").textContent = "Купил лот из находок — открой его и нажми «Я купил». Трекер будет следить за его ценой и шансом продажи."; }
   const upd = async (body) => { const r = await api("/api/purchases/update", body); if (!r.ok) toast(r.message, true); else sellOpen = null; await refresh(); renderPurchases(true); };
-  $("bRows").querySelectorAll("[data-listed]").forEach((b) => b.onclick = () => upd({id: b.dataset.listed, status: "listed"}));
+  $("bRows").querySelectorAll("[data-listed]").forEach((b) => b.onclick = () => { const f = document.querySelector(`[data-lp="${b.dataset.listed}"]`); if (f) { f.focus(); f.select(); } else upd({id: b.dataset.listed, status: "listed"}); });
+  $("bRows").querySelectorAll("[data-opt]").forEach((b) => b.onclick = () => { const f = document.querySelector(`[data-lp="${b.dataset.opt}"]`); if (f) { f.value = b.dataset.total; f.focus(); } });
+  $("bRows").querySelectorAll("[data-list]").forEach((b) => b.onclick = () => {
+    const f = document.querySelector(`[data-lp="${b.dataset.list}"]`);
+    upd({id: b.dataset.list, list_price: (f ? f.value : "").replace(/\s/g, "").replace(",", ".")});
+  });
   $("bRows").querySelectorAll("[data-hold]").forEach((b) => b.onclick = () => upd({id: b.dataset.hold, status: "holding"}));
   $("bRows").querySelectorAll("[data-reopen]").forEach((b) => b.onclick = () => upd({id: b.dataset.reopen, status: "holding"}));
   $("bRows").querySelectorAll("[data-sell]").forEach((b) => b.onclick = () => { sellOpen = b.dataset.sell; renderPurchases(true); const f = $("sellPrice"); if (f) { f.focus(); f.select(); } });
@@ -1321,19 +1361,146 @@ function renderPurchases(force) {
   $("bRows").querySelectorAll("[data-del]").forEach((b) => b.onclick = async () => { const r = await api("/api/purchases/remove", {id: b.dataset.del}); toast(r.message, !r.ok); await refresh(); renderPurchases(true); });
 }
 
+// ---------- помощник продажи: за сколько выставить, перебили ли ----------
+const OPT_RU = {fast: "Быстро", best: "Выгодно", slow: "Дороже"};
+function sellHelp(p) {
+  const opts = p.options || [], ls = p.list_state, many = p.amount > 1;
+  const per = (x) => rub(x) + (many ? "/шт" : "");
+  const chips = opts.map((o) => `<button class="opt ${o.key}" data-opt="${p.id}" data-total="${Math.round(o.total)}" title="Подставить цену">
+      <b>${OPT_RU[o.key] || ""}: ${per(o.unit)}</b><span>шанс ${Math.round(o.chance * 100)}%${o.hours ? " · " + fmtHours(o.hours) : ""} · ${o.profit >= 0 ? "+" : "−"}${rub(Math.abs(o.profit))}</span></button>`).join("");
+  let state = "";
+  if (p.status === "listed" && p.list_price) {
+    const mine = p.list_price / p.amount;
+    if (p.undercut || (ls && ls.cheaper)) {
+      const best = (p.undercut && p.undercut.best) || (ls && ls.best), sug = (p.undercut && p.undercut.suggest) || (ls && ls.suggest);
+      state = `<div class="ls bad">Твой лот перебили: есть лот за ${per(best)} (у тебя ${per(mine)}).${sug ? ` Чтобы продать первым — ${per(sug)}.` : ""}</div>`;
+    } else if (ls && ls.own) state = `<div class="ls good">Твой лот за ${per(mine)} — самый дешёвый среди таких же. Трекер скажет, если его перебьют или он продастся.</div>`;
+    else state = `<div class="ls">Выставлен за ${rub(p.list_price)}${many ? " за весь лот" : ""}. Трекер ещё не видел его на аукционе — новые лоты появляются в API примерно через 10 минут.</div>`;
+  }
+  if (!opts.length && !state) return `<tr class="sellrow"><td colspan="7"><span class="muted small">${p.cur_at ? "Подсказать цену не по чему: мало сделок по этому предмету." : "Подсказка, за сколько выставить, появится, когда поиск проверит этот предмет."}</span></td></tr>`;
+  const listVal = Math.round(p.list_price || (opts.find((o) => o.key === "best") || opts[0] || {}).total || p.paid);
+  return `<tr class="sellrow"><td colspan="7"><div class="sell">
+    ${state}
+    ${opts.length ? `<div class="opts"><span class="muted small">${p.status === "listed" ? "Перевыставить:" : "За сколько выставить:"}</span>${chips}</div>` : ""}
+    <span class="inline"><input class="field num" data-lp="${p.id}" value="${listVal}" title="Цена за весь лот"><button class="btn sm${p.status === "listed" ? "" : " primary"}" data-list="${p.id}">${p.status === "listed" ? "Перевыставил" : "Выставил за эту цену"}</button></span>
+  </div></td></tr>`;
+}
+function renderAccuracy() {
+  const a = S.status.accuracy, sold = (S.purchases || []).filter((p) => p.status === "sold");
+  let html = "";
+  if (sold.length) {
+    const exp = sold.reduce((x, p) => x + (p.expected || 0), 0), got = sold.reduce((x, p) => x + (p.profit || 0), 0);
+    html += `<p>Твои продажи: трекер обещал <b class="num">${exp >= 0 ? "+" : "−"}${rub(Math.abs(exp))}</b>, вышло <b class="num ${got >= 0 ? "pos" : "neg"}">${got >= 0 ? "+" : "−"}${rub(Math.abs(got))}</b> по ${sold.length} ${plural(sold.length, ["сделке", "сделкам", "сделкам"])}.</p>`;
+  }
+  if (!a) html += `<p class="muted">Сверка по рынку появится через несколько часов работы поиска: нужно, чтобы после находок прошли продажи таких же лотов.</p>`;
+  else {
+    const pct = Math.round(a.ratio * 100), hit = Math.round(a.hit * 100);
+    html += `<p>По ${a.n} ${plural(a.n, ["находке", "находкам", "находкам"])} за неделю такие же лоты потом продавали в среднем за <b>${pct}%</b> от оценки трекера; оценка сбылась у <b>${hit}%</b>.
+      ${a.factor < 0.995 ? `Поэтому оценка перепродажи сейчас снижена на <b>${Math.round((1 - a.factor) * 100)}%</b>${S.settings.calibrate === false ? " — но поправка выключена в «Настройках»" : ""}.` : a.n < 15 ? "Для поправки нужно хотя бы 15 сверенных находок." : "Поправка не нужна."}</p>`;
+    html += `<div class="accrows">${a.rows.map((r) => { const d = Math.round((r.fact / r.pred - 1) * 100);
+      return `<div><span>${esc(r.name)}${r.kind === "near" ? ' <span class="muted small">(почти находка)</span>' : ""}</span><span class="num muted">оценка ${rub(r.pred)}</span><span class="num ${d >= -3 ? "pos" : "neg"}">факт ${rub(r.fact)} (${d > 0 ? "+" : ""}${d}%)</span></div>`; }).join("")}</div>`;
+  }
+  const sig = JSON.stringify([a && a.at, sold.length, S.settings.calibrate]);
+  if (sig !== renderAccuracy.sig) { renderAccuracy.sig = sig; $("accBody").innerHTML = html; }
+}
+
+// ---------- что приносят предметы списка ----------
+async function loadYield() {
+  loadYield.at = Date.now();
+  let r;
+  try { r = await api("/api/yield"); } catch (e) { return; }
+  if (!r || !r.ok) return;
+  const rows = r.rows, empty = rows.filter((x) => x.status === "empty"), good = rows.filter((x) => x.status === "good");
+  $("yieldBox").hidden = !rows.length;
+  if (!rows.length) return;
+  const share = r.total ? Math.round(empty.length / r.total * 100) : 0;
+  $("yieldSub").textContent = good.length || empty.length
+    ? `За неделю: ${good.length} ${plural(good.length, ["предмет дал", "предмета дали", "предметов дали"])} находки, на которые можно было успеть; ${empty.length} — ни одного лота дешевле рынка.`
+    : "Нужны хотя бы сутки поиска, чтобы понять, какие предметы приносят находки.";
+  const line = (x) => `<div class="yrow"><span class="n">${esc(x.name)}</span><span class="muted small num">${x.status === "good"
+      ? `${x.catch} ${plural(x.catch, ["лот успеть", "лота успеть", "лотов успеть"])}${x.deal ? ` · находок ${x.deal}` : ""}`
+      : `${x.lots} ${plural(x.lots, ["лот", "лота", "лотов"])} за ${Math.round(x.hours)} ч — дешевле рынка ни одного`}</span></div>`;
+  $("yieldBody").innerHTML = (good.length ? `<div class="ylist"><b class="small">Приносят больше всего</b>${good.slice(0, 8).map(line).join("")}</div>` : "")
+    + (empty.length ? `<div class="ylist"><b class="small">Пустые</b>${empty.slice(0, 8).map(line).join("")}${empty.length > 8 ? `<div class="muted small">и ещё ${empty.length - 8}</div>` : ""}</div>
+      <div class="linkrow"><button class="btn" id="yieldDrop">Убрать пустые (${empty.length})</button><span class="muted small">круг станет короче примерно на ${share}% — остальные предметы будут проверяться чаще</span></div>` : "");
+  const b = $("yieldDrop");
+  if (b) b.onclick = async () => {
+    const res = await api("/api/watch/remove", {ids: empty.map((x) => x.id)});
+    toast(res.message, !res.ok); await refresh(); loadYield();
+  };
+}
+
+// ---------- калькулятор крафта ----------
+let CR = null;
+const FEAT_RU = {workbench: "верстак", centrifuge: "центрифуга", tool_trolley: "тележка с инструментами", laboratory_table: "лабораторный стол",
+  rotary_evaporator: "роторный испаритель", chemical_reactor: "химический реактор", precise_tools: "точные инструменты", cnc: "станок ЧПУ",
+  flasks_kit: "набор колб", hoods: "вытяжка", kitchen_items: "кухонная утварь", stove: "плита", welding_equipment: "сварка", lathe: "токарный станок",
+  fermentation_container: "ёмкость для брожения", precise_powertools: "точный электроинструмент", sterilization_system: "стерилизатор",
+  chromatographic_equipment: "хроматограф", kitchen_table: "кухонный стол", electronics_kit: "набор электроники", gauze_filter: "марлевый фильтр",
+  laminar_box: "ламинарный бокс", calipers_kit: "штангенциркули", scalpels_kit: "скальпели", screwdrivers: "отвёртки", wrenches_kit: "гаечные ключи",
+  laser_level: "лазерный уровень", generator_energy_source_battery: "генератор: аккумулятор", water_collector: "сборщик воды",
+  generator_energy_source_anomal: "генератор: аномальный источник"};
+async function loadCraft() {
+  loadCraft.at = Date.now();
+  let r;
+  try { r = await api("/api/craft"); } catch (e) { return; }
+  if (!r.ok) { $("advice").innerHTML = `<div class="muted">${esc(r.message || "Не получилось загрузить рецепты")}</div>`; return; }
+  CR = r; renderSkills(); renderCraft();
+}
+function renderSkills() {
+  if (!CR || document.activeElement && $("skills").contains(document.activeElement)) return;
+  $("skills").innerHTML = CR.perks.map((p) => `<label class="skill"><span>${esc(p.name)}</span><select class="field" data-perk="${p.id}">${[0, 1, 2, 3, 4, 5].map((l) => `<option value="${l}"${l === p.level ? " selected" : ""}>${l || "нет"}</option>`).join("")}</select></label>`).join("");
+  $("skills").querySelectorAll("select").forEach((sel) => sel.onchange = async () => {
+    const skills = {}; $("skills").querySelectorAll("select").forEach((x) => skills[x.dataset.perk] = +x.value);
+    const res = await api("/api/settings", {skills}); if (!res.ok) toast(res.message, true);
+    sel.blur(); loadCraft();
+  });
+}
+function crName(id) { return (CR.names && CR.names[id]) || id; }
+function renderCraft() {
+  if (!CR) return;
+  const q = normQ($("crSearch").value), mine = $("crMine").checked, key = $("crSort").value;
+  const perkName = Object.fromEntries(CR.perks.map((p) => [p.id, p.name]));
+  let rows = CR.rows.filter((r) => (!mine || r.available) && (!q || [...r.result, ...r.ingredients].some(([i]) => normQ(crName(i)).includes(q))));
+  const v = (r) => key === "energy" ? (r.per_energy ?? -1e12) : key === "name" ? 0 : (r.profit ?? -1e12);
+  rows.sort((a, b) => key === "name" ? crName(a.result[0][0]).localeCompare(crName(b.result[0][0]), "ru") : v(b) - v(a));
+  const total = Object.keys(CR.names).length, priced = Object.keys(CR.prices).length;
+  $("crPrices").textContent = `цены есть у ${priced} из ${total} предметов` + (CR.queued || S.status.craft_left ? ` · узнаю ещё ${CR.queued || S.status.craft_left}` : "");
+  const ing = (r) => r.ingredients.map(([i, n]) => `<span class="${CR.prices[i] ? "" : "noprice"}" title="${CR.prices[i] ? rub(CR.prices[i][0]) + "/шт по " + CR.prices[i][1] + " сделкам" : CR.trade[i] === false ? "не продаётся на аукционе" : "нет цены — нажми «Узнать цены»"}">${esc(crName(i))} ×${n}</span>`).join(", ");
+  $("crRows").innerHTML = rows.slice(0, 200).map((r) => {
+    const [rid, rn] = r.result[0];
+    const need = Object.entries(r.need || {}).map(([k, l]) => `<span class="tag bad">${esc(perkName[k] || k)} ${l}</span>`).join("");
+    const req = Object.entries(r.perks).filter(([k]) => !(k in (r.need || {}))).map(([k, l]) => `<span class="tag">${esc(perkName[k] || k)} ${l}</span>`).join("");
+    const feats = r.features.map((f) => FEAT_RU[f] || f).join(", ");
+    const money = (x) => x == null ? `<span class="muted">—</span>` : (x >= 0 ? "+" : "−") + rub(Math.abs(x));
+    return `<tr${r.profit != null && r.profit <= 0 ? ' class="loss"' : ""}>
+      <td><div class="item">${slot(rid, crName(rid), "var(--q0)", "sm")}<div><span class="n">${esc(crName(rid))}${rn > 1 ? ` ×${rn}` : ""}</span><div class="tags">${need}${req}</div>${feats ? `<span class="when">нужно в убежище: ${esc(feats)}</span>` : ""}</div></div></td>
+      <td class="small">${ing(r)}${r.missing.length ? `<div class="muted small">нет цены: ${r.missing.slice(0, 3).map((i) => esc(crName(i))).join(", ")}${r.missing.length > 3 ? "…" : ""}</div>` : ""}</td>
+      <td class="num">${r.cost == null ? "—" : rub(r.cost)}</td>
+      <td class="num">${r.value == null ? "—" : rub(r.value)}</td>
+      <td class="num ${r.profit == null ? "" : r.profit >= 0 ? "profit" : "neg"}">${money(r.profit)}</td>
+      <td class="num">${money(r.per_energy)}<small class="muted" style="display:block;font-size:12px">энергия ${Math.round(r.energy)}</small></td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">${mine ? "По твоим навыкам рецептов не нашлось — поставь уровни слева или сними «Только доступные мне»." : "Ничего не найдено."}</td></tr>`;
+  $("advice").innerHTML = CR.advice.filter((a) => a.best).slice(0, 6).map((a) => `<div class="adv"><b>${esc(a.name)} ${a.level} → ${a.level + 1}</b>
+      <span>откроет ${a.count} ${plural(a.count, ["прибыльный рецепт", "прибыльных рецепта", "прибыльных рецептов"])}; лучший — ${esc(crName(a.best.result[0][0]))}: <b class="num pos">+${rub(a.best.profit)}</b> за крафт</span></div>`).join("")
+    || `<div class="muted">${priced < total / 3 ? "Мало цен, чтобы советовать: нажми «Узнать цены» — трекер узнает их во время поиска." : "Следующие уровни навыков пока не открывают прибыльных рецептов по нынешним ценам."}</div>`;
+}
+$("crSearch").oninput = () => renderCraft();
+$("crMine").onchange = () => renderCraft();
+$("crSort").onchange = () => renderCraft();
+$("crFetch").onclick = async () => { const r = await api("/api/craft/fetch", {only_available: $("crMine").checked}); toast(r.message, !r.ok); loadCraft(); };
+
 // ---------- настройки ----------
 function fillForm() {
   const c = S.settings;
-  $("sDemo").checked = S.demo; $("sClientId").value = c.client_id || ""; $("sClientSecret").value = c.client_secret || ""; $("sToken").value = c.app_token || "";
-  $("sDiscount").value = Math.round(c.discount * 100); $("sMinProfit").value = Math.round(c.min_profit); $("sPoll").value = c.poll_minutes;
-  $("sHist").value = c.history_hours; $("sBids").checked = !!c.bids; $("sBidWin").value = c.bid_window_minutes;
+  $("sDemo").checked = S.demo; $("sClientId").value = c.client_id || ""; $("sClientSecret").value = c.client_secret || "";
+  $("sDiscount").value = Math.round(c.discount * 100); $("sMinProfit").value = Math.round(c.min_profit);
   $("sTgToken").value = c.telegram_token || ""; $("sTgChat").value = c.telegram_chat_id || ""; $("sSound").checked = store.get("sound", true);
   $("appVer").textContent = S.version || ""; $("dataDir").textContent = S.data_dir || "";
-  $("sKeep").value = c.history_keep_days || 14;
-  $("sUpdRepo").value = c.update_repo || "";
   $("sRare").checked = c.rare_enabled !== false; $("sRareQ").value = String(c.rare_quality ?? 4);
-  $("sRareProfit").value = Math.round(c.rare_min_profit ?? 5000); $("sMinChance").value = Math.round(c.notify_min_chance || 0);
+  $("sRareProfit").value = Math.round(c.rare_min_profit ?? 5000);
   $("sTheme").value = store.get("theme", "system");
+  $("sAutostart").checked = !!c.autostart;
 }
 document.querySelectorAll("#view-settings input, #view-settings select").forEach((el) => el.addEventListener("input", () => {
   if (el.id === "sTheme" || el.id === "sSound") return;
@@ -1355,12 +1522,11 @@ $("updBtn").onclick = async () => { await api("/api/update/apply", {}); toast("�
 $("saveBtn").onclick = async () => {
   const num = (id) => $(id).value.replace(/\s/g, "").replace(",", ".");
   const r = await api("/api/settings", {
-    demo: $("sDemo").checked, client_id: $("sClientId").value, client_secret: $("sClientSecret").value, app_token: $("sToken").value,
-    discount_pct: num("sDiscount"), min_profit: num("sMinProfit"), poll_minutes: num("sPoll"), history_hours: num("sHist"),
-    bids: $("sBids").checked, bid_window_minutes: num("sBidWin"), telegram_token: $("sTgToken").value, telegram_chat_id: $("sTgChat").value,
-    history_keep_days: num("sKeep"), update_repo: $("sUpdRepo").value,
+    demo: $("sDemo").checked, client_id: $("sClientId").value, client_secret: $("sClientSecret").value,
+    discount_pct: num("sDiscount"), min_profit: num("sMinProfit"),
+    telegram_token: $("sTgToken").value, telegram_chat_id: $("sTgChat").value,
     rare_enabled: $("sRare").checked, rare_quality: $("sRareQ").value, rare_min_profit: num("sRareProfit"),
-    notify_min_chance: num("sMinChance"),
+    autostart: $("sAutostart").checked, autorun_search: $("sAutostart").checked,
   });
   toast(r.ok ? "Настройки сохранены" : r.message, !r.ok);
   if (r.ok) { formDirty = false; $("saveHint").textContent = ""; }
@@ -1510,7 +1676,9 @@ async function refresh() {
   if (!firstLoad && loud.length) { beep(loud.some((d) => d.rare)); loud.slice(0, 3).forEach(notifyDesktop); }
   if (firstLoad || !formDirty) fillForm();
   if (!CAT) loadCatalog();
-  renderStatus(); renderDeals(); renderNear(); renderChips(); renderPurchases(); renderAccess();
+  renderStatus(); renderDeals(); renderNear(); renderChips(); renderPurchases(); renderAccuracy(); renderAccess();
+  if (view === "items" && Date.now() - (loadYield.at || 0) > 300000) loadYield();
+  if (view === "craft" && Date.now() - (loadCraft.at || 0) > (S.status.craft_left ? 20000 : 120000)) loadCraft();
   firstLoad = false;
 }
 document.querySelector('.nav button[data-view="log"]').addEventListener("click", () => { if (S) renderStatus(); });
