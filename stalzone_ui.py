@@ -90,6 +90,7 @@ main{display:flex;flex-direction:column;min-width:0;height:100vh}
 .run:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 .view{display:none;flex:1;min-height:0;overflow:auto;padding:6px 28px 28px}
 .view.on{display:flex;flex-direction:column;gap:16px}
+.view.on>*{flex-shrink:0}   /* иначе длинный список сжимается до высоты окна и обрезается — его не пролистать */
 
 /* --- главное предложение --- */
 .hero{display:flex;flex-direction:column;gap:3px;padding:2px 0 2px}
