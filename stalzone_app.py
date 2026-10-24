@@ -29,6 +29,7 @@ import secrets
 import shutil
 import sqlite3
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ import time
 import uuid
 import webbrowser
 import zipfile
+import zlib
 from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -55,7 +57,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -143,7 +145,12 @@ DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # н�
                 sound_on=True,             # звук при находке
                 sound="builtin:double",    # какой: builtin:… — встроенный, win:… — из звуков Windows, custom:… — свой файл
                 sound_rare="builtin:fanfare",   # для особо редких
-                sound_volume=70)           # громкость, %
+                sound_volume=70,           # громкость, %
+                tg_control=True,           # Telegram: кнопки под сообщениями и команды (/status, /finds …)
+                tg_photo=True,             # картинка предмета в сообщении о находке
+                tg_quiet=False, tg_quiet_from=0, tg_quiet_to=8,   # тихие часы: без звука (особо редкие — со звуком)
+                tg_daily=True, tg_daily_hour=23, tg_daily_last="",   # итог дня
+                tg_muted_until=0)          # «тишина» до этого момента
 OPEN_LINKS = {
     "api_bot": "https://t.me/stalzone_api_bot",
     "docs": "https://eapi.stalzone.net/overview.html",
@@ -264,7 +271,8 @@ RESTART_DELAY = 3          # сменили ключи — перезапуск 
 RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days", "extra_keys")
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
               "server_url_override", "ui", "theme", "ui_scale", "sound_on", "sound", "sound_rare",
-              "sound_volume")   # из-за них новый проход не начинаем — просто запомнить
+              "sound_volume", "tg_control", "tg_photo", "tg_quiet", "tg_quiet_from", "tg_quiet_to", "tg_daily",
+              "tg_daily_hour", "tg_daily_last", "tg_muted_until")   # из-за них новый проход не начинаем — просто запомнить
 UI_MODES = ("new", "old")
 THEMES = ("system", "light", "dark")
 UI_SCALES = ("s", "m", "l")
@@ -1320,8 +1328,17 @@ class Worker(threading.Thread):
         scan_cfg["resale_factor"] = self.resale_factor if cfg.get("calibrate", True) else 1.0
         return items, auto, hold_ids, cats, scan_cfg
 
-    def telegram(self, text):
-        ok, msg = send_telegram(self.cfg, text)
+    def telegram(self, text, deal=None, buttons=None):
+        """В Telegram: через бота программы (картинка, кнопки), а без него — простым сообщением."""
+        bot = getattr(self, "notifier", None)
+        if bot is not None and bot.active():
+            if deal is not None:
+                ok, msg = bot.notify_find(deal)
+            else:
+                bot.send_text(text, buttons)
+                return
+        else:
+            ok, msg = send_telegram(self.cfg, text)
         if not ok and msg:
             self.emit("log", msg)
 
@@ -1625,7 +1642,11 @@ class Worker(threading.Thread):
         self.emit("log", text.replace("\n", ". ").replace("⚠ ", ""))
         self.emit("undercut", {"id": h["id"], "best": best, "suggest": state.get("suggest")})
         if self.cfg.get("alerts", True):
-            self.telegram(text)
+            buttons = []
+            if state.get("suggest"):
+                total = round(state["suggest"] * amount)
+                buttons.append([(f"Перевыставил за {eng.fmt_rub(total)}", f"list:{h['id']}:{total}")])
+            self.telegram(text, buttons=buttons or None)
 
     def record(self, item_id, name, d, kind, key, meta=None):
         """Находка в том виде, в каком она уходит в таблицу и подписчикам. (запись, текст для Telegram)."""
@@ -1691,9 +1712,10 @@ class Worker(threading.Thread):
         min_chance = float(self.cfg.get("notify_min_chance", 0) or 0) / 100
         if notify and not rare and chance and chance["chance"] < min_chance:
             notify = False
-        self.emit("deal", dict(rec, rare=bool(rare), text=text, notify=notify))
+        d = dict(rec, rare=bool(rare), text=text, notify=notify)
+        self.emit("deal", d)          # программа присваивает находке номер — он нужен кнопке «Купил»
         if notify:
-            self.telegram(text)
+            self.telegram(text, deal=d if "id" in d else None)
 
     def deal(self, item_id, name, d, kind, key, notify=True, rare=False, meta=None):
         """Совместимость: собрать запись и показать."""
@@ -1854,9 +1876,14 @@ class FeedWorker(threading.Thread):
                 notify = False
             seen.add(key)
             text = feed_text(out, cfg)
-            self.emit("deal", dict(out, text=text, notify=notify))
+            d = dict(out, text=text, notify=notify)
+            self.emit("deal", d)
             if notify:
-                ok, msg = send_telegram(cfg, text)
+                bot = getattr(self, "notifier", None)
+                if bot is not None and bot.active() and "id" in d:
+                    ok, msg = bot.notify_find(d)
+                else:
+                    ok, msg = send_telegram(cfg, text)
                 if not ok and msg:
                     self.emit("log", msg)
         self.emit("feed_sync", {"present": sorted(present), "fates": fates})
@@ -2250,6 +2277,721 @@ def sound_file(kind, name):
     return os.path.join(folder, name)
 
 
+# ------------------------------- Бот в Telegram -------------------------------
+# Не просто уведомления, а пульт: картинка предмета, название, которое копируется нажатием, кнопки «Купил»
+# и «Скрыть»; сообщение само меняется, когда лот ушёл; после покупки — за сколько выставить, кнопками;
+# перебили — «Перевыставил» одной кнопкой; команды /status /finds /profit /buys /stop /go /mute /min;
+# итог дня, тихие часы. Слушается только своего чата (Chat ID из настроек).
+TG_API = "https://api.telegram.org/bot{token}/{method}"
+TG_COMMANDS = [("status", "Что с поиском сейчас"), ("finds", "Лучшие находки сейчас"), ("profit", "Сколько заработал"),
+               ("buys", "Что куплено и за сколько выставить"), ("stop", "Остановить поиск"), ("go", "Начать поиск"),
+               ("mute", "Тишина на час (/mute 3 — на 3 часа)"), ("unmute", "Снова присылать находки"),
+               ("min", "Минимальная прибыль: /min 20000"), ("help", "Что умеет бот")]
+TG_FATE = {"sold": "уже купили", "removed": "лот сняли", "expired": "время вышло"}
+
+
+def _h(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _rub(x):
+    return eng.fmt_rub(x).replace(" ", " ")
+
+
+def _signed(x):
+    return ("+" if x >= 0 else "−") + _rub(abs(x))
+
+
+def _hours(h):
+    if h is None:
+        return ""
+    return "меньше часа" if h < 1 else f"~{h:.0f} ч" if h < 48 else f"~{h / 24:.0f} дн."
+
+
+def grade_label(d):
+    """«особый +15», «Легенда» — как в окне программы."""
+    q = d.get("quality")
+    if d.get("cat") == "artefact" or (d.get("cat") is None and q is not None):
+        if q is None:
+            return ""
+        p = int(d.get("ptn") or 0)
+        return f"{QUALITY[max(0, min(5, int(q)))]} " + (f"+{p}" if d.get("exact") else "+15" if p >= 15 else f"+{p}…{p + 4}")
+    return eng.RANK_NAMES.get(d.get("rank"), "") if d.get("rank") == "RANK_LEGEND" else ""
+
+
+TG_RANK_COLORS = {"RANK_NEWBIE": (106, 176, 76), "RANK_STALKER": (72, 140, 214), "RANK_VETERAN": (155, 89, 208),
+                  "RANK_MASTER": (214, 72, 72), "RANK_LEGEND": (230, 180, 34)}
+TG_QUALITY_COLORS = [(150, 150, 150), (106, 176, 76), (72, 140, 214), (155, 89, 208), (214, 72, 72), (230, 180, 34)]
+
+
+def _png_rgba(data):
+    """PNG 8 бит RGBA/RGB без чересстрочности → (ширина, высота, bytearray RGBA). None — другой формат."""
+    if not data or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    pos, idat, head = 8, [], None
+    while pos + 8 <= len(data):
+        n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        chunk = data[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            head = struct.unpack(">IIBBBBB", chunk)
+        elif kind == b"IDAT":
+            idat.append(chunk)
+        elif kind == b"IEND":
+            break
+        pos += 12 + n
+    if not head:
+        return None
+    w, h, depth, ctype, _, _, inter = head
+    if depth != 8 or ctype not in (2, 6) or inter or not (0 < w <= 1024 and 0 < h <= 1024):
+        return None
+    bpp = 4 if ctype == 6 else 3
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * bpp
+    out = bytearray(w * h * 4)
+    prev = bytearray(stride)
+    pos = 0
+    for y in range(h):
+        f, line = raw[pos], bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        if f == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 255
+        elif f == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:
+            for i in range(stride):
+                line[i] = (line[i] + ((line[i - bpp] if i >= bpp else 0) + prev[i]) // 2) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                b, c = prev[i], (prev[i - bpp] if i >= bpp else 0)
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        if bpp == 4:
+            out[y * w * 4:(y + 1) * w * 4] = line
+        else:
+            for x in range(w):
+                out[(y * w + x) * 4:(y * w + x) * 4 + 4] = bytes(line[x * 3:x * 3 + 3]) + b"\xff"
+        prev = line
+    return w, h, out
+
+
+def _png_rgb(w, h, rgb):
+    rows = b"".join(b"\x00" + bytes(rgb[y * w * 3:(y + 1) * w * 3]) for y in range(h))
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+
+def tg_card(png, color=None):
+    """Картинка для Telegram: иконка предмета крупнее, на тёмном фоне (прозрачный фон Telegram
+    закрашивает чёрным), сверху полоска цвета ранга. None — не получилось (отправим без картинки)."""
+    try:
+        img = _png_rgba(png)
+    except Exception:
+        img = None
+    if img is None:
+        return None
+    w, h, px = img
+    k = max(1, min(3, 260 // max(w, h)))          # 128 → 256
+    W, H = 440, 300
+    bg = (30, 34, 40)
+    canvas = bytearray(bytes(bg) * (W * H))
+    col = color or (90, 100, 112)
+    for y in range(6):
+        canvas[y * W * 3:(y + 1) * W * 3] = bytes(col) * W
+    ox, oy = (W - w * k) // 2, (H - h * k) // 2 + 3
+    for y in range(h * k):
+        sy = min(h - 1.0, max(0.0, (y + 0.5) / k - 0.5))
+        y0 = int(sy)
+        y1, fy = min(h - 1, y0 + 1), sy - int(sy)
+        base = ((oy + y) * W + ox) * 3
+        for x in range(w * k):
+            sx = min(w - 1.0, max(0.0, (x + 0.5) / k - 0.5))
+            x0 = int(sx)
+            x1, fx = min(w - 1, x0 + 1), sx - x0
+            acc = [0.0, 0.0, 0.0, 0.0]
+            for (yy, wy) in ((y0, 1 - fy), (y1, fy)):
+                for (xx, wx) in ((x0, 1 - fx), (x1, fx)):
+                    wgt = wy * wx
+                    if wgt:
+                        i = (yy * w + xx) * 4
+                        a = px[i + 3] / 255 * wgt
+                        acc[0] += px[i] * a
+                        acc[1] += px[i + 1] * a
+                        acc[2] += px[i + 2] * a
+                        acc[3] += a
+            a = acc[3]
+            if a <= 0.002:
+                continue
+            j = base + x * 3
+            for c in range(3):
+                canvas[j + c] = min(255, int(acc[c] + bg[c] * (1 - a) + 0.5))
+    return _png_rgb(W, H, canvas)
+
+
+class TgBot:
+    def __init__(self, state):
+        self.state = state
+        self.lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.msgs = {}           # ключ находки → {"id", "photo", "text", "deal", "state"}
+        self.thread = None       # ответы на кнопки и команды
+        self.sig = None
+        self.offset = None
+        self.bad_token = None    # токен, который Telegram не принял, — не дёргаем его снова
+        self.said = {}
+        self.cards = {}          # картинки для сообщений: предмет и цвет → PNG
+        self.problem = None      # почему кнопки и команды сейчас не работают (для «Настроек»)
+
+    # --- настройки ---
+    def creds(self):
+        cfg = self.state.cfg
+        return str(cfg.get("telegram_token") or "").strip(), str(cfg.get("telegram_chat_id") or "").strip()
+
+    def active(self):
+        token, chat = self.creds()
+        return bool(token and chat)
+
+    def control(self):
+        """Кнопки работают, только пока программа слушает Telegram (getUpdates)."""
+        return self.active() and self.state.cfg.get("tg_control", True) and self.thread is not None and self.thread.is_alive()
+
+    def quiet_now(self):
+        cfg = self.state.cfg
+        if not cfg.get("tg_quiet"):
+            return False
+        a, b, h = int(cfg.get("tg_quiet_from", 0)), int(cfg.get("tg_quiet_to", 8)), datetime.now().hour
+        return a <= h < b if a < b else (h >= a or h < b)
+
+    def muted(self):
+        return float(self.state.cfg.get("tg_muted_until") or 0) > time.time()
+
+    def info(self):
+        """Для «Настроек»: слушает ли бот кнопки и команды, а если нет — почему."""
+        token, chat = self.creds()
+        problem = self.problem
+        if token and token == self.bad_token:
+            problem = "Telegram не принял токен бота — проверь его"
+        return {"listening": bool(self.control()), "problem": problem,
+                "muted_until": float(self.state.cfg.get("tg_muted_until") or 0) if self.muted() else 0}
+
+    # --- запросы к Telegram ---
+    def call(self, method, data=None, files=None, timeout=20, token=None):
+        """(ok, result или текст ошибки)."""
+        token = token or self.creds()[0]
+        try:
+            r = requests.post(TG_API.format(token=token, method=method), data=data or {}, files=files, timeout=timeout)
+        except Exception as e:
+            return False, f"Telegram не ответил: {type(e).__name__}"
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code == 200 and (not isinstance(body, dict) or body.get("ok", True)):
+            return True, body.get("result") if isinstance(body, dict) else None
+        why = body.get("description", "") if isinstance(body, dict) else ""
+        return False, f"Telegram: ошибка {r.status_code}" + (f" ({why})" if why else "")
+
+    @staticmethod
+    def markup(buttons):
+        if not buttons:
+            return json.dumps({"inline_keyboard": []})
+        return json.dumps({"inline_keyboard": [[{"text": t, "callback_data": c} for t, c in row] for row in buttons]},
+                          ensure_ascii=False)
+
+    def send(self, html, buttons=None, photo=None, silent=False, chat=None):
+        """Отправить сейчас. (ok, id сообщения, есть ли картинка)."""
+        token, my_chat = self.creds()
+        chat = chat or my_chat
+        if not (token and chat):
+            return False, None, False
+        data = {"chat_id": chat, "parse_mode": "HTML", "disable_notification": "true" if silent else "false"}
+        if buttons:
+            data["reply_markup"] = self.markup(buttons)
+        with self.send_lock:
+            if photo:
+                ok, res = self.call("sendPhoto", dict(data, caption=html), files={"photo": ("item.png", photo, "image/png")})
+                if ok:
+                    return True, (res or {}).get("message_id") if isinstance(res, dict) else None, True
+            ok, res = self.call("sendMessage", dict(data, text=html, disable_web_page_preview="true"))
+        if not ok:
+            self._log_once("send", res)
+        return ok, (res or {}).get("message_id") if ok and isinstance(res, dict) else None, False
+
+    def edit(self, msg_id, photo, html, buttons=None):
+        token, chat = self.creds()
+        if not (token and chat and msg_id):
+            return False
+        data = {"chat_id": chat, "message_id": msg_id, "parse_mode": "HTML", "reply_markup": self.markup(buttons)}
+        with self.send_lock:
+            ok, _ = self.call("editMessageCaption" if photo else "editMessageText",
+                              dict(data, caption=html) if photo else dict(data, text=html, disable_web_page_preview="true"))
+        return ok
+
+    def _log_once(self, key, text, every=600):
+        if text and time.time() - self.said.get(key, 0) > every:
+            self.said[key] = time.time()
+            self.state.add_log(text)
+
+    # --- находки ---
+    def find_html(self, d, head=""):
+        rare, bid, many = d.get("rare"), d.get("kind") == "bid", int(d.get("amount") or 1) > 1
+        g = grade_label(d)
+        lines = ["💎 ОСОБО РЕДКИЙ"] if rare else []
+        if head:
+            lines.append(head)
+        lines.append(("🔨 " if bid else "🟢 ") + f"<b>{_h(d['name'])}</b>" + (f" · {_h(g)}" if g else "")
+                     + (f" · {d['amount']} шт" if many else ""))
+        lines.append(f"<code>{_h(d['name'])}</code> — нажми, чтобы скопировать")
+        if bid:
+            ends = ""
+            try:
+                ends = eng.parse_time(d.get("ends")).astimezone().strftime("%H:%M")
+            except Exception:
+                pass
+            lines.append(f"Ставка сейчас: <b>{_rub(d['cost'])}</b>" + (f", не выше {_rub(d['max_bid'])}" if d.get("max_bid") else "")
+                         + (f", торги до {ends}" if ends else ""))
+        else:
+            lines.append(f"Купить: <b>{_rub(d['cost'])}</b>" + (f" ({_rub(d['unit'])}/шт)" if many else ""))
+        lines.append(f"Продать: ~{_rub(d['resale'])}" + (f" ({_rub(d['market'])}/шт)" if many else "")
+                     + f", дешевле рынка на {d.get('pct', 0):.0f}%")
+        lines.append(f"Прибыль: <b>{_signed(d['profit'])}</b> (+{d.get('roi', 0):.0f}% к вложенному)")
+        c = d.get("chance")
+        lines.append(f"Шанс продать за сутки: {c * 100:.0f}%" + (f", обычно за {_hours(d.get('sell_hours'))}" if d.get("sell_hours") else "")
+                     if c is not None else "Шанс продать за сутки: не посчитан")
+        if d.get("only_you_until") and d["only_you_until"] > time.time():
+            lines.append(f"🎯 Только тебе ещё ~{max(1, round((d['only_you_until'] - time.time()) / 60))} мин — потом увидят все")
+        if d.get("stale"):
+            lines.append("⚠ " + _h(d["stale"]))
+        return "\n".join(lines)
+
+    def find_buttons(self, d):
+        if not self.control():
+            return None
+        return [[("✅ Купил", f"buy:{d['id']}"), ("🙈 Скрыть", f"hide:{d['id']}")], [("🔕 Тишина на час", "mute:60")]]
+
+    def notify_find(self, d):
+        """Новая находка — с картинкой предмета и кнопками. Возвращает (ok, текст ошибки)."""
+        if self.muted() and not d.get("rare"):
+            return True, ""
+        photo = None
+        if self.state.cfg.get("tg_photo", True):
+            photo = self.card(d)
+        html = self.find_html(d)
+        ok, mid, is_photo = self.send(html, self.find_buttons(d), photo, silent=self.quiet_now() and not d.get("rare"))
+        if ok and mid and d.get("key"):
+            with self.lock:
+                self.msgs[d["key"]] = {"id": mid, "photo": is_photo, "deal": d.get("id"), "state": "new", "at": time.time()}
+                if len(self.msgs) > 300:
+                    for k in sorted(self.msgs, key=lambda k: self.msgs[k]["at"])[:50]:
+                        self.msgs.pop(k, None)
+        return ok, ""
+
+    def card(self, d):
+        q = d.get("quality")
+        color = (TG_RANK_COLORS.get("RANK_LEGEND") if d.get("rare") else
+                 TG_QUALITY_COLORS[max(0, min(5, int(q)))] if q is not None and d.get("cat") in ("artefact", None)
+                 else TG_RANK_COLORS.get(d.get("rank")))
+        key = (d.get("item_id"), color)
+        if key not in self.cards:
+            try:
+                png = self.state.icon(d.get("item_id"))
+            except Exception:
+                png = None
+            if png is None:
+                return None           # нет картинки (нет сети) — не запоминаем, попробуем в следующий раз
+            self.cards[key] = tg_card(png, color) or png
+            if len(self.cards) > 200:
+                self.cards.pop(next(iter(self.cards)))
+        return self.cards[key]
+
+    def send_text(self, text, buttons=None, silent=None):
+        """Обычное сообщение (оповещения) — в фоне, с повтором, если сеть ещё не поднялась."""
+        def go():
+            for attempt in range(3):
+                ok, _, _ = self.send(_h(text), buttons if self.control() else None, silent=self.quiet_now() if silent is None else silent)
+                if ok:
+                    return
+                time.sleep(30)
+        threading.Thread(target=go, daemon=True).start()
+
+    # --- сверка: ушёл ли лот, купил ли ты, пора ли подсказать цену, итог дня ---
+    def tick(self):
+        if not self.active():
+            return
+        st = self.state
+        with st.lock:
+            deals = {d.get("key"): dict(d) for d in st.deals if d.get("key")}
+            purchases = [dict(p) for p in st.purchases]
+        with self.lock:
+            msgs = list(self.msgs.items())
+        for key, m in msgs:
+            d = deals.get(key)
+            if d is None or m["state"] in ("gone", "bought", "hidden"):
+                continue
+            head, new = None, None
+            if d.get("bought"):
+                p = next((x for x in purchases if x["id"] == d["bought"]), None)
+                head, new = "✅ <b>Куплено</b>" + (f" за {_rub(p['paid'])}" if p else "") + " — в «Моих покупках»", "bought"
+            elif d.get("gone"):
+                mins = max(1, round((time.time() - float(d.get("found") or time.time())) / 60))
+                head = f"⛔ <b>Ушло</b>: {TG_FATE.get(d.get('fate'), 'лота больше нет')} (через ~{mins} мин после находки)"
+                new = "gone"
+            if new:
+                self.edit(m["id"], m["photo"], self.find_html(d, head=head), None)
+                with self.lock:
+                    if key in self.msgs:
+                        self.msgs[key]["state"] = new
+        for p in purchases:     # купил — подсказать, за сколько выставить (один раз)
+            if (p.get("status") == "holding" and p.get("options") and not p.get("tg_suggested")
+                    and time.time() - float(p.get("bought_at") or 0) < 6 * 3600):
+                self.suggest(p)
+                with st.lock:
+                    for x in st.purchases:
+                        if x["id"] == p["id"]:
+                            x["tg_suggested"] = True
+                st.save_purchases()
+        cfg = st.cfg
+        if cfg.get("tg_daily", True):
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            if now.hour == int(cfg.get("tg_daily_hour", 23)) and cfg.get("tg_daily_last") != today:
+                st.update_settings({"tg_daily_last": today})
+                self.send(self.daily_html(), silent=True)
+
+    def suggest(self, p):
+        opts = p.get("options") or []
+        if not opts:
+            return False
+        names = {"fast": "⚡ Быстро", "best": "⭐ Выгодно", "slow": "💰 Дороже"}
+        many = int(p.get("amount") or 1) > 1
+        lines = [f"💡 <b>{_h(p['name'])}</b> — за сколько выставить" + (f" ({p['amount']} шт)" if many else ""),
+                 f"<code>{_h(p['name'])}</code>"]
+        for o in opts:
+            lines.append(f"{names.get(o['key'], o['key'])}: <b>{_rub(o['unit'])}</b>{'/шт' if many else ''} — шанс {o['chance'] * 100:.0f}%"
+                         + (f", {_hours(o.get('hours'))}" if o.get("hours") else "") + f", {_signed(o['profit'])}")
+        lines.append("Выставил — нажми кнопку, трекер скажет, если твой лот перебьют.")
+        buttons = [[(f"Выставил за {eng.fmt_rub(o['total'])}", f"list:{p['id']}:{round(o['total'])}")] for o in opts]
+        ok, _, _ = self.send("\n".join(lines), buttons if self.control() else None, silent=self.quiet_now())
+        return ok
+
+    # --- сводки ---
+    def stats(self, since):
+        sold = [p for p in self.state.purchases if p.get("status") == "sold" and float(p.get("sold_at") or 0) >= since]
+        return sold, sum(float(p.get("profit") or 0) for p in sold)
+
+    def day_start(self):
+        now = datetime.now()
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    def profit_html(self):
+        now, t0 = time.time(), self.day_start()
+        rows = []
+        for label, since in (("Сегодня", t0), ("7 дней", now - 7 * 86400), ("30 дней", now - 30 * 86400), ("Всё время", 0)):
+            sold, total = self.stats(since)
+            rows.append(f"{label}: <b>{_signed(total)}</b> — {len(sold)} {plural_ru(len(sold), ('продажа', 'продажи', 'продаж'))}")
+        open_ = [p for p in self.state.purchases if p.get("status") != "sold"]
+        invested = sum(float(p.get("paid") or 0) for p in open_)
+        fee = float(self.state.cfg.get("fee", 0.05))
+        expected = sum((p.get("cur_market") or p.get("target") or 0) * int(p.get("amount") or 1) * (1 - fee) - float(p.get("paid") or 0)
+                       for p in open_)
+        sold_all, _ = self.stats(0)
+        best = max(sold_all, key=lambda p: float(p.get("profit") or 0), default=None)
+        out = ["💰 <b>Заработано</b>"] + rows + [f"В товаре сейчас: {_rub(invested)}" + (f", ожидается ещё {_signed(expected)}" if open_ else "")]
+        if best:
+            out.append(f"Лучшая сделка: {_h(best['name'])} {_signed(float(best.get('profit') or 0))}")
+        return "\n".join(out)
+
+    def daily_html(self):
+        t0 = self.day_start()
+        st = self.state
+        finds = [d for d in st.deals if float(d.get("found") or 0) >= t0]
+        bought = [p for p in st.purchases if float(p.get("bought_at") or 0) >= t0]
+        sold, total = self.stats(t0)
+        best = max(finds, key=lambda d: d.get("profit") or 0, default=None)
+        lines = [f"📊 <b>Итог дня, {datetime.now().strftime('%d.%m')}</b>",
+                 f"Находок: {len(finds)}" + (f", лучшая — {_h(best['name'])} {_signed(best['profit'])}" if best else ""),
+                 f"Куплено: {len(bought)}" + (f" на {_rub(sum(float(p.get('paid') or 0) for p in bought))}" if bought else ""),
+                 f"Продано: {len(sold)}, прибыль <b>{_signed(total)}</b>"]
+        acc = st.status.get("accuracy")
+        if acc:
+            lines.append(f"Прогнозы трекера сбываются: {acc['hit'] * 100:.0f}% (по {acc['n']} находкам за неделю)")
+        return "\n".join(lines)
+
+    def status_html(self):
+        st = self.state
+        s, now = st.status, time.time()
+        run = s.get("running")
+        active = [d for d in st.deals if not d.get("gone")]
+        lines = ["🔎 <b>Поиск идёт</b>" if run else "⏸ <b>Поиск остановлен</b>"]
+        if run and s.get("progress"):
+            lines.append(f"Проверяю {s['progress'].get('done')} из {s['progress'].get('total')}"
+                         + (f", круг ~{s['took']:.0f} с" if s.get("took") else ""))
+        lines.append(f"Находок сейчас: {len(active)}" + (f", вместе до {_signed(sum(d['profit'] for d in active))}" if active else ""))
+        if s.get("keys_total"):
+            lines.append(f"Ключей API: {s.get('keys')} из {s.get('keys_total')}"
+                         + (f", сейчас ~{s['rate']:.0f} запросов в минуту" if s.get("rate") else ""))
+        if st.feed_server:
+            with st.lock:
+                online = sum(1 for x in st.subscribers.values() if now - x["last"] < 120)
+            lines.append(f"Подписчиков онлайн: {online}")
+        if self.muted():
+            lines.append("🔕 Тишина до " + datetime.fromtimestamp(float(st.cfg["tg_muted_until"])).strftime("%H:%M"))
+        lines.append(f"Мин. прибыль: {_rub(st.cfg.get('min_profit', 0))}, дешевле рынка от {st.cfg.get('discount', 0) * 100:.0f}%")
+        return "\n".join(lines)
+
+    def help_html(self):
+        return ("🤖 <b>STALZONE Трекер</b> — что умеет бот\n"
+                "Под каждой находкой: «Купил» (отметит покупку в программе), «Скрыть», «Тишина на час». "
+                "Название в рамке копируется нажатием — вставь в поиск аукциона. Лот ушёл — сообщение само это покажет. "
+                "Купил — бот подскажет, за сколько выставить; перебили — «Перевыставил» одной кнопкой.\n\n"
+                + "\n".join(f"/{c} — {t}" for c, t in TG_COMMANDS))
+
+    # --- кнопки и команды ---
+    def ensure(self, force=False):
+        """Запустить или остановить прослушивание Telegram по настройкам."""
+        token, chat = self.creds()
+        self.forced = force or getattr(self, "forced", False)     # проверки без сети включают бота сами
+        want = bool(token and chat and token != self.bad_token and (self.forced or not os.environ.get("STALZONE_OFFLINE")))
+        # без «Кнопок и команд» Telegram не слушаем, но сверку (ушёл лот, подсказка цены, итог дня) делаем
+        sig = (token, chat, bool(self.state.cfg.get("tg_control", True))) if want else None
+        with self.lock:
+            self.sig = sig
+            if want and not (self.thread and self.thread.is_alive()):
+                self.thread = threading.Thread(target=self.loop, daemon=True)
+                self.thread.start()
+
+    def loop(self):
+        """Один поток на всё время: сменили токен или Chat ID — продолжает с новыми, выключили — выходит."""
+        my, last_tick = None, 0.0
+        while not self.state.exit_requested.is_set():
+            with self.lock:
+                if self.sig is None:
+                    self.thread = None
+                    return
+                sig = self.sig
+            if sig != my:
+                my, self.offset, self.problem = sig, None, None
+                if sig[2]:
+                    self.call("setMyCommands", {"commands": json.dumps([{"command": c, "description": t} for c, t in TG_COMMANDS],
+                                                                       ensure_ascii=False)})
+            if time.time() - last_tick > 5:
+                last_tick = time.time()
+                try:
+                    self.tick()
+                except Exception as e:
+                    self._log_once("tick", f"Telegram: {type(e).__name__}: {e}")
+            if not sig[2]:
+                self.state.exit_requested.wait(5)
+                continue
+            data = {"timeout": 20, "allowed_updates": json.dumps(["message", "callback_query"])}
+            if self.offset is None:
+                data.update(offset=-1, timeout=0)     # старые нажатия и команды не выполняем
+            else:
+                data["offset"] = self.offset
+            ok, res = self.call("getUpdates", data, timeout=30)
+            if self.sig != my:
+                continue
+            if not ok:
+                if "401" in str(res) or "404" in str(res):
+                    self.bad_token = my[0]
+                    self._log_once("token", "Telegram не принял токен бота — проверь его в «Настройках» (кнопки и команды выключены)")
+                    with self.lock:
+                        if self.sig == my:
+                            self.sig = None
+                    continue
+                if "409" in str(res):
+                    self.problem = ("Этого бота уже слушает другая программа (вторая копия трекера, другой компьютер или сайт) — "
+                                    "кнопки и команды работают только в одной. Сообщения о находках приходят как обычно")
+                    self._log_once("409", "Telegram: " + self.problem)
+                else:
+                    self.problem = "Нет связи с Telegram — пробую снова"
+                self.state.exit_requested.wait(15)
+                continue
+            self.problem = None
+            for u in res or []:
+                self.offset = max(self.offset or 0, int(u.get("update_id", 0)) + 1)
+                if data.get("offset") == -1:
+                    continue
+                try:
+                    self.handle(u)
+                except Exception as e:
+                    self._log_once("handle", f"Telegram: не получилось выполнить команду ({type(e).__name__}: {e})", 60)
+            if self.offset is None:
+                self.offset = 0
+
+    def handle(self, u):
+        token, chat = self.creds()
+        if "callback_query" in u:
+            q = u["callback_query"]
+            msg = q.get("message") or {}
+            if str((msg.get("chat") or {}).get("id")) != chat:
+                return self.call("answerCallbackQuery", {"callback_query_id": q["id"], "text": "Это не твой трекер"})
+            text = self.on_button(q.get("data") or "", msg)
+            return self.call("answerCallbackQuery", {"callback_query_id": q["id"], "text": text or "Готово"})
+        m = u.get("message") or {}
+        if str((m.get("chat") or {}).get("id")) != chat:
+            if (m.get("chat") or {}).get("type") == "private":
+                self.send("Это личный бот STALZONE Трекера — он слушается только своего владельца.", chat=str(m["chat"]["id"]))
+            return
+        text = str(m.get("text") or "").strip()
+        if not text.startswith("/"):
+            return self.send(self.help_html())
+        cmd, _, arg = text[1:].partition(" ")
+        cmd = cmd.split("@")[0].lower()
+        return self.on_command(cmd, arg.strip())
+
+    def on_command(self, cmd, arg):
+        st = self.state
+        if cmd in ("start", "help"):
+            return self.send(self.help_html())
+        if cmd == "status":
+            run = st.status.get("running")
+            return self.send(self.status_html(), [[("⏸ Остановить" if run else "▶ Начать поиск", "stop" if run else "go"),
+                                                    ("🔕 Тишина на час", "mute:60")]] if self.control() else None)
+        if cmd == "finds":
+            active = sorted([d for d in st.deals if not d.get("gone") and not d.get("bought")],
+                            key=lambda d: -(d.get("exp_profit") if d.get("exp_profit") is not None else d["profit"] * 0.3))[:5]
+            if not active:
+                return self.send("Сейчас находок нет" + (" — ищу дальше." if st.status.get("running") else ". Поиск остановлен: /go"))
+            lines = ["🟢 <b>Лучшие находки сейчас</b>"]
+            for d in active:
+                c = d.get("chance")
+                lines.append(f"<code>{_h(d['name'])}</code> {_h(grade_label(d))} — {_rub(d['cost'])} → <b>{_signed(d['profit'])}</b>"
+                             + (f", шанс {c * 100:.0f}%" if c is not None else ""))
+            buttons = [[(f"✅ Купил: {d['name'][:28]}", f"buy:{d['id']}")] for d in active] if self.control() else None
+            return self.send("\n".join(lines), buttons)
+        if cmd == "profit":
+            return self.send(self.profit_html())
+        if cmd == "buys":
+            open_ = [p for p in st.purchases if p.get("status") != "sold"]
+            if not open_:
+                return self.send("Непроданных покупок нет. Купил по находке — нажми «Купил» под сообщением.")
+            lines = ["🛒 <b>Мои покупки</b>"]
+            buttons = []
+            for p in open_[:10]:
+                st_txt = {"holding": "в инвентаре", "listed": "выставлен"}.get(p.get("status"), p.get("status"))
+                unit = p.get("cur_market") or p.get("target") or 0
+                lines.append(f"<code>{_h(p['name'])}</code> — {st_txt}, купил за {_rub(p['paid'])}"
+                             + (f", выставлен за {_rub(p['list_price'])}" if p.get("status") == "listed" and p.get("list_price") else
+                                f", рынок {_rub(unit * int(p.get('amount') or 1))}" if unit else ""))
+                if p.get("options") and p.get("status") == "holding":
+                    buttons.append([(f"💡 За сколько выставить: {p['name'][:22]}", f"sug:{p['id']}")])
+                if p.get("status") == "listed" and p.get("list_price"):
+                    buttons.append([(f"💰 Продал за {eng.fmt_rub(p['list_price'])}: {p['name'][:16]}", f"sold:{p['id']}")])
+            return self.send("\n".join(lines), buttons if self.control() else None)
+        if cmd == "stop":
+            st.stop()
+            return self.send("⏸ Поиск остановлен. Начать снова: /go")
+        if cmd == "go":
+            ok, msg = st.try_start()
+            return self.send(("▶ " if ok else "⚠ ") + _h(msg))
+        if cmd == "mute":
+            try:
+                hours = max(0.25, min(24.0, float(arg.replace(",", ".")))) if arg else 1.0
+            except ValueError:
+                hours = 1.0
+            return self.send(self.set_mute(hours * 60))
+        if cmd == "unmute":
+            st.update_settings({"tg_muted_until": 0})
+            return self.send("🔔 Находки снова приходят.")
+        if cmd in ("min", "discount"):
+            if not arg:
+                return self.send(f"Сейчас: мин. прибыль {_rub(st.cfg.get('min_profit', 0))}, дешевле рынка от "
+                                 f"{st.cfg.get('discount', 0) * 100:.0f}%. Поменять: /min 20000 или /discount 15")
+            key = "min_profit" if cmd == "min" else "discount_pct"
+            ok, msg = st.update_settings({key: re.sub(r"[^\d.,]", "", arg).replace(",", ".") or "x"})
+            return self.send(("✅ Сохранено. " if ok else "⚠ ") + (_h(msg) if not ok else
+                             f"Мин. прибыль {_rub(st.cfg['min_profit'])}, дешевле рынка от {st.cfg['discount'] * 100:.0f}%"))
+        return self.send("Не знаю такой команды.\n\n" + self.help_html())
+
+    def set_mute(self, minutes):
+        until = time.time() + minutes * 60
+        self.state.update_settings({"tg_muted_until": until})
+        return (f"🔕 Тишина до {datetime.fromtimestamp(until).strftime('%H:%M')} — обычные находки не присылаю, "
+                "особо редкие — всё равно. Снова включить: /unmute")
+
+    def on_button(self, data, msg):
+        st = self.state
+        kind, _, rest = data.partition(":")
+        if kind == "buy":
+            ok, text = st.buy(int(rest))
+            if ok:
+                self.mark_by_deal(int(rest), "bought", msg)
+            return text
+        if kind == "hide":
+            did = int(rest)
+            with st.lock:
+                d = next((x for x in st.deals if x["id"] == did), None)
+                st.deals = [x for x in st.deals if x["id"] != did]
+            st.save_deals()
+            if d is not None:
+                self.mark_by_deal(did, "hidden", msg, dict(d))
+            return "Скрыто"
+        if kind == "mute":
+            return self.set_mute(float(rest or 60))[:180]
+        if kind in ("stop", "go"):
+            if kind == "stop":
+                st.stop()
+                return "Поиск остановлен"
+            return st.try_start()[1]
+        if kind == "list":
+            pid, _, total = rest.partition(":")
+            ok, text = st.update_purchase({"id": pid, "list_price": total})
+            return f"Выставлен за {eng.fmt_rub(float(total))} — скажу, если перебьют" if ok else text
+        if kind == "sold":
+            p = next((x for x in st.purchases if x["id"] == rest), None)
+            if not p or not p.get("list_price"):
+                return "Покупка не найдена"
+            ok, text = st.update_purchase({"id": rest, "status": "sold", "sold_price": p["list_price"]})
+            return f"Продано, прибыль {eng.fmt_rub(next(x for x in st.purchases if x['id'] == rest).get('profit', 0))}" if ok else text
+        if kind == "sug":
+            p = next((x for x in st.purchases if x["id"] == rest), None)
+            return "Отправил варианты цены" if p and self.suggest(p) else "Подсказать цену пока не по чему"
+        return "Кнопка устарела"
+
+    def mark_by_deal(self, deal_id, new_state, msg, deal=None):
+        """Сразу поменять сообщение о находке после нажатия (не ждать сверки)."""
+        with self.state.lock:
+            d = deal or next((dict(x) for x in self.state.deals if x["id"] == deal_id), None)
+        if d is None:
+            return
+        with self.lock:
+            m = self.msgs.get(d.get("key"))
+            if m:
+                m["state"] = new_state
+        mid = (m or {}).get("id") or msg.get("message_id")
+        photo = (m or {}).get("photo") if m else bool(msg.get("photo"))
+        head = "✅ <b>Куплено</b> — в «Моих покупках»" if new_state == "bought" else "🙈 Скрыто"
+        self.edit(mid, photo, self.find_html(d, head=head), None)
+
+    def find_chat(self, token=None):
+        """«Найти Chat ID»: последний, кто написал боту в личку. (ok, chat_id, имя или текст ошибки)."""
+        token = (token or self.creds()[0]).strip()
+        if not token:
+            return False, "", "Сначала впиши токен бота"
+        if self.control() and token == self.creds()[0] and self.problem is None:
+            return False, "", f"Бот уже на связи с чатом {self.creds()[1]} — напиши ему /status. Другой чат — сначала сотри Chat ID"
+        ok, res = self.call("getUpdates", {"timeout": 0, "limit": 50}, token=token)
+        if not ok:
+            if "409" in str(res):
+                return False, "", "Бот уже подключён к программе — Chat ID, видимо, вписан. Если нет — выключи «Кнопки и команды» и нажми ещё раз"
+            return False, "", "Telegram не принял токен — проверь его" if ("401" in str(res) or "404" in str(res)) else str(res)
+        for u in reversed(res or []):
+            m = u.get("message") or {}
+            c = m.get("chat") or {}
+            if c.get("type") == "private":
+                name = " ".join(x for x in (c.get("first_name"), c.get("last_name")) if x) or c.get("username") or "чат"
+                if c.get("username"):
+                    name += f" (@{c['username']})"
+                return True, str(c["id"]), name
+        return False, "", "Никто ещё не писал боту: открой своего бота в Telegram, нажми «Start» (или напиши ему что угодно) и нажми «Найти» ещё раз"
+
+
 class State:
     def __init__(self, api_factory=None):
         self.lock = threading.Lock()
@@ -2285,6 +3027,7 @@ class State:
         self.exit_requested = threading.Event()
         self.exit_hook = None               # как закрыть окно программы (задаёт main)
         self.on_theme = None                # сменили тему — перекрасить рамку окна (задаёт main)
+        self.tg = TgBot(self)               # бот в Telegram: находки с кнопками, команды, итог дня
         self._card_api, self._card_cache = None, {}   # карточка рецепта: свой ключ API и лоты за последние минуты
         logging.getLogger("tracker").addHandler(_LogHandler(self))
         logging.getLogger("tracker").setLevel(logging.INFO)
@@ -2416,6 +3159,10 @@ class State:
             if now - self._alerted.get(text, 0) < 1800:
                 return
             self._alerted[text] = now
+
+        if getattr(self, "tg", None) is not None:
+            self.tg.send_text(text)
+            return
 
         def send():
             for attempt in range(3):
@@ -2764,7 +3511,10 @@ class State:
         if sold_line:
             self.add_log(sold_line)
             self.save_purchases()
-            self.alert("💰 " + sold_line.split(" (по истории")[0])
+            sold_today, total_today = self.tg.stats(self.tg.day_start())
+            self.alert("💰 " + sold_line.split(" (по истории")[0]
+                       + f"\nСегодня: {'+' if total_today >= 0 else '−'}{eng.fmt_rub(abs(total_today))}"
+                       f" ({len(sold_today)} {plural_ru(len(sold_today), ('продажа', 'продажи', 'продаж'))})")
         if kind == "log":
             self.add_log(data)
         elif kind == "deal":
@@ -3179,6 +3929,18 @@ class State:
             return None
         return str(self.cfg.get("server_url_override") or "").strip().rstrip("/") or self.access.server_url()
 
+    def try_start(self):
+        """Начать поиск, если всё готово: (ok, что не так). Из окна и из Telegram."""
+        access = self.access.check()
+        if not access["ok"]:
+            return False, access.get("reason", "Нет доступа")
+        if not self.snapshot()["configured"]:
+            return False, "Сначала вставь Client ID и Client Secret в настройках — или включи демо-режим."
+        if not self.cfg.get("watch") and not eng.auto_categories(self.cfg) and not self.subscriber_server():
+            return False, "Добавь предметы во вкладке «Предметы» или включи «Все артефакты»."
+        self.start()
+        return True, "Поиск запущен"
+
     def start(self):
         if not self.access.check()["ok"]:
             return
@@ -3191,6 +3953,7 @@ class State:
                 self.worker = FeedWorker(dict(self.cfg), self.emit, feed_url, self.cfg.get("access_code", ""),
                                          self.access.machine, shown={d["key"] for d in self.deals if d.get("key")},
                                          holdings=[dict(p) for p in self.purchases if p.get("status") != "sold"])
+                self.worker.notifier = self.tg
                 self.worker.start()
             self.add_log("Трекер запущен — находки с сервера владельца")
             return
@@ -3207,6 +3970,7 @@ class State:
                                  shown={d["key"] for d in self.deals if d.get("key")},
                                  tracked=tracked, holdings=holdings, serving=self.serving(),
                                  shared=self.journal_once, wants_fn=self.subscriber_wants)
+            self.worker.notifier = self.tg
             self.worker.start()
         self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else "")
                      + (" — по ключу API владельца из кода доступа" if self.worker.cfg.get("shared_api") else ""))
@@ -3297,6 +4061,7 @@ class State:
         elif feed_url:
             server = {"role": "subscriber", "url": feed_url}
         access, update = self.access.snapshot(), self.updater.snapshot()   # до self.lock: им самим нужен этот замок
+        tg = self.tg.info()
         with self.lock:
             self._prune_near(time.time())
             near = sorted(self.near.values(), key=lambda r: (bool(r.get("gone")), -(r.get("profit") or 0)))[:12]
@@ -3318,6 +4083,7 @@ class State:
                 "update": update,
                 "access": access,
                 "purchases": [dict(p) for p in self.purchases],
+                "tg": tg,
                 "cat_counts": dict(self.cat_counts),
                 "auto_cats": eng.auto_categories(cfg),
                 "frozen": bool(getattr(sys, "frozen", False)),
@@ -3403,6 +4169,16 @@ class State:
                     cfg[key] = f"{kind}:{name}"
             if "sound_volume" in data:
                 cfg["sound_volume"] = min(100, max(0, int(float(data["sound_volume"]))))
+            for key in ("tg_control", "tg_photo", "tg_quiet", "tg_daily"):
+                if key in data:
+                    cfg[key] = bool(data[key])
+            for key in ("tg_quiet_from", "tg_quiet_to", "tg_daily_hour"):
+                if key in data:
+                    cfg[key] = min(23, max(0, int(float(data[key]))))
+            if "tg_muted_until" in data:
+                cfg["tg_muted_until"] = max(0.0, float(data["tg_muted_until"] or 0))
+            if "tg_daily_last" in data:
+                cfg["tg_daily_last"] = str(data["tg_daily_last"])[:10]
             if "update_repo" in data:
                 repo = str(data["update_repo"] or "").strip().strip("/")
                 repo = re.sub(r"^https?://github\.com/", "", repo).strip("/")   # можно вставить и ссылку
@@ -3429,6 +4205,9 @@ class State:
             ok, why = set_autostart(cfg["autostart"])
             if not ok:
                 note = " · " + why
+        if changed & {"telegram_token", "telegram_chat_id", "tg_control"}:
+            self.tg.bad_token = None
+            self.tg.ensure()
         if "theme" in changed and self.on_theme:
             try:
                 self.on_theme(cfg["theme"])
@@ -3629,6 +4408,17 @@ def make_handler(state, token):
             if path == "/api/purchases/remove":
                 ok, msg = state.remove_purchase(data.get("id"))
                 return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/telegram/find":
+                ok, chat_id, name = state.tg.find_chat(str(data.get("telegram_token") or ""))
+                if not ok:
+                    return self.send_json({"ok": False, "message": name})
+                upd = {"telegram_chat_id": chat_id}
+                if data.get("telegram_token"):
+                    upd["telegram_token"] = str(data["telegram_token"]).strip()
+                state.update_settings(upd)
+                state.tg.send(state.tg.help_html())
+                return self.send_json({"ok": True, "chat_id": chat_id,
+                                       "message": f"Нашёл: {name}. Chat ID сохранён — проверь Telegram"})
             if path == "/api/telegram/test":
                 cfg = dict(state.cfg)
                 for k in ("telegram_token", "telegram_chat_id"):
@@ -3678,18 +4468,8 @@ def make_handler(state, token):
                 threading.Thread(target=state.access.refresh_revoked, kwargs={"force": True}, daemon=True).start()
                 return self.send_json({"ok": True})
             if path == "/api/start":
-                access = state.access.check()
-                if not access["ok"]:
-                    return self.send_json({"ok": False, "message": access.get("reason", "Нет доступа")})
-                if not state.snapshot()["configured"]:
-                    return self.send_json({"ok": False, "message": "Сначала вставь Client ID и Client Secret "
-                                                                   "в настройках — или включи демо-режим."})
-                if (not state.cfg.get("watch") and not eng.auto_categories(state.cfg)
-                        and not state.subscriber_server()):
-                    return self.send_json({"ok": False, "message": "Добавь предметы во вкладке «Предметы» "
-                                                                   "или включи «Все артефакты»."})
-                state.start()
-                return self.send_json({"ok": True})
+                ok, msg = state.try_start()
+                return self.send_json({"ok": ok, "message": msg})
             if path == "/api/stop":
                 state.stop()
                 return self.send_json({"ok": True})
@@ -3765,6 +4545,7 @@ def main():
             state.start()
     threading.Thread(target=boot, daemon=True).start()
     threading.Thread(target=state.watchdog, daemon=True).start()
+    state.tg.ensure()          # бот в Telegram: кнопки и команды
     if state.cfg.get("autostart"):
         set_autostart(True)   # программу могли перенести в другую папку — обновим путь
     windowed = False

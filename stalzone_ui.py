@@ -2224,6 +2224,10 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
 .frow small{color:var(--text-2);font-size:12px;line-height:16px}
 .frow .field{width:100%}
 .linkrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.tgstate{margin-top:10px;padding:8px 12px;border-radius:6px;background:var(--sel);color:var(--text-2)}
+.tgstate.warn{background:var(--warn-bg);color:var(--text)}
+.tg-help{margin-top:10px}
+.srow .combo select:disabled{opacity:.5}
 
 /* ---------- журнал ---------- */
 .log{background:var(--card);border:1px solid var(--stroke);border-radius:8px;padding:8px 0;font-size:13px;line-height:20px}
@@ -2494,8 +2498,14 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
                 <summary><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><path d="m3 9.5 13.5-5.5-2.5 12-4-3.5-2 2.5v-4l6-5.5"/></svg><div class="tx" style="flex:1;min-width:0"><div>Telegram</div><small class="muted" id="tgSum">Сообщение о каждой находке и о важном: продано, перебили, поиск встал</small></div><svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></summary>
                 <div class="inner">
                   <div class="srow"><div class="tx"><div>Токен бота</div><small>Создай бота у @BotFather</small></div><input class="field" id="sTgToken" type="password" autocomplete="off"></div>
-                  <div class="srow"><div class="tx"><div>Chat ID</div><small>Число от @userinfobot; у своего бота нажми Start</small></div><input class="field" id="sTgChat" autocomplete="off"></div>
+                  <div class="srow"><div class="tx"><div>Chat ID</div><small>Напиши своему боту «Start» в Telegram и нажми «Найти» — трекер узнает его сам</small></div><input class="field" id="sTgChat" autocomplete="off" style="width:150px"><button class="btn" id="tgFindBtn">Найти</button></div>
                   <div class="linkrow"><button class="btn" id="tgTestBtn">Проверить Telegram</button><button class="btn subtle" data-open="botfather">Открыть @BotFather</button></div>
+                  <div class="tgstate small" id="tgState" hidden></div>
+                  <div class="srow"><div class="tx"><div>Кнопки и команды</div><small>Под находкой — «Купил», «Скрыть», «Тишина на час»; команды /status, /finds, /profit, /buys, /stop, /go, /mute, /min</small></div><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sTgControl"><i></i></label></div>
+                  <div class="srow"><div class="tx"><div>Картинка предмета</div><small>Сообщение о находке — с изображением предмета</small></div><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sTgPhoto"><i></i></label></div>
+                  <div class="srow"><div class="tx"><div>Тихие часы</div><small>Находки приходят без звука. Особо редкие — всё равно со звуком</small></div><span class="combo" style="width:96px"><select id="sTgQFrom"><option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option><option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option><option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span><span class="faint">–</span><span class="combo" style="width:96px"><select id="sTgQTo"><option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option><option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option><option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sTgQuiet"><i></i></label></div>
+                  <div class="srow"><div class="tx"><div>Итог дня</div><small>Сколько нашёл, купил, продал и заработал — одним сообщением</small></div><span class="combo" style="width:96px"><select id="sTgDailyH"><option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option><option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option><option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sTgDaily"><i></i></label></div>
+                  <div class="tg-help small faint">Купил по находке — нажми «Купил» прямо в Telegram: покупка появится в «Моих покупках», бот подскажет, за сколько выставить, и даст кнопку «Выставил за …». Лот ушёл — сообщение о находке само поменяется. Бот слушается только твоего Chat ID.</div>
                 </div>
               </details>
               <details class="sexp" id="rareExp">
@@ -3668,6 +3678,15 @@ function fillForm() {
   if (document.activeElement !== $("sKeys") && !$("sKeys").dataset.bad) $("sKeys").value = (c.extra_keys || []).map((k) => `${k.id} ${"•".repeat(10)}`).join("\n");
   setVal("sDiscount", Math.round(c.discount * 100)); setVal("sMinProfit", rubN(c.min_profit));
   setVal("sTgToken", c.telegram_token || ""); setVal("sTgChat", c.telegram_chat_id || "");
+  setVal("sTgControl", c.tg_control !== false); setVal("sTgPhoto", c.tg_photo !== false); setVal("sTgQuiet", !!c.tg_quiet);
+  setVal("sTgQFrom", String(c.tg_quiet_from ?? 0)); setVal("sTgQTo", String(c.tg_quiet_to ?? 8));
+  setVal("sTgDaily", c.tg_daily !== false); setVal("sTgDailyH", String(c.tg_daily_hour ?? 23));
+  $("sTgQFrom").disabled = $("sTgQTo").disabled = !c.tg_quiet; $("sTgDailyH").disabled = c.tg_daily === false;
+  const tg = S.tg || {}, tgOn = !!(c.telegram_token && c.telegram_chat_id);
+  const tgLine = !tgOn ? "" : tg.problem ? "⚠ " + tg.problem
+    : c.tg_control === false ? "Кнопки и команды выключены — приходят только сообщения"
+    : tg.listening ? "Бот на связи: кнопки и команды работают" + (tg.muted_until ? ` · тишина до ${new Date(tg.muted_until * 1000).toLocaleTimeString("ru-RU", {hour: "2-digit", minute: "2-digit"})}` : "") : "";
+  $("tgState").hidden = !tgLine; $("tgState").textContent = tgLine; $("tgState").classList.toggle("warn", !!tg.problem);
   setVal("sRare", c.rare_enabled !== false); setVal("sRareQ", String(c.rare_quality ?? 4)); setVal("sRareProfit", rubN(c.rare_min_profit ?? 5000));
   setVal("sTheme", c.theme || "system"); setVal("sUi", c.ui || "new"); setVal("sScale", c.ui_scale || "m"); setVal("sAutostart", !!c.autostart);
   setVal("sSoundOn", c.sound_on !== false); setVal("sVolume", c.sound_volume ?? 70); $("sVolumeV").textContent = ($("sVolume").value) + "%";
@@ -3696,6 +3715,19 @@ onChange("sClientSecret", () => saveSetting({client_secret: $("sClientSecret").v
 onChange("sKeys", () => saveSetting({extra_keys: $("sKeys").value.split("\n")}, "Ключи сохранены", $("sKeys")));
 onChange("sTgToken", () => saveSetting({telegram_token: $("sTgToken").value}, "Сохранено"));
 onChange("sTgChat", () => saveSetting({telegram_chat_id: $("sTgChat").value}, "Сохранено"));
+onChange("sTgControl", () => saveSetting({tg_control: $("sTgControl").checked}));
+onChange("sTgPhoto", () => saveSetting({tg_photo: $("sTgPhoto").checked}));
+onChange("sTgQuiet", () => saveSetting({tg_quiet: $("sTgQuiet").checked}));
+onChange("sTgQFrom", () => saveSetting({tg_quiet_from: $("sTgQFrom").value}, "Сохранено"));
+onChange("sTgQTo", () => saveSetting({tg_quiet_to: $("sTgQTo").value}, "Сохранено"));
+onChange("sTgDaily", () => saveSetting({tg_daily: $("sTgDaily").checked}));
+onChange("sTgDailyH", () => saveSetting({tg_daily_hour: $("sTgDailyH").value}, "Сохранено"));
+$("tgFindBtn").onclick = async () => {
+  toast("Ищу, кто написал боту…");
+  const r = await api("/api/telegram/find", {telegram_token: $("sTgToken").value});
+  toast(r.message, !r.ok);
+  if (r.ok) { $("sTgChat").value = r.chat_id; await refresh(); }
+};
 onChange("sRare", () => { syncToggleLabels(); saveSetting({rare_enabled: $("sRare").checked}); });
 onChange("sRareQ", () => saveSetting({rare_quality: $("sRareQ").value}, "Сохранено"));
 onChange("sRareProfit", () => saveSetting({rare_min_profit: num($("sRareProfit").value)}, "Сохранено"));
