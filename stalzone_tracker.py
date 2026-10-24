@@ -863,6 +863,52 @@ class Api:
         return out, "cap"
 
 
+class KeyPool(Api):
+    """Несколько ключей API в одной программе: запросы расходятся по ключам, у каждого свой темп и свой
+    лимит (400 в минуту). Главный ключ — сам этот объект, дополнительные — отдельные Api. Ключ, который
+    EXBO не пустила, выбывает — проверка идёт дальше на остальных."""
+
+    def __init__(self, cfg, extra):
+        super().__init__(cfg)
+        self.members = [self]
+        for cid, secret in extra:
+            try:
+                self.members.append(Api(dict(cfg, client_id=cid, client_secret=secret, app_token="",
+                                             share_expected=False, share_hint="")))
+            except AuthError:
+                continue
+        self.dead = set()
+        self._pick_lock = threading.Lock()
+        log.info("Ключей API: %d — запросы делятся между ними (до %d в минуту)", len(self.members),
+                 len(self.members) * 400 * RATE_SHARE)
+
+    def alive(self):
+        return [m for m in self.members if id(m) not in self.dead]
+
+    def _pick(self):
+        with self._pick_lock:
+            alive = self.alive()
+            if not alive:
+                raise AuthError("Ни один ключ API не подошёл — проверь Client ID и Client Secret в «Настройках».")
+            return min(alive, key=lambda m: m._next_slot)
+
+    def get(self, path, params):
+        while True:
+            api = self._pick()
+            try:
+                return Api.get(api, path, params)
+            except AuthError:
+                if api is self and len(self.members) == 1:
+                    raise
+                with self._pick_lock:
+                    self.dead.add(id(api))
+                    left = len(self.alive())
+                n = self.members.index(api) + 1
+                log.warning("Ключ API №%d не пустил (проверь его Client ID и Secret) — работаю без него, осталось %d",
+                            n, left)
+                if not left:
+                    raise
+
 # --------------------------- Логика поиска ---------------------------
 _FRACTION_RE = re.compile(r"\.(\d+)")
 

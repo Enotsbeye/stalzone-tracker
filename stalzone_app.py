@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -254,13 +254,17 @@ def send_telegram(cfg, text):
 WATCH_MAX = 300            # предметов в своём списке (категории целиком — сверх этого)
 ICON_URL = "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main/{region}{path}"   # картинки предметов
 RESTART_DELAY = 3          # сменили ключи — перезапуск через столько секунд после последнего изменения
-RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days")
+RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region", "history_keep_days", "extra_keys")
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
               "server_url_override")   # из-за них новый проход не начинаем — просто запомнить
 FEED_PORT = 8790            # сервер для подписчиков слушает только этот компьютер; наружу — через Tailscale Funnel
-FEED_POLL = 30              # подписчик спрашивает сервер раз в столько секунд
+FEED_POLL = 15              # подписчик спрашивает сервер раз в столько секунд
 FEED_MIN_INTERVAL = 10      # чаще одного запроса в 10 с с одного кода — отказ
 FEED_KEEP_GONE = 30 * 60    # пропавшие находки ещё полчаса видны подписчикам («уже купили»)
+EXCLUSIVE_S = 120           # новая находка сначала только одному подписчику (по очереди), потом — всем
+WANT_FRESH = 600            # что ищут подписчики: учитываем тех, кто приходил за последние 10 минут
+SUB_ITEMS_MAX = 1500        # больше предметов для подписчиков не берём
+MAX_EXTRA_KEYS = 30
 NEAR_DISCOUNT = 0.08        # «почти находки»: лоты дешевле рынка хотя бы на 8%…
 NEAR_MIN_PROFIT = 3000      # …с прибылью от 3 000 ₽, которые не прошли твои пороги, — видно, что и почему отсеяно
 NEAR_KEEP = 30 * 60         # «почти находка» видна, пока лот на аукционе, но не дольше получаса без новых проверок
@@ -306,6 +310,58 @@ def is_near(rec):
     """Стоит ли показать находку, не прошедшую пороги, в «почти находках»."""
     return (rec.get("kind") == "buyout" and float(rec.get("profit") or 0) >= NEAR_MIN_PROFIT
             and near_pct(rec) >= NEAR_DISCOUNT * 100 - 1e-6)
+
+
+def parse_keys(text, old=()):
+    """Дополнительные ключи из поля настроек: по строке «Client ID  Client Secret» (через пробел, «:» или «;»).
+    Вместо секрета можно оставить точки — тогда берём прежний секрет этого ID. → [{"id", "secret"}]."""
+    known = {str(k.get("id")): str(k.get("secret")) for k in old or [] if isinstance(k, dict)}
+    out, seen = [], set()
+    lines = text if isinstance(text, list) else str(text or "").splitlines()
+    for line in lines:
+        if isinstance(line, dict):
+            cid, secret = str(line.get("id") or "").strip(), str(line.get("secret") or "").strip()
+        else:
+            parts = [x for x in re.split(r"[\s:;,]+", str(line).strip()) if x]
+            if not parts:
+                continue
+            if len(parts) != 2:
+                raise ValueError("В каждой строке — Client ID и Client Secret через пробел")
+            cid, secret = parts
+        if not cid or cid in seen:
+            continue
+        if not secret or set(secret) <= {"•", "*"}:
+            secret = known.get(cid, "")
+            if not secret:
+                raise ValueError(f"Для ключа {cid} нужен Client Secret")
+        seen.add(cid)
+        out.append({"id": cid, "secret": secret})
+    return out[:MAX_EXTRA_KEYS]
+
+
+def make_api(cfg):
+    """Ключ API для проверки: один — Api, несколько (свой + дополнительные) — KeyPool, запросы делятся."""
+    extra = [(k["id"], k["secret"]) for k in cfg.get("extra_keys") or []
+             if isinstance(k, dict) and k.get("id") and k.get("secret") and k["id"] != cfg.get("client_id")]
+    if extra and cfg.get("client_id") and cfg.get("client_secret") and not cfg.get("shared_api"):
+        eng.FETCH_THREADS = min(48, 10 * (len(extra) + 1))
+        eng.FETCH_AHEAD = 2 * eng.FETCH_THREADS
+        return eng.KeyPool(cfg, extra)
+    eng.FETCH_THREADS, eng.FETCH_AHEAD = 10, 20
+    return eng.Api(cfg)
+
+
+def wants(want, rec):
+    """Подходит ли находка подписчику: его предметы и категории (пусто — всё) и его пороги."""
+    w, c = want.get("w") or [], want.get("c") or []
+    if (w or c) and rec.get("item_id") not in w and rec.get("cat") not in c:
+        return False
+    cfg = {"min_profit": float(want.get("mp") or 0), "discount": float(want.get("d") or 0.15),
+           "rare_enabled": bool(want.get("re", True)), "rare_min_profit": float(want.get("rp") or 0),
+           "rare_quality": int(want.get("rq") or 4), "bids": True}
+    rare = is_rare(cfg, rec.get("item_id"), rec.get("name", ""), {"cat": rec.get("cat"), "rank": rec.get("rank")},
+                   rec.get("quality"))
+    return meets_thresholds(rec, cfg, rare)
 
 
 def plural_ru(n, forms):
@@ -357,6 +413,8 @@ def feed_text(rec, cfg):
                  f"Перепродать ~{rub(rec['market'])}/шт · прибыль ~{rub(rec['profit'])} после комиссии"]
     if rec.get("chance_info"):
         lines.append(chance_text(rec["chance_info"]))
+    if rec.get("only_you_until") and rec["only_you_until"] > time.time():
+        lines.insert(0, f"🎯 Только тебе ещё ~{max(1, round((rec['only_you_until'] - time.time()) / 60))} мин — потом увидят все")
     return ("💎 ОСОБО РЕДКИЙ\n" if rec.get("rare") else "") + "\n".join(lines)
 
 
@@ -1164,8 +1222,10 @@ class Worker(threading.Thread):
     Настройки меняются на ходу (reconfigure): пороги — сразу, список предметов — со следующего прохода.
     Перезапуск нужен только при смене ключей API (раньше любая галочка перезапускала проверку с нуля)."""
 
-    def __init__(self, cfg, emit, api_factory=None, shown=(), tracked=(), holdings=(), serving=False, shared=None):
+    def __init__(self, cfg, emit, api_factory=None, shown=(), tracked=(), holdings=(), serving=False, shared=None,
+                 wants_fn=None):
         super().__init__(daemon=True)
+        self.wants_fn = wants_fn or (lambda: (set(), set()))   # что ищут подписчики: (предметы, категории)
         self.cfg = cfg
         self.serving = serving             # владелец раздаёт находки подписчикам
         self.emit = emit
@@ -1173,7 +1233,7 @@ class Worker(threading.Thread):
         self.wake = threading.Event()      # новые настройки — не ждать конца паузы между проходами
         self._pending = None               # (настройки, serving) — применить со следующего прохода
         self._pending_lock = threading.Lock()
-        self.api_factory = api_factory or eng.Api
+        self.api_factory = api_factory or make_api
         self.db = None
         self.initial_shown = set(shown)   # что уже есть в таблице (например, восстановлено после перезапуска)
         # находки-выкупы, за судьбой которых следим: пропал лот — купили его или сняли
@@ -1208,11 +1268,23 @@ class Worker(threading.Thread):
             self.serving = pending[1]
         return pending is not None
 
-    def _plan(self, names):
-        """Что проверять и с какими порогами — по текущим настройкам: (предметы, авто, купленное, категории, пороги)."""
+    def _plan(self, names, wanted=None):
+        """Что проверять и с какими порогами — по текущим настройкам: (предметы, авто, купленное, категории, пороги).
+        Сервер для подписчиков ищет ещё и то, что выбрали они сами (их предметы и категории)."""
         cfg = self.cfg
-        items, auto = eng.watch_items(cfg, names)
-        cats = eng.auto_categories(cfg)
+        sub_items, sub_cats = wanted or (set(), set())
+        own_cats = eng.auto_categories(cfg)
+        cats_all = own_cats + [c for c in sorted(sub_cats) if c in eng.AUTO_CATEGORIES and c not in own_cats]
+        items, auto = eng.watch_items(dict(cfg, auto_categories=cats_all, all_artifacts="artefact" in cats_all), names)
+        have = {i for i, _ in items}
+        for item_id in sorted(sub_items):
+            if len(auto) >= SUB_ITEMS_MAX:
+                break
+            if item_id in names and item_id not in have:
+                have.add(item_id)
+                auto.add(item_id)
+                items.append((item_id, names[item_id]))
+        cats = cats_all
         have = {i for i, _ in items}
         hold_ids = set()
         for h in list(self.holdings):   # купленное тоже проверяем — чтобы видеть его текущую цену
@@ -1304,7 +1376,7 @@ class Worker(threading.Thread):
             except Exception:
                 self.meta = {}
             self._take_pending()   # что поменяли, пока запускались, уже в self.cfg
-            items, auto, hold_ids, cats, scan_cfg = self._plan(names)
+            items, auto, hold_ids, cats, scan_cfg = self._plan(names, self.wants_fn() if self.serving else None)
             if not items:
                 self.emit("error", "Список предметов пуст или названия не найдены — проверь вкладку «Предметы».")
                 return
@@ -1320,11 +1392,15 @@ class Worker(threading.Thread):
                 setattr(scanner, attr, self.shared.setdefault(attr, set()))
             first_pass, announce, last_line = True, True, None
             heat, heat_at, acc_at = {}, 0.0, 0.0
+            wanted_sig = None
             while not self.stop_event.is_set():
-                if self._take_pending():
-                    items, auto, hold_ids, cats, scan_cfg = self._plan(names)
+                wanted = self.wants_fn() if self.serving else (set(), set())
+                sig = (frozenset(wanted[0]), frozenset(wanted[1]))
+                if self._take_pending() or (sig != wanted_sig and wanted_sig is not None):
+                    items, auto, hold_ids, cats, scan_cfg = self._plan(names, wanted)
                     scanner.cfg, scanner.quiet = scan_cfg, auto | hold_ids
                     announce = True
+                wanted_sig = sig
                 if announce:
                     announce = False
                     scanner.quiet_label = "Все артефакты" if cats == ["artefact"] else "Категории целиком"
@@ -1413,6 +1489,8 @@ class Worker(threading.Thread):
                     self.emit("log", scanner.summary())
                 self.emit("pass", {"time": time.time(), "found": found[0], "took": time.time() - started,
                                    "key_others": getattr(api, "others_last", None), "key_limit": getattr(api, "key_limit", None),
+                                   "keys": len(api.alive()) if hasattr(api, "alive") else 1,
+                                   "keys_total": len(getattr(api, "members", [api])),
                                    "delay": api_delay(fresh_ages),
                                    "delay_min": min(fresh_ages) if fresh_ages else None,
                                    "delay_n": len(fresh_ages),
@@ -1662,7 +1740,7 @@ class FeedWorker(threading.Thread):
                     etag, quiet_next = None, True
                 started = time.time()
                 headers = {"X-Access-Code": self.code, "X-Machine": self.machine, "X-App-Version": APP_VERSION,
-                           "Accept-Encoding": "gzip"}
+                           "Accept-Encoding": "gzip", "X-Want": self.want_header(cfg, watch_ids, cats)}
                 if etag:
                     headers["If-None-Match"] = etag
                 wait = FEED_POLL
@@ -1716,6 +1794,14 @@ class FeedWorker(threading.Thread):
             self.emit("error", f"Не удалось подключиться к серверу: {e}")
         finally:
             self.emit("stopped", None)
+
+    @staticmethod
+    def want_header(cfg, watch_ids, cats):
+        """Что я ищу — серверу: он проверит и мои предметы и будет отдавать мне находки по очереди с другими."""
+        want = {"w": sorted(watch_ids)[:400], "c": sorted(cats)[:20], "mp": float(cfg.get("min_profit") or 0),
+                "d": float(cfg.get("discount") or 0.15), "re": bool(cfg.get("rare_enabled", True)),
+                "rq": int(cfg.get("rare_quality", 4)), "rp": float(cfg.get("rare_min_profit", 5000))}
+        return _b64e(json.dumps(want, separators=(",", ":")).encode("utf-8"))
 
     def process(self, data, cfg, meta, watch_ids, cats, seen, shown, quiet=False):
         present, fates, found = set(), {}, 0
@@ -1808,6 +1894,14 @@ def make_feed_handler(state):
                 return self._json(403, {"error": err})
             cid, now = str(payload["i"]), time.time()
             skey = cid if payload["m"] != ANY_MACHINE else f"{cid}:{norm_machine(machine)}"   # у кода на группу — по компьютерам
+            want = None
+            raw = str(self.headers.get("X-Want") or "")[:16000]
+            if raw:     # что подписчик ищет сам: предметы, категории, пороги
+                try:
+                    want = json.loads(_b64d(raw).decode("utf-8"))
+                    want = want if isinstance(want, dict) else None
+                except (ValueError, UnicodeDecodeError):
+                    want = None
             first = False
             with state.lock:
                 sub = state.subscribers.get(skey)
@@ -1817,6 +1911,8 @@ def make_feed_handler(state):
                     too_fast = False
                     first = sub is None
                     state.subscribers[skey] = {
+                        "want": want if want is not None else (sub or {}).get("want"),
+                        "given": (sub or {}).get("given") or [],
                         "cid": cid, "name": payload["n"], "machine": norm_machine(machine) or payload["m"], "last": now,
                         "requests": (sub or {}).get("requests", 0) + 1,
                         "version": str(self.headers.get("X-App-Version") or "")[:20],
@@ -1825,7 +1921,7 @@ def make_feed_handler(state):
                 return self._json(429, {"error": "слишком часто"}, {"Retry-After": str(FEED_MIN_INTERVAL)})
             if first:
                 state.add_log(f"Подписчик подключился: {payload['n']} (№ {cid})")
-            rev, body, gz = state.feed_bytes()
+            rev, body, gz = state.feed_bytes(skey)
             etag = f'"{rev}"'
             if self.headers.get("If-None-Match") == etag:
                 return self._send(304, b"", {"ETag": etag})
@@ -2171,8 +2267,8 @@ class State:
         return True, "Удалено"
 
     # --- сервер для подписчиков (владелец) ---
-    def feed_bytes(self):
-        """(номер версии, JSON, JSON в gzip) — собираем заново, только если лента изменилась."""
+    def feed_bytes(self, who=None):
+        """(метка, JSON, JSON в gzip) для подписчика who: находки, отданные по очереди другому, он пока не видит."""
         now = time.time()
         with self.lock:
             for key in [k for k, r in self.feed.items()
@@ -2180,15 +2276,44 @@ class State:
                         or (r.get("ends") and State._ts(r["ends"], now + 1) < now - 300)]:
                 del self.feed[key]
                 self.feed_rev += 1
-            if self._feed_cache[0] == self.feed_rev:
-                return self._feed_cache
+            deals = []
+            for r in self.feed.values():
+                mine = r.get("excl") and now < r.get("excl_until", 0)
+                if mine and r["excl"] != who:
+                    continue        # пока — только тому, кому досталась по очереди
+                d = {k: v for k, v in r.items() if k not in ("text", "notify", "id", "excl", "excl_until")}
+                if mine:
+                    d["only_you_until"] = r["excl_until"]
+                deals.append(d)
             payload = {"v": 1, "server_version": APP_VERSION, "time": now,
-                       "last_pass": self.status.get("last_pass"), "items": self.status.get("total"),
-                       "deals": [{k: v for k, v in r.items() if k not in ("text", "notify", "id")}
-                                 for r in self.feed.values()]}
-            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            self._feed_cache = (self.feed_rev, body, gzip.compress(body, 6))
-            return self._feed_cache
+                       "last_pass": self.status.get("last_pass"), "items": self.status.get("total"), "deals": deals}
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        tag = hashlib.md5(json.dumps(deals, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return tag, body, gzip.compress(body, 6)
+
+    def _assign_exclusive(self, rec):
+        """Новая находка — сначала одному подписчику (под lock): из тех, кто онлайн и кому она подходит по его
+        предметам и порогам, тому, кто за последний час получил меньше всех. Через EXCLUSIVE_S её видят все."""
+        now = time.time()
+        cands = [(key, sub) for key, sub in self.subscribers.items()
+                 if now - sub["last"] < 90 and isinstance(sub.get("want"), dict) and wants(sub["want"], rec)]
+        if not cands or rec.get("gone"):
+            return
+        key, sub = min(cands, key=lambda ks: (sum(1 for t in ks[1].get("given", []) if now - t < 3600),
+                                              ks[1].get("given", [0])[-1] if ks[1].get("given") else 0))
+        sub["given"] = (sub.get("given") or [])[-199:] + [now]
+        rec["excl"], rec["excl_until"] = key, now + EXCLUSIVE_S
+
+    def subscriber_wants(self):
+        """Что выбрали подписчики, которые заходили за последние 10 минут: (предметы, категории)."""
+        now, items, cats = time.time(), set(), set()
+        with self.lock:
+            for sub in self.subscribers.values():
+                want = sub.get("want")
+                if now - sub["last"] < WANT_FRESH and isinstance(want, dict):
+                    items.update(str(x) for x in (want.get("w") or [])[:400])
+                    cats.update(str(x) for x in (want.get("c") or [])[:20])
+        return items, cats
 
     def subscribers_seen(self):
         """№ кода → когда последний раз приходил кто-то из его компьютеров."""
@@ -2317,7 +2442,8 @@ class State:
                 self.status["starting"] = False
             elif kind == "pass":
                 self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"),
-                                   key_others=data.get("key_others"), key_limit=data.get("key_limit"))
+                                   key_others=data.get("key_others"), key_limit=data.get("key_limit"),
+                                   keys=data.get("keys"), keys_total=data.get("keys_total"))
                 quiet_line = self._quiet_summary(data["time"])
                 if data["delay"] is not None:
                     self.status.update(delay=data["delay"], delay_min=data.get("delay_min"),
@@ -2350,6 +2476,10 @@ class State:
                 rec = dict(data, found=(old or {}).get("found", time.time()))
                 if old and old.get("gone"):
                     rec.update(gone=old["gone"], gone_at=old.get("gone_at"), fate=old.get("fate"))
+                if old:
+                    rec.update({k: old[k] for k in ("excl", "excl_until") if k in old})
+                else:
+                    self._assign_exclusive(rec)
                 self.feed[data["key"]] = rec
                 self.feed_rev += 1
             elif kind == "feed_sync":    # подписчик: что сейчас есть на сервере
@@ -2680,7 +2810,7 @@ class State:
             self.worker = Worker(self.api_cfg(), self.emit, self.api_factory,
                                  shown={d["key"] for d in self.deals if d.get("key")},
                                  tracked=tracked, holdings=holdings, serving=self.serving(),
-                                 shared=self.journal_once)
+                                 shared=self.journal_once, wants_fn=self.subscriber_wants)
             self.worker.start()
         self.add_log("Трекер запущен" + (" (ДЕМО-режим)" if self.cfg["base_url"] == DEMO_URL else "")
                      + (" — по ключу API владельца из кода доступа" if self.worker.cfg.get("shared_api") else ""))
@@ -2763,7 +2893,9 @@ class State:
             with self.lock:
                 online = sum(1 for x in self.subscribers.values() if now - x["last"] < 120)
                 feed_n = sum(1 for r in self.feed.values() if not r.get("gone"))
+            sub_items, sub_cats = self.subscriber_wants()
             server = {"role": "owner", "enabled": bool(cfg.get("server_enabled")), "running": bool(self.feed_server),
+                      "sub_items": len(sub_items), "sub_cats": sorted(sub_cats),
                       "port": int(cfg.get("server_port") or FEED_PORT), "url": cfg.get("server_url") or "",
                       "error": self.feed_error, "online": online, "feed": feed_n}
         elif feed_url:
@@ -2845,6 +2977,11 @@ class State:
                 cfg["server_url_override"] = str(data["server_url_override"] or "").strip().rstrip("/")
             if "notify_min_chance" in data:
                 cfg["notify_min_chance"] = min(90.0, max(0.0, float(data["notify_min_chance"])))
+            if "extra_keys" in data:
+                try:
+                    cfg["extra_keys"] = parse_keys(data["extra_keys"], self.cfg.get("extra_keys"))
+                except ValueError as e:
+                    return False, f"Ещё ключи: {e}"
             for key in ("calibrate", "threshold_expected", "keep_awake", "autostart", "autorun_search", "alerts"):
                 if key in data:
                     cfg[key] = bool(data[key])

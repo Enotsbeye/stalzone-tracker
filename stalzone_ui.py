@@ -204,6 +204,7 @@ table.craft th:nth-child(-n+2),table.craft td:nth-child(-n+2){text-align:left}
 table.craft tr.loss{opacity:.6}
 .noprice{color:var(--faint)}
 .tag.bad{color:var(--bad);background:var(--bad-soft)}
+.tag.excl{color:var(--amber-ink);background:var(--amber)}
 .warncard{border-color:color-mix(in srgb,var(--bad) 45%,var(--line))}
 .warncard h3{color:var(--bad)}
 .nr.gone .n{text-decoration:line-through}
@@ -592,6 +593,8 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="row" id="demoRow"><label>Демо-режим<small>Тестовые данные EXBO, ключи не нужны</small></label><label class="switch"><input type="checkbox" id="sDemo"><i></i></label></div>
           <div class="row wide"><label>Client ID</label><input class="field" id="sClientId" autocomplete="off"></div>
           <div class="row wide"><label>Client Secret</label><input class="field" id="sClientSecret" type="password" autocomplete="off"></div>
+          <div class="row wide"><label>Ещё ключи API<small>необязательно: по одному в строке — Client ID, пробел, Client Secret. Запросы делятся между ключами, каждый добавляет 400 в минуту. Сохранённые секреты показаны точками.</small></label><textarea class="field code" id="sKeys" placeholder="4729 секрет&#10;4730 секрет" autocomplete="off" spellcheck="false"></textarea></div>
+          <div class="muted small" id="keysInfo"></div>
           <div class="linkrow"><button class="btn" data-open="api_bot">Получить доступ</button><button class="btn" data-open="docs">Документация</button></div>
         </div>
         <div class="card">
@@ -947,6 +950,7 @@ function dealTags(d, now) {
   return (d.kind === "bid" ? `<span class="tag bid">Ставка</span>` : "")
     + (d.rare ? `<span class="tag rare">💎 редкий</span>` : "")
     + (fresh ? `<span class="tag fresh">новое</span>` : "")
+    + (d.only_you_until && d.only_you_until > now && !d.gone ? `<span class="tag excl" title="Сервер отдал эту находку сначала тебе — потом её увидят все">🎯 только тебе ещё ${Math.max(1, Math.ceil((d.only_you_until - now) / 60))} мин</span>` : "")
     + fateTag(d)
     + (d.stale && !d.gone ? `<span class="tag stale" title="${esc(d.stale)}">давно висит</span>` : "");
 }
@@ -1506,6 +1510,7 @@ $("crFetch").onclick = async () => { const r = await api("/api/craft/fetch", {on
 function fillForm() {
   const c = S.settings;
   $("sDemo").checked = S.demo; $("sClientId").value = c.client_id || ""; $("sClientSecret").value = c.client_secret || "";
+  $("sKeys").value = (c.extra_keys || []).map((k) => `${k.id} ${"•".repeat(10)}`).join("\n");
   $("sDiscount").value = Math.round(c.discount * 100); $("sMinProfit").value = Math.round(c.min_profit);
   $("sTgToken").value = c.telegram_token || ""; $("sTgChat").value = c.telegram_chat_id || ""; $("sSound").checked = store.get("sound", true);
   $("appVer").textContent = S.version || ""; $("dataDir").textContent = S.data_dir || "";
@@ -1514,7 +1519,7 @@ function fillForm() {
   $("sTheme").value = store.get("theme", "system");
   $("sAutostart").checked = !!c.autostart;
 }
-document.querySelectorAll("#view-settings input, #view-settings select").forEach((el) => el.addEventListener("input", () => {
+document.querySelectorAll("#view-settings input, #view-settings select, #view-settings textarea").forEach((el) => el.addEventListener("input", () => {
   if (el.id === "sTheme" || el.id === "sSound") return;
   formDirty = true; $("saveHint").textContent = "Есть несохранённые изменения";
 }));
@@ -1535,6 +1540,7 @@ $("saveBtn").onclick = async () => {
   const num = (id) => $(id).value.replace(/\s/g, "").replace(",", ".");
   const r = await api("/api/settings", {
     demo: $("sDemo").checked, client_id: $("sClientId").value, client_secret: $("sClientSecret").value,
+    extra_keys: $("sKeys").value.split("\n"),
     discount_pct: num("sDiscount"), min_profit: num("sMinProfit"),
     telegram_token: $("sTgToken").value, telegram_chat_id: $("sTgChat").value,
     rare_enabled: $("sRare").checked, rare_quality: $("sRareQ").value, rare_min_profit: num("sRareProfit"),
@@ -1633,6 +1639,7 @@ function renderAccess() {
     $("funnelCmd").textContent = "tailscale funnel --bg " + (sv.port || 8790);
     $("srvStatus").innerHTML = !sv.enabled ? "Выключен. Подписчики не получают находки."
       : sv.running ? `Работает на этом компьютере (порт ${sv.port}). Подписчиков онлайн: <b>${sv.online}</b> · в ленте находок: <b>${sv.feed}</b>`
+        + `<br>Подписчики выбирают предметы сами — сервер проверяет и их${sv.sub_items ? ` (ещё <b>${sv.sub_items}</b>${(sv.sub_cats || []).length ? " и категории целиком" : ""})` : ""}. Каждая новая находка — сначала одному подписчику на 2 минуты, по очереди, потом всем.`
         + (S.status.running ? "" : `<br><b style="color:var(--amber-text)">Нажми «Начать поиск» — без проверки аукциона лента пустая.</b>`)
         + (sv.url ? "" : `<br><b style="color:var(--amber-text)">Впиши публичный адрес — без него подписчики не найдут сервер.</b>`)
       : `Не запустился: ${esc(sv.error || "")}`;
@@ -1658,6 +1665,12 @@ function renderAccess() {
   $("feedNote").hidden = !sub; $("subItemsNote").hidden = !sub;
 }
 
+function renderKeys() {
+  const st = (S && S.status) || {}, n = (S.settings.extra_keys || []).length;
+  $("keysInfo").textContent = !n ? "" : st.keys_total
+    ? `Ключей в работе: ${st.keys} из ${st.keys_total}` + (st.keys < st.keys_total ? " — какой-то EXBO не пустила, смотри «Журнал»" : " — до " + (st.keys * 380) + " запросов в минуту")
+    : `Ещё ключей: ${n} — заработают после «Начать поиск»`;
+}
 function keyLoad() {
   const st = (S && S.status) || {}, o = st.key_others, lim = st.key_limit || 400;
   return o != null && o >= lim * 0.1 ? {others: Math.round(o), limit: lim} : null;
@@ -1722,7 +1735,7 @@ async function refresh() {
   if (!firstLoad && loud.length) { beep(loud.some((d) => d.rare)); loud.slice(0, 3).forEach(notifyDesktop); }
   if (firstLoad || !formDirty) fillForm();
   if (!CAT) loadCatalog();
-  renderStatus(); renderDeals(); renderNear(); renderChips(); renderPurchases(); renderAccuracy(); renderAccess();
+  renderStatus(); renderDeals(); renderNear(); renderChips(); renderPurchases(); renderAccuracy(); renderAccess(); renderKeys();
   if (view === "items" && Date.now() - (loadYield.at || 0) > 300000) loadYield();
   if (view === "craft" && Date.now() - (loadCraft.at || 0) > (S.status.craft_left ? 20000 : 120000)) loadCraft();
   firstLoad = false;
