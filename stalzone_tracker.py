@@ -19,6 +19,7 @@ STALZONE — трекер лотов ниже рынка.
 """
 
 import argparse
+import bisect
 import json
 import logging
 import math
@@ -84,7 +85,7 @@ CONFIG = {
     "history_refresh_minutes": 10,  # как часто докачивать новые сделки
     "history_keep_days": 14,  # сколько дней хранить сделки в своей базе (market.db)
 
-    "poll_minutes": 1,      # как часто проверять лоты (новый проход — не раньше, чем через столько минут)
+    "poll_minutes": 0,      # пауза между проходами в минутах; 0 — проверять без остановки (быстрее всего)
 
     # Режим ставок: лоты, которые скоро заканчиваются, а текущая ставка
     # сильно ниже рынка. Тут задержка API почти не мешает — лоты висят часами.
@@ -112,9 +113,9 @@ LOT_PAGES = 5                # страниц лотов по 100 на пред�
 UNDERCUT = 0.99              # чтобы продать, ставишь чуть дешевле самого дешёвого конкурента
 STALE_MINUTES = 60           # лот висит дольше и его не купили — вероятно, есть подвох
 LONG_DAYS = 7                # если за history_hours сделок мало — смотрим столько дней из своей базы
-FETCH_THREADS = 6            # столько запросов к API могут идти одновременно
-FETCH_AHEAD = 12             # на сколько предметов вперёд заранее запрашивать данные
-RATE_SHARE = 0.85            # какую долю лимита API тратить (остальное — запас)
+FETCH_THREADS = 10           # столько запросов к API могут идти одновременно (темп всё равно держит Api)
+FETCH_AHEAD = 20             # на сколько предметов вперёд заранее запрашивать данные
+RATE_SHARE = 0.95            # какую долю лимита API тратить: 380 из 400 в минуту (остаток проверяется в каждом ответе)
 SHARE_ON, SHARE_OFF = 0.1, 0.05   # чужих запросов за минуту больше 10% лимита — делим ключ, меньше 5% — нет
 SHARE_SETTLE = 5             # через столько секунд после начала новой минуты лимита считаем прошлую
 SHARE_MIN_SPAN = 40          # минута в счёт, только если мы сами работали в ней столько секунд
@@ -158,6 +159,50 @@ def load_listing(region):
         if ru:
             names[item_id] = ru
     return names
+
+
+def load_icons(region):
+    """Справочник id → путь к картинке предмета в базе EXBO (например, /icons/artefact/…/9nd0.png)."""
+    icons = {}
+    for it in _listing(region):
+        item_id, _ = _id_and_name(it)
+        if it.get("icon"):
+            icons[item_id] = str(it["icon"])
+    return icons
+
+
+def _grade_rows(con, region, item_id, grade, since):
+    """Сделки предмета с since: для артефакта — того же качества и заточки от −4 до той же (как market_for)."""
+    for ts, amount, price, qlt, ptn in con.execute(
+            "SELECT ts, amount, price, qlt, ptn FROM sales WHERE region = ? AND item_id = ? AND ts >= ?",
+            (region, item_id, since)):
+        if amount <= 0 or price <= 0:
+            continue
+        if grade is None:
+            if qlt != -1:
+                continue
+        elif qlt != grade[0] or not grade[1] - 4 <= ptn <= grade[1]:
+            continue
+        yield ts, amount, price
+
+
+def price_series(con, region, item_id, grade=None, days=7, step_h=12, now=None):
+    """Цена за штуку по отрезкам (для графика в карточке находки): [(начало, медиана, сделок)]."""
+    now = now or time.time()
+    since = now - days * 86400
+    buckets = {}
+    for ts, amount, price in _grade_rows(con, region, item_id, grade, since):
+        buckets.setdefault(int((ts - since) // (step_h * 3600)), []).append((price / amount, amount))
+    return [(since + k * step_h * 3600, weighted_median(v), len(v)) for k, v in sorted(buckets.items())]
+
+
+def hour_profile(con, region, item_id, grade=None, days=14, now=None):
+    """Сколько сделок было в каждый час суток (по часам этого компьютера) — когда предмет покупают."""
+    now = now or time.time()
+    counts = [0] * 24
+    for ts, _, _ in _grade_rows(con, region, item_id, grade, now - days * 86400):
+        counts[time.localtime(ts).tm_hour] += 1
+    return counts
 
 
 def load_artifacts(region):
@@ -359,6 +404,10 @@ class Api:
         self.client_id = str(cfg.get("client_id") or "").strip()
         self.client_secret = str(cfg.get("client_secret") or "").strip()
         self.app_token = str(cfg.get("app_token") or "").strip()
+        self.share_hint = str(cfg.get("share_hint") or "")   # кто ещё, скорее всего, пользуется ключом
+        # делить лимит, только если ключ дали другим программам сами (коды доступа с ключом). Иначе чужие
+        # запросы — повод сменить секрет, а не замедляться: от лишнего лимит и так бережёт _respect_ratelimit
+        self.share_expected = bool(cfg.get("share_expected"))
         self.s = requests.Session()
         # запросы идут из нескольких потоков — пул соединений побольше
         self.s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=FETCH_THREADS + 4))
@@ -591,18 +640,26 @@ class Api:
                     self.sharing = False
             others = last[-1] if last else 0
             budget = limit * RATE_SHARE
-            if self.sharing:
+            expected = getattr(self, "share_expected", True)
+            if self.sharing and expected:
                 want = max(limit * 0.1, min(budget - others, budget / 2))
                 target = (60 / self.min_gap + want) / 2
             else:
                 target = budget
             self.min_gap = max(self.base_gap or 0.15, 60 / target)
-        if self.sharing != was:
+            say_unknown = self.sharing and not was and not expected and not getattr(self, "_share_said", False)
+            if say_unknown:
+                self._share_said = True
+        if self.sharing != was and expected:
             if self.sharing:
-                log.info("Ключ API сейчас использует ещё кто-то (~%.0f запр./мин) — делю лимит, "
-                         "проверки станут медленнее", others)
+                log.info("Ключ API сейчас использует ещё кто-то (~%.0f запр./мин)%s — делю лимит, "
+                         "проверки станут медленнее", others, getattr(self, "share_hint", ""))
             else:
                 log.info("Ключ API снова только у этой программы — проверяю в полную скорость")
+        elif say_unknown:
+            log.info("Сервер EXBO насчитал на твоём ключе ~%.0f запр./мин сверх запросов этой программы. "
+                     "Скорость не снижаю. Если ключ знает кто-то ещё — вторая копия трекера или сайт, где ты "
+                     "вводил Client ID и Secret, — смени Client Secret в @stalzone_api_bot", others)
 
     def _respect_ratelimit(self, r):
         """Если лимит почти исчерпан — все потоки ждут до его сброса."""
@@ -635,6 +692,26 @@ class Api:
         return self.get(f"{region}/auction/{item_id}/lots", {
             "limit": 100, "offset": 0, "sort": sort, "order": order, "additional": "true",
         }).get("lots", [])
+
+    def lots_top(self, region, item_id, min_buyouts=20, max_pages=LOT_PAGES):
+        """Самые дешёвые лоты предмета — для поиска выгодных этого достаточно: первая страница (100 шт.),
+        следующая — только если на ней почти нет лотов с выкупом. Раньше на каждый популярный предмет
+        качалось до 5 страниц, и это была половина всех запросов прохода. Список полный для всех лотов
+        дешевле последнего на странице (lots_cap)."""
+        out = []
+        for page in range(max_pages):
+            data = self.get(f"{region}/auction/{item_id}/lots", {
+                "limit": 100, "offset": page * 100, "sort": "buyout_price", "order": "asc",
+                "additional": "true",
+            })
+            lots = data.get("lots", [])
+            out.extend(lots)
+            total = int(_num(data.get("total")))
+            if len(lots) < 100 or (total and len(out) >= total):
+                break
+            if sum(1 for lot in out if _num(lot.get("buyoutPrice")) > 0) >= min_buyouts:
+                break
+        return out
 
     def lots_all(self, region, item_id, max_pages=LOT_PAGES):
         """Все лоты предмета (до max_pages × 100), от дешёвого выкупа к дорогому.
@@ -1013,6 +1090,15 @@ CHANCE_HOURS = 24   # шанс продать за сутки
 CHANCE_CAP = 0.9    # наверняка не бывает: API не знает, сколько людей хотят купить
 OBSERVED_TRUST = 10  # после стольких своих наблюдений лотов формула и наблюдения весят поровну
 VISIBILITY = 0.6     # не каждый покупатель берёт самый дешёвый лот: ставки, другое количество, перебивают цену
+# Шанс по наблюдениям: лоты, за которыми трекер следил сам, по корзинам «цена к рынку × ходовость предмета»
+RATIO_BINS = (0.0, 0.9, 0.97, 1.03, 1.1, 1.25, 1.6)   # цена лота за штуку / рыночная
+LIQ_BINS = (0.0, 3.0, 15.0, 60.0)                       # сделок предмета в сутки
+RATES_TRUST_H = 48   # столько часов наблюдений в корзине весят столько же, сколько формула
+
+
+def rate_bin(x, edges):
+    """Номер корзины: последняя граница, не больше x."""
+    return max(0, bisect.bisect_right(edges, x) - 1)
 
 
 def poisson_at_least(lam, k):
@@ -1046,7 +1132,7 @@ def liquidity_label(days):
 
 
 def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, hours=CHANCE_HOURS,
-                supply=None, observed=None):
+                supply=None, observed=None, rates=None):
     """Примерный шанс продать лот за hours часов по цене price за штуку. Своя формула, не знание.
     Строгая («сердитая») оценка. Покупатели приходят случайно (пуассоновский поток) с частотой прошлых
     сделок этой корзины, и она
@@ -1058,8 +1144,10 @@ def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, ho
         запас больше полусуток — продавцы перебивают цену друг друга, шанс ниже,
       × тренд (рынок за сутки упал на 10% — ×0,75) и «давно висит» (лот час никто не купил даже со скидкой).
     Чтобы продать amount штук, нужно ~amount / (обычный размер сделки) покупателей.
-    observed — (продано за сутки, всего) по лотам, за которыми трекер следил сам: чем их больше,
-    тем сильнее итог опирается на них, а не на формулу.
+    observed — (продано за сутки, всего) по лотам этого предмета, за которыми трекер следил сам.
+    rates — (продано, часов наблюдения) у похожих лотов всех предметов: та же цена относительно рынка,
+    такая же ходовость предмета. Это главное: шанс = 1 − e^(−продаж_в_час × 24) с поправкой на размер лота,
+    тренд, «давно висит» и лишних конкурентов. Чем больше часов наблюдения, тем меньше вес формулы.
     Возвращает {chance 0…1, hours — ожидаемое время продажи, week — шанс за неделю, …} или None."""
     if not pairs or price <= 0 or amount <= 0:
         return None
@@ -1089,6 +1177,16 @@ def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, ho
         seen = ((sold + 0.5) / (total + 1)) ** need             # доля лотов, проданных за сутки
         weight = total / (total + OBSERVED_TRUST)
         chance = weight * seen + (1 - weight) * model
+    data = None
+    if rates and float(rates[1]) > 0:
+        sold_n, seen_h = float(rates[0]), float(rates[1])
+        per_hour = (sold_n + 0.5) / (seen_h + 1.0)                 # продаж на час, что лот был на виду
+        per_hour *= trend_f * stale_f / (1 + 0.25 * max(0, min(comp, 20) - 1))
+        data_p = poisson_at_least(per_hour * hours, need)          # хватит ли покупателей на весь лот
+        data_w = seen_h / (seen_h + RATES_TRUST_H)
+        chance = data_w * data_p + (1 - data_w) * chance
+        weight = max(weight, data_w)
+        data = {"sold": int(sold_n), "hours": seen_h, "per_hour": per_hour, "p": data_p, "weight": data_w}
     if weight:   # частота покупателей, которая даёт итоговый шанс, — для времени продажи
         rate = _rate_for(min(chance, 0.999), need) * 24 / hours if chance > 0 else 0.0
     return {"chance": min(CHANCE_CAP, max(0.01, chance)),
@@ -1097,7 +1195,8 @@ def sale_chance(price, amount, pairs, window_h, comp=0, trend=None, age=None, ho
             "per_day": per_day, "confidence": confidence, "share": share, "size": size, "need": need,
             "comp": comp, "supply": None if supply is None else int(supply), "supply_days": supply_days,
             "liq_f": liq_f, "trend_f": trend_f, "stale_f": stale_f, "model": model,
-            "observed": [int(observed[0]), int(observed[1])] if observed else None, "weight": weight}
+            "observed": [int(observed[0]), int(observed[1])] if observed else None, "weight": weight,
+            "data": data}
 
 
 def chance_label(c):
@@ -1217,6 +1316,15 @@ def range_keys(market):
 def main_bucket(market):
     """Обычный предмет — корзина None; у артефактов — самая торгуемая связка качество+заточка."""
     return None if None in market else max(range_keys(market), key=lambda k: market[k][1])
+
+
+def lots_cap(lots, page=100):
+    """Ниже какой цены выкупа список лотов полный. Лоты приходят от дешёвых к дорогим страницами по 100:
+    последняя страница неполная — видны все лоты; полная — видны все, что дешевле последнего на ней."""
+    if not lots or len(lots) % page:
+        return math.inf
+    prices = [_num(lot.get("buyoutPrice")) for lot in lots if _num(lot.get("buyoutPrice")) > 0]
+    return max(prices) if prices else 0.0
 
 
 def lot_units(lots, bucket, total_lots):
@@ -1403,10 +1511,13 @@ class MarketDB:
             "AND ts >= ? LIMIT 1", (region, item_id, int(amount), float(price), float(since_ts))).fetchone()
         return row is not None
 
-    def observe_lots(self, region, item_id, lots, ratio_fn=lambda lot: None, now=None):
+    def observe_lots(self, region, item_id, lots, ratio_fn=lambda lot: None, now=None, cap=math.inf):
         """Запомнить лоты этой проверки; пропавшие разобрать: в истории есть сделка ровно на лот — продан,
-        вышло время — истёк, иначе через 2 часа — снят продавцом."""
+        вышло время — истёк, иначе через 2 часа — снят продавцом.
+        cap — ниже какой цены список полный (lots_cap): лот дороже мог просто не попасть на страницу,
+        его пропавшим не считаем."""
         now = now or time.time()
+        cap = math.inf if cap is None else cap
         rows = []
         for lot in lots:
             amount, price = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
@@ -1431,7 +1542,8 @@ class MarketDB:
                 "UPDATE lots SET last_seen = ?, gone_ts = NULL WHERE region = ? AND item_id = ? AND lot_key = ? "
                 "AND outcome IS NULL", [(now, region, item_id, r[2]) for r in rows])
             self.con.execute("UPDATE lots SET gone_ts = ? WHERE region = ? AND item_id = ? AND outcome IS NULL "
-                             "AND gone_ts IS NULL AND last_seen < ?", (now, region, item_id, now))
+                             "AND gone_ts IS NULL AND last_seen < ? AND price < ?",
+                             (now, region, item_id, now, cap if cap < math.inf else 1e300))
             pending = self.con.execute(
                 "SELECT lot_key, start_ts, end_ts, amount, price, gone_ts FROM lots WHERE region = ? AND item_id = ? "
                 "AND outcome IS NULL AND gone_ts IS NOT NULL", (region, item_id)).fetchall()
@@ -1449,6 +1561,38 @@ class MarketDB:
                     continue
                 self.con.execute("UPDATE lots SET outcome = ?, sold_ts = ? WHERE region = ? AND item_id = ? "
                                  "AND lot_key = ?", (outcome, sold, region, item_id, key))
+
+    def sale_rates(self, region, now=None, days=7):
+        """Как быстро продаются лоты на твоём рынке — по лотам, за которыми трекер следил сам.
+        Корзины: (цена лота к рынку, ходовость предмета) → (продано, часов, что лоты были на виду).
+        Возвращает (корзины, {item_id: сделок в сутки})."""
+        now = now or time.time()
+        since = now - days * 86400
+        cov = dict(self.con.execute("SELECT item_id, covered_from FROM coverage WHERE region = ?", (region,)))
+        liq = {}
+        for item, n in self.con.execute(
+                "SELECT item_id, COUNT(*) FROM sales WHERE region = ? AND ts >= ? GROUP BY item_id", (region, since)):
+            start = max(since, cov.get(item, since))
+            liq[item] = n / max(0.5, (now - start) / 86400)
+        table = {}
+        for item, ratio, first, last, gone, outcome in self.con.execute(
+                "SELECT item_id, ratio, first_seen, last_seen, gone_ts, outcome FROM lots "
+                "WHERE region = ? AND last_seen >= ? AND ratio BETWEEN 0.3 AND 3", (region, since)):
+            seen_h = max(0.0, ((gone or last) - first) / 3600)
+            if seen_h <= 0 and outcome != "sold":
+                continue
+            key = (rate_bin(ratio, RATIO_BINS), rate_bin(liq.get(item, 0.0), LIQ_BINS))
+            sold, hours = table.get(key, (0, 0.0))
+            table[key] = (sold + (outcome == "sold"), hours + seen_h)
+        return table, liq
+
+    def new_lot_rates(self, region, hours=6, now=None):
+        """Сколько новых лотов в час появлялось у каждого предмета за последние hours часов — где
+        выгодные лоты появляются чаще, туда и смотреть чаще."""
+        now = now or time.time()
+        return {item: n / hours for item, n in self.con.execute(
+            "SELECT item_id, COUNT(*) FROM lots WHERE region = ? AND first_seen >= ? GROUP BY item_id",
+            (region, now - hours * 3600))}
 
     def lot_outcomes(self, region, item_id, grade=None, now=None, days=7, max_ratio=1.05):
         """(продано за сутки, всего) среди лотов, выставленных не дороже рынка (до +5%), той же корзины.
@@ -1474,7 +1618,7 @@ class MarketDB:
                 total += 1
             elif outcome == "removed":
                 total += (gone - start) >= 86400
-            elif gone is None and now - start >= 86400:
+            elif gone is None and last - start >= 86400:   # сами видели, что висит дольше суток
                 total += 1
         return sold, total
 
@@ -1531,6 +1675,8 @@ class Scanner:
         self.priced, self.unpriced = set(), set()  # для сводки по автодобавленным
         self.quiet_label = "Все артефакты"
         self.fields_logged = set()   # какие наборы полей лотов уже описали в журнале
+        self.last_cap = {}           # item_id -> ниже какой цены последний список лотов полный
+        self._rates, self._rates_at = ({}, {}), 0.0   # как быстро продаются похожие лоты (раз в 20 мин)
 
     def summary(self):
         """Строка-сводка по автодобавленным артефактам (или None, если их нет)."""
@@ -1570,6 +1716,25 @@ class Scanner:
         # лоты нужны, если рынок есть или станет известен после обновления истории
         return {"hist": need_hist, "stop": stop, "lots": need_hist or bool(cached and cached[1])}
 
+    def rates_for(self, item_id, price, hist):
+        """(продано, часов на виду) у похожих лотов: та же цена к рынку, такой же ходовости предмет."""
+        if self.db is None or not hist or price <= 0:
+            return None
+        now = time.time()
+        if now - self._rates_at > 1200:
+            try:
+                self._rates = self.db.sale_rates(self.cfg["region"], now=now)
+            except sqlite3.Error:
+                self._rates = ({}, {})
+            self._rates_at = now
+        table, liq = self._rates
+        return table.get((rate_bin(price / hist, RATIO_BINS), rate_bin(liq.get(item_id, 0.0), LIQ_BINS)))
+
+    def _lots(self, region, item_id):
+        """Самые дешёвые лоты (lots_top); у подставных API в проверках — все (lots_all)."""
+        top = getattr(self.api, "lots_top", None)
+        return top(region, item_id) if top else self.api.lots_all(region, item_id)
+
     def fetch(self, item_id, plan):
         """Только сеть — можно из любого потока. Ошибку не бросает, а кладёт в результат."""
         cfg, out = self.cfg, {}
@@ -1581,7 +1746,7 @@ class Scanner:
                     since = datetime.now(timezone.utc) - timedelta(hours=cfg["history_hours"])
                     out["hist_list"] = self.api.history(cfg["region"], item_id, since)
             if plan["lots"]:
-                out["lots"] = self.api.lots_all(cfg["region"], item_id)
+                out["lots"] = self._lots(cfg["region"], item_id)
         except Exception as e:  # разберёт главный поток
             out["error"] = e
         return out
@@ -1645,8 +1810,9 @@ class Scanner:
             self.priced.add(item_id)
             self.unpriced.discard(item_id)
         if raw is None:  # рынок появился, а лоты не запрашивали — заберём их сейчас
-            raw = self.api.lots_all(cfg["region"], item_id)
-        lots = {lot_key(item_id, lot): lot for lot in raw}  # все лоты: по ним видна реальная цена продажи
+            raw = self._lots(cfg["region"], item_id)
+        cap = lots_cap(raw)    # ниже этой цены видны все лоты
+        lots = {lot_key(item_id, lot): lot for lot in raw}  # по лотам видна реальная цена продажи
         lot_list = list(lots.values())
         if len(self.fields_logged) < 6:  # какие поля API присылает у лотов — пригодится для точности
             keys = tuple(sorted({str(k) for lot in lot_list if isinstance(lot.get("additional"), dict)
@@ -1659,14 +1825,14 @@ class Scanner:
         if item_id not in self.described and not quiet:
             self.described.add(item_id)
             log.info("%s", describe_market(name, market, lot_list, cfg["history_hours"], total_lots))
-        if self.db is not None and len(lot_list) < LOT_PAGES * 100:   # видны все лоты — следим, какие продаются
+        if self.db is not None:   # следим, какие лоты продаются (там, где список полный — ниже cap)
             def ratio(lot, market=market, total=total_lots):
                 found = market_for(market, lot.get("additional"))
                 amount, raw = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
                 if not found or amount <= 0 or raw <= 0 or not found[0][0]:
                     return None
                 return (raw / amount if total else raw) / found[0][0]
-            self.db.observe_lots(cfg["region"], item_id, lot_list, ratio)
+            self.db.observe_lots(cfg["region"], item_id, lot_list, ratio, cap=cap)
         factor = price_mismatch(market, lot_list, total_lots)
         if factor:  # находки по такому предмету почти наверняка ложные — молчим
             if item_id not in self.mismatched:
@@ -1676,6 +1842,15 @@ class Scanner:
         # find_min_profit — порог пониже для особо редких (обычные находки приложение отсеет само)
         find_cfg = dict(cfg, min_profit=cfg["find_min_profit"]) if cfg.get("find_min_profit") is not None else cfg
         deals = find_deals(lots.values(), market, find_cfg, total_lots)
+        if deals and cap < math.inf and any(d["floor"] is None for d in deals) and hasattr(self.api, "lots_all"):
+            # редкий случай: у находки (обычно артефакт высокого качества) на первой странице нет лотов
+            # не хуже неё — цену перепродажи не с чем сравнить. Докачиваем остальные страницы.
+            raw = self.api.lots_all(cfg["region"], item_id)
+            cap = lots_cap(raw)
+            lots = {lot_key(item_id, lot): lot for lot in raw}
+            lot_list = list(lots.values())
+            deals = find_deals(lots.values(), market, find_cfg, total_lots)
+        self.last_cap[item_id] = cap
         bids = find_bid_deals(lots.values(), market, cfg, total=total_lots) if cfg.get("bids") else []
         if self.db is not None and (deals or bids):  # тренд: как цена изменилась за сутки
             history = self.db.sales(cfg["region"], item_id, time.time() - LONG_DAYS * 86400)
@@ -1687,12 +1862,23 @@ class Scanner:
             if found:
                 comp = competitors(d["lot"], lot_list, d["market"], total_lots)
                 supply = competitors(d["lot"], lot_list, d["market"], total_lots, spread=0.3)
-                observed = (self.db.lot_outcomes(cfg["region"], item_id, grade_of(d["lot"].get("additional")))
-                            if self.db is not None else None)
                 d["chance"] = sale_chance(d["market"], d["amount"], found[0], found[1], comp, d.get("trend"),
                                           d.get("age") if "unit" in d else None, supply=supply,
-                                          observed=observed if observed and observed[1] else None)
+                                          rates=self.rates_for(item_id, d["market"], d.get("hist") or d["market"]))
         return lots, deals, bids
+
+
+def pass_order(items, heat, share=0.25):
+    """Порядок проверки на один проход. Самые «горячие» предметы (новые лоты появляются чаще всего,
+    heat — новых лотов в час) идут первыми и проверяются ещё раз в середине прохода: новый лот у них
+    виден примерно вдвое быстрее. Остальные — по разу. Без данных о лотах — как в списке."""
+    items = list(items)
+    if len(items) < 8 or not heat:
+        return items
+    base = sorted(items, key=lambda it: -heat.get(it[0], 0))
+    hot = [it for it in base[:max(1, int(len(base) * share))] if heat.get(it[0], 0) > 0]
+    mid = len(base) // 2
+    return base[:mid] + hot + base[mid:]
 
 
 def scan_pass(scanner, items, on_item, should_stop=lambda: False, on_progress=None):
@@ -2260,6 +2446,10 @@ def selftest():
         sold, total = db_l.lot_outcomes("ru", "x", None, now=t0 + 3 * 3600)
         assert (sold, total) == (1, 2), (sold, total)   # a — продан за сутки; c — висит 33 ч; b снят до суток; e дорогой
         assert db_l.lot_outcomes("ru", "x", (3, 15), now=t0) == (0, 0)
+        table, liq = db_l.sale_rates("ru", now=t0 + 3 * 3600)    # a и b — в корзине «цена 0,90–0,97»
+        sold_b, hours_b = table[(rate_bin(0.9, RATIO_BINS), rate_bin(liq["x"], LIQ_BINS))]
+        assert sold_b == 1 and hours_b > 0, table
+        assert db_l.new_lot_rates("ru", now=t0 + 60)["x"] > 0
     finally:
         db_l.close()
         shutil.rmtree(tmp_l, ignore_errors=True)
@@ -2274,12 +2464,13 @@ def selftest():
     sh.base_gap = sh.min_gap = 60 / (400 * RATE_SHARE)
     clock = [1000.0]      # своё время программы: важны только промежутки, часы компьютера не нужны
 
-    def minute(ours, others):
+    def minute(ours, others, api=None):
         """Минута лимита: наши ответы идут всю минуту, чужие запросы сервер считает вперемешку."""
+        api = api or sh
         reset = 1_790_000_000 + 60 * int(clock[0] / 60 + 1)
         for i in range(ours):
             used = min(400, round((i + 1) * (ours + others) / ours))
-            sh._share_pace(_R(400 - used, reset), now=clock[0] + i * 58 / ours)
+            api._share_pace(_R(400 - used, reset), now=clock[0] + i * 58 / ours)
         clock[0] += 60
     for _ in range(3):
         minute(300, 0)                                                  # одни — чужих нет
@@ -2292,6 +2483,36 @@ def selftest():
     assert not sh.sharing and abs(sh.min_gap - sh.base_gap) < 1e-9
     sh._share_pace(_R(10, 1_790_000_000), now=clock[0])                 # запоздалый ответ давней минуты
     assert not sh.sharing
+    # ключ никому не давали, а сервер насчитывает лишнее — не замедляемся, один раз советуем сменить секрет
+    un = Api.__new__(Api)
+    un._lock, un.paced, un.share_expected = threading.Lock(), True, False
+    un._init_share()
+    un.base_gap = un.min_gap = 60 / (400 * RATE_SHARE)
+    said = []
+    catch = logging.Handler()
+    catch.emit = lambda rec: said.append(rec.getMessage())
+    log.addHandler(catch)
+    try:
+        for _ in range(3):
+            minute(250, 45, un)
+        minute(250, 0, un); minute(250, 0, un); minute(250, 50, un); minute(250, 50, un); minute(250, 50, un)
+    finally:
+        log.removeHandler(catch)
+    assert abs(un.min_gap - un.base_gap) < 1e-9, un.min_gap
+    assert sum("Скорость не снижаю" in s for s in said) == 1 and not any("делю лимит" in s for s in said), said
+    # --- шанс по наблюдениям за похожими лотами ---
+    pairs10 = [(100.0, 1)] * 10
+    base = sale_chance(100, 1, pairs10, 24 * 7)["chance"]
+    hot = sale_chance(100, 1, pairs10, 24 * 7, rates=(300, 400))
+    cold = sale_chance(100, 1, pairs10, 24 * 7, rates=(0, 600))
+    assert hot["chance"] > base > cold["chance"] and cold["chance"] < 0.2 and hot["data"]["weight"] > 0.85, (base, hot, cold)
+    assert rate_bin(0.5, RATIO_BINS) == 0 and rate_bin(1.0, RATIO_BINS) == 2 and rate_bin(100, LIQ_BINS) == 3
+    # --- порядок прохода: горячие — дважды ---
+    its = [(f"i{k}", f"П{k}") for k in range(10)]
+    order = pass_order(its, {"i5": 9.0, "i2": 1.0})
+    assert order.count(("i5", "П5")) == 2 and order[0] == ("i5", "П5") and len(order) == 12
+    assert pass_order(its, {}) == its
+    assert lots_cap([{"buyoutPrice": p} for p in range(1, 101)]) == 100 and lots_cap([{"buyoutPrice": 5}]) == math.inf
     # --- категории ---
     assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"
     assert item_category({"data": "/items/other/x.json"}, "Стандартные инструменты") == "tools"

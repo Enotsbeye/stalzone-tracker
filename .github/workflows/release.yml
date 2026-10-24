@@ -56,7 +56,7 @@ jobs:
 
       - name: Архив исходников
         shell: pwsh
-        run: Compress-Archive -Path stalzone_app.py, stalzone_tracker.py, stalzone.ico, build_exe.bat, README.txt -DestinationPath stalzone_source.zip
+        run: Compress-Archive -Path stalzone_app.py, stalzone_tracker.py, stalzone_ui.py, stalzone_fonts.py, FONTS-OFL.txt, stalzone.ico, build_exe.bat, README.txt -DestinationPath stalzone_source.zip
 
       - name: Файлы к выпуску (здесь, вместе с исходниками)
         uses: softprops/action-gh-release@v2
