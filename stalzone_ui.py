@@ -501,12 +501,13 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="card">
             <h3>Категории целиком</h3>
             <div class="sub">Трекер сам проверит все предметы категории, даже если их нет в твоём списке.</div>
+            <div class="catrow all-head"><div><b>Весь аукцион</b><small id="allSub">всё, что продаётся: свой список — каждый проход, остальное — по очереди</small></div><label class="switch"><input type="checkbox" id="sAllMarket"><i></i></label></div>
             <div class="catrow art-head"><div><b>Артефакты</b><small id="artSub">все артефакты из базы игры</small></div><label class="switch"><input type="checkbox" id="sAllArts" data-cat="artefact"><i></i></label></div>
             <div class="catrow"><div><b>Броня</b><small data-cnt="armor"></small></div><label class="switch"><input type="checkbox" data-cat="armor"><i></i></label></div>
             <div class="catrow"><div><b>Оружие</b><small data-cnt="weapon"></small></div><label class="switch"><input type="checkbox" data-cat="weapon"><i></i></label></div>
             <div class="catrow"><div><b>Запчасти</b><small data-cnt="parts"></small></div><label class="switch"><input type="checkbox" data-cat="parts"><i></i></label></div>
             <div class="catrow"><div><b>Инструменты</b><small data-cnt="tools"></small></div><label class="switch"><input type="checkbox" data-cat="tools"><i></i></label></div>
-            <div class="note" id="catNote">Каждый предмет — 1–2 запроса к API за круг (лимит EXBO — 400 в минуту). Чем больше предметов, тем длиннее круг. Цена брони и оружия зависит от заточки — такие находки проверяй в игре.</div>
+            <div class="note" id="catNote">«Весь аукцион» не тормозит твой список: он проверяется каждый проход (~1 мин), остальное — по очереди. Первый обход всего аукциона — около 10 минут (трекер узнаёт цены), дальше быстрее. Цена брони и оружия зависит от заточки — такие находки проверяй в игре.</div>
           </div>
         </div>
       </div>
@@ -1287,7 +1288,11 @@ function renderChips(force) {
     : cats.length ? "Свой список пуст — проверяются только категории целиком." : "Список пуст.";
   $("watchCnt").textContent = list.length ? "· " + list.length : "";
   $("cntItems").textContent = watchTotal() || "";
-  document.querySelectorAll("[data-cat]").forEach((el) => el.checked = cats.includes(el.dataset.cat));
+  const all = !!S.settings.all_market;
+  $("sAllMarket").checked = all;
+  const tradable = Object.values(S.cat_counts || {}).reduce((x, n) => x + n, 0);
+  $("allSub").textContent = tradable ? `все ${tradable.toLocaleString("ru-RU")} предметов, что продаются: свой список — каждый проход, остальное — по очереди` : $("allSub").textContent;
+  document.querySelectorAll("[data-cat]").forEach((el) => { el.checked = all || cats.includes(el.dataset.cat); el.disabled = all; });
   const arts = S.cat_counts.artefact || S.artifacts;
   $("artSub").textContent = arts ? `все ${arts} ${plural(arts, ["артефакт", "артефакта", "артефактов"])} из базы игры` : "все артефакты из базы игры";
   document.querySelectorAll("[data-cnt]").forEach((el) => {
@@ -1296,6 +1301,12 @@ function renderChips(force) {
   });
   if (CAT && view === "items") renderCatalog();
 }
+$("sAllMarket").onchange = async () => {
+  const on = $("sAllMarket").checked;
+  const r = await api("/api/settings", {all_market: on});
+  toast(r.ok ? (on ? "Весь аукцион включён — первый обход займёт дольше: трекер узнаёт цены всех предметов" : "Весь аукцион выключен") : r.message, !r.ok);
+  refresh();
+};
 document.querySelectorAll("[data-cat]").forEach((el) => el.onchange = async () => {
   const cats = [...document.querySelectorAll("[data-cat]")].filter((x) => x.checked).map((x) => x.dataset.cat);
   const r = await api("/api/settings", {auto_categories: cats});
@@ -1643,7 +1654,9 @@ function renderStatus() {
   else h = run ? (near.length ? "По твоим порогам пока ничего — ищу дальше" : "Пока ничего выгодного — ищу дальше") : "Поиск остановлен";
   if (subscriber) sub = !sv ? "Находки придут с сервера владельца после «Начать поиск»." : sv.ok ? `Сервер владельца на связи${sv.server_pass ? ", его последняя проверка " + ago(new Date(sv.server_pass * 1000).toISOString(), S.now) : ""}.` : (sv.error || "Сервер владельца не отвечает.");
   else if (run) {
-    sub = `Проверяю ${items} ${plural(items, ["предмет", "предмета", "предметов"])} по кругу${st.took ? `, круг занимает ~${Math.max(1, Math.round(st.took))} с` : ""}.`;
+    sub = st.coverage
+      ? `Свой список (${st.core}) — каждый проход, ~${Math.max(1, Math.round(st.took))} с; весь аукцион (${(st.auto || 0).toLocaleString("ru-RU")}) обхожу примерно за ${Math.max(1, Math.round(st.coverage))} мин.`
+      : `Проверяю ${items} ${plural(items, ["предмет", "предмета", "предметов"])} по кругу${st.took ? `, круг занимает ~${Math.max(1, Math.round(st.took))} с` : ""}.`;
     if (st.delay !== null && st.delay !== undefined) sub += ` Новые лоты аукцион отдаёт через API примерно через ${Math.max(1, Math.round(st.delay))} мин после выставления — так у всех, кто смотрит через API.`;
     if (!active.length && near.length) sub = `Дешевле рынка есть ${near.length} ${plural(near.length, ["лот", "лота", "лотов"])} с меньшей выгодой, чем в твоих порогах, — смотри «Почти находки» ниже. ` + sub;
   }

@@ -401,7 +401,10 @@ def load_catalog(region):
 
 
 def auto_categories(cfg):
-    """Какие категории проверять целиком (старая галочка «все артефакты» тоже считается)."""
+    """Какие категории проверять целиком (старая галочка «все артефакты» тоже считается).
+    «Весь аукцион» — все категории, всё, что продаётся."""
+    if cfg.get("all_market"):
+        return list(CATEGORY_NAMES)
     cats = [c for c in (cfg.get("auto_categories") or []) if c in AUTO_CATEGORIES]
     if cfg.get("all_artifacts") and "artefact" not in cats:
         cats.insert(0, "artefact")
@@ -422,7 +425,10 @@ def watching_line(items, auto, cats=("artefact",)):
     own = [name for item_id, name in items if item_id not in auto]
     text = "Слежу за: " + (", ".join(own) if own else "—")
     if auto:
-        what = ", ".join(CATEGORY_IN_LINE.get(c, c) for c in cats) or "все артефакты"
+        if set(cats) >= set(CATEGORY_NAMES):
+            what = "весь аукцион"
+        else:
+            what = ", ".join(CATEGORY_IN_LINE.get(c, CATEGORY_NAMES.get(c, c).lower()) for c in cats) or "все артефакты"
         text += f" + {what} ({len(auto)} шт.)"
     return text
 
@@ -520,6 +526,7 @@ class Api:
         self.paced = False
         self.base_gap = None        # темп, когда ключ API использует только эта программа
         self._init_share()
+        self.sent = 0               # сколько запросов отправлено — для расписания «всего аукциона»
         self.bearer = None          # токен от EXBO — только в памяти
         self.oauth_tried = False
         remove_old_token_file()
@@ -633,6 +640,7 @@ class Api:
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
+            self.sent += 1
             self._share_pace(r)          # каждый ответ, и с ошибкой: сервер его тоже посчитал
             self._respect_ratelimit(r)
             if r.status_code in (401, 403):
@@ -1972,6 +1980,7 @@ class Scanner:
         self.quiet_label = "Все артефакты"
         self.fields_logged = set()   # какие наборы полей лотов уже описали в журнале
         self.last_cap = {}           # item_id -> ниже какой цены последний список лотов полный
+        self.liq = {}                # item_id -> сделок в сутки (по своей базе) — как часто обновлять историю
         self._rates, self._rates_at = ({}, {}), 0.0   # как быстро продаются похожие лоты (раз в 20 мин)
 
     def summary(self):
@@ -2005,7 +2014,10 @@ class Scanner:
             return None
         cfg = self.cfg
         cached = self.market_cache.get(item_id)
-        need_hist = not cached or time.time() - cached[0] > cfg["history_refresh_minutes"] * 60
+        refresh = cfg["history_refresh_minutes"] * 60
+        if item_id in self.quiet:    # добавлены целиком: почти не продающиеся — историю реже
+            refresh *= quiet_refresh_factor(self.liq.get(item_id))
+        need_hist = not cached or time.time() - cached[0] > refresh
         stop = None
         if need_hist and self.db is not None:
             stop = self.db.stop_point(cfg["region"], item_id, max(cfg["history_hours"], LONG_DAYS * 24))
@@ -2037,7 +2049,9 @@ class Scanner:
         try:
             if plan["hist"]:
                 if self.db is not None:
-                    out["hist"] = self.api.history_since(cfg["region"], item_id, plan["stop"])
+                    # у добавленных целиком в первый раз — не всю неделю, а последние 300 сделок: быстрее обойти всё
+                    kw = {"max_pages": QUIET_HISTORY_PAGES} if item_id in self.quiet else {}
+                    out["hist"] = self.api.history_since(cfg["region"], item_id, plan["stop"], **kw)
                 else:
                     since = datetime.now(timezone.utc) - timedelta(hours=cfg["history_hours"])
                     out["hist_list"] = self.api.history(cfg["region"], item_id, since)
@@ -2075,6 +2089,7 @@ class Scanner:
         self.db.store(region, item_id, records, how)  # в первый раз — история сразу за неделю (если влезет)
         now = time.time()
         long_sales = self.db.sales(region, item_id, now - long_h * 3600)
+        self.liq[item_id] = len(long_sales) / max(0.5, self.db.window_hours(region, item_id, long_h) / 24)
         recent = [s for s in long_sales if s["ts"] >= now - hours * 3600]
         total = self.fmt.total("history", recent or long_sales, "price", name)
         self.total_hist[item_id] = total
@@ -2162,6 +2177,17 @@ class Scanner:
                                           d.get("age") if "unit" in d else None, supply=supply,
                                           rates=self.rates_for(item_id, d["market"], d.get("hist") or d["market"]))
         return lots, deals, bids
+
+
+QUIET_HISTORY_PAGES = 3      # добавленные целиком: в первый раз — до 300 последних сделок
+
+
+def quiet_refresh_factor(per_day):
+    """Во сколько раз реже обновлять историю у предметов, добавленных целиком: ходовые (от 30 сделок
+    в сутки) — как обычно, средние — раз в 20 минут, редкие — раз в час, почти не продающиеся — раз в 6 часов."""
+    if per_day is None:
+        return 1
+    return 1 if per_day >= 30 else 2 if per_day >= 5 else 6 if per_day >= 1 else 36
 
 
 def pass_order(items, heat, share=0.25):

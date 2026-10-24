@@ -55,7 +55,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -266,6 +266,11 @@ NEAR_MIN_PROFIT = 3000      # …с прибылью от 3 000 ₽, котор�
 NEAR_KEEP = 30 * 60         # «почти находка» видна, пока лот на аукционе, но не дольше получаса без новых проверок
 NEAR_MAX = 40
 QUIET_SUMMARY = 30 * 60     # столько без находок — пишем в журнал, что было отсеяно порогами
+ROTATE_MIN = 40             # «весь аукцион»: столько предметов «целиком» и меньше — обходим все каждый проход
+ROTATE_MAX = 900            # больше за проход не берём
+PASS_TARGET_MIN = 1.0       # проход со своим списком и частью остальных — около минуты
+HOT_HEAT = 3.0              # новых лотов в час — такой предмет из «всего аукциона» проверяем каждый проход
+HOT_MAX = 60
 CRAFT_PER_PASS = 15         # цены для калькулятора крафта: столько предметов за проход (≈ 20–40 запросов в минуту)
 STALL_ALERT = 10 * 60       # поиск идёт, а проходов нет столько секунд — сообщить в Telegram
 
@@ -1240,14 +1245,17 @@ class Worker(threading.Thread):
                 setattr(scanner, attr, self.shared.setdefault(attr, set()))
             first_pass, announce, last_line = True, True, None
             heat, heat_at, acc_at = {}, 0.0, 0.0
+            rotation, per_item, coverage = deque(), 1.5, None   # «весь аукцион»: по частям за проход
             while not self.stop_event.is_set():
                 if self._take_pending():
                     items, auto, hold_ids, cats, scan_cfg = self._plan(names)
                     scanner.cfg, scanner.quiet = scan_cfg, auto | hold_ids
                     announce = True
+                    rotation.clear()
                 if announce:
                     announce = False
-                    scanner.quiet_label = "Все артефакты" if cats == ["artefact"] else "Категории целиком"
+                    scanner.quiet_label = ("Весь аукцион" if self.cfg.get("all_market") else
+                                           "Все артефакты" if cats == ["artefact"] else "Категории целиком")
                     line = (eng.watching_line([x for x in items if x[0] not in hold_ids], auto, cats) if items else
                             "Список предметов пуст — добавь предметы во вкладке «Предметы», проверка продолжится сама")
                     if self.serving:
@@ -1274,7 +1282,25 @@ class Worker(threading.Thread):
                         heat, heat_at = db.new_lot_rates(cfg["region"]), started
                     except Exception:
                         heat, heat_at = {}, started
-                order = eng.pass_order(items, heat)
+                core = [it for it in items if it[0] not in auto]
+                rest = [it for it in items if it[0] in auto]
+                if len(rest) > ROTATE_MIN:
+                    # много предметов «целиком»: свой список и «горячие» — каждый проход, остальные — по очереди,
+                    # столько, чтобы проход занимал около минуты. Так свои предметы не ждут, пока обойдём всё.
+                    hot = sorted((it for it in rest if heat.get(it[0], 0) >= HOT_HEAT),
+                                 key=lambda it: -heat.get(it[0], 0))[:HOT_MAX]
+                    hot_ids = {i for i, _ in hot}
+                    if not rotation:
+                        rotation.extend(sorted((it for it in rest if it[0] not in hot_ids),
+                                               key=lambda it: -heat.get(it[0], 0)))
+                    budget = 60 / max(api.min_gap, 0.005) * PASS_TARGET_MIN
+                    n = int(max(ROTATE_MIN, min(ROTATE_MAX, budget / per_item - len(core) - len(hot))))
+                    chunk = [rotation.popleft() for _ in range(min(n, len(rotation)))]
+                    order = eng.pass_order(core, heat) + hot + chunk
+                    rest_n = len(rest) - len(hot)
+                else:
+                    order, n, rest_n = eng.pass_order(items, heat), None, 0
+                sent_before = getattr(api, "sent", 0)
 
                 def on_progress(i, item_id, name):
                     self.emit("progress", {"text": f"Проверяю {name}", "done": i, "total": len(order)})
@@ -1328,10 +1354,15 @@ class Worker(threading.Thread):
 
                 # сеть — параллельно, обработка — по порядку (см. eng.scan_pass)
                 eng.scan_pass(scanner, order, on_item, self.stop_event.is_set, on_progress)
+                took = time.time() - started
+                cost = (getattr(api, "sent", 0) - sent_before) / max(1, len(order))
+                per_item = min(6.0, max(0.3, 0.6 * per_item + 0.4 * cost)) if order else per_item
+                coverage = (rest_n / max(1, n) * took / 60) if n else None   # за сколько минут обходим всё
                 eng.save_seen(seen)
                 if first_pass and not self.stop_event.is_set() and scanner.summary():
                     self.emit("log", scanner.summary())
-                self.emit("pass", {"time": time.time(), "found": found[0], "took": time.time() - started,
+                self.emit("pass", {"time": time.time(), "found": found[0], "took": took,
+                                   "core": len(core), "auto": len(rest), "coverage": coverage,
                                    "delay": api_delay(fresh_ages),
                                    "delay_min": min(fresh_ages) if fresh_ages else None,
                                    "delay_n": len(fresh_ages),
@@ -2160,7 +2191,8 @@ class State:
                 self.status["progress"] = data
                 self.status["starting"] = False
             elif kind == "pass":
-                self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"))
+                self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"),
+                                   core=data.get("core"), auto=data.get("auto"), coverage=data.get("coverage"))
                 quiet_line = self._quiet_summary(data["time"])
                 if data["delay"] is not None:
                     self.status.update(delay=data["delay"], delay_min=data.get("delay_min"),
@@ -2659,6 +2691,8 @@ class State:
                 cfg["bid_window_minutes"] = min(720, max(5, int(float(data["bid_window_minutes"]))))
             if "bids" in data:
                 cfg["bids"] = bool(data["bids"])
+            if "all_market" in data:
+                cfg["all_market"] = bool(data["all_market"])
             if "all_artifacts" in data:
                 cfg["all_artifacts"] = bool(data["all_artifacts"])
                 cats = [c for c in cfg.get("auto_categories") or [] if c != "artefact"]
