@@ -57,7 +57,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.8"
+APP_VERSION = "2.8.1"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -4108,6 +4108,12 @@ class State:
                 cfg["history_keep_days"] = min(90, max(3, int(float(data["history_keep_days"]))))
             if "bid_window_minutes" in data:
                 cfg["bid_window_minutes"] = min(720, max(5, int(float(data["bid_window_minutes"]))))
+            if "bid_min_left_minutes" in data:
+                cfg["bid_min_left_minutes"] = min(60, max(0, int(float(data["bid_min_left_minutes"]))))
+            if ("bid_window_minutes" in data or "bid_min_left_minutes" in data) and \
+                    cfg.get("bid_min_left_minutes", 3) >= cfg.get("bid_window_minutes", 60):
+                return False, (f"Ставки: «не меньше» ({cfg['bid_min_left_minutes']} мин) должно быть меньше, "
+                               f"чем «сообщать, если меньше» ({cfg['bid_window_minutes']} мин)")
             if "bids" in data:
                 cfg["bids"] = bool(data["bids"])
             if "all_artifacts" in data:

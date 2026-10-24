@@ -581,6 +581,13 @@ textarea.field.code{width:100%;min-height:74px;resize:vertical;font:12.5px/1.4 C
           <div class="row"><label>Минимальная прибыль<small>после комиссии 5%, ₽</small></label><input class="field num" id="sMinProfit" inputmode="numeric"></div>
         </div>
         <div class="card">
+          <h3>Лоты со ставками</h3>
+          <div class="sub">Торги скоро закончатся, а ставка намного ниже рынка. Для них действует минимальная прибыль, а «дешевле рынка» — нет. В сообщении — предельная ставка.</div>
+          <div class="row"><label>Искать лоты со ставками</label><label class="switch"><input type="checkbox" id="sBids"><i></i></label></div>
+          <div class="row"><label>Сообщать, если до конца торгов меньше<small>минут, от 5 до 720</small></label><input class="field num" id="sBidWindow" inputmode="numeric"></div>
+          <div class="row"><label>Но не меньше<small>минут — чтобы не приходило то, что уже не успеть</small></label><input class="field num" id="sBidMin" inputmode="numeric"></div>
+        </div>
+        <div class="card">
           <h3>Надёжность</h3>
           <div class="sub">Пока идёт поиск, компьютер не уснёт (экран гаснуть может). О важном — продано, твой лот перебили, поиск встал, компьютер спал — трекер напишет в Telegram, если он настроен ниже.</div>
           <div class="row"><label>Запускать вместе с Windows<small>окно откроется свёрнутым, поиск начнётся сам</small></label><label class="switch"><input type="checkbox" id="sAutostart"><i></i></label></div>
@@ -1514,6 +1521,7 @@ function fillForm() {
   $("sDemo").checked = S.demo; $("sClientId").value = c.client_id || ""; $("sClientSecret").value = c.client_secret || "";
   $("sKeys").value = (c.extra_keys || []).map((k) => `${k.id} ${"•".repeat(10)}`).join("\n");
   $("sDiscount").value = Math.round(c.discount * 100); $("sMinProfit").value = Math.round(c.min_profit);
+  $("sBids").checked = c.bids !== false; $("sBidWindow").value = c.bid_window_minutes ?? 60; $("sBidMin").value = c.bid_min_left_minutes ?? 3;
   $("sTgToken").value = c.telegram_token || ""; $("sTgChat").value = c.telegram_chat_id || ""; $("sSound").checked = store.get("sound", true);
   $("appVer").textContent = S.version || ""; $("dataDir").textContent = S.data_dir || "";
   $("sRare").checked = c.rare_enabled !== false; $("sRareQ").value = String(c.rare_quality ?? 4);
@@ -1546,6 +1554,7 @@ $("saveBtn").onclick = async () => {
     demo: $("sDemo").checked, client_id: $("sClientId").value, client_secret: $("sClientSecret").value,
     extra_keys: $("sKeys").value.split("\n"),
     discount_pct: num("sDiscount"), min_profit: num("sMinProfit"),
+    bids: $("sBids").checked, bid_window_minutes: num("sBidWindow"), bid_min_left_minutes: num("sBidMin"),
     telegram_token: $("sTgToken").value, telegram_chat_id: $("sTgChat").value,
     rare_enabled: $("sRare").checked, rare_quality: $("sRareQ").value, rare_min_profit: num("sRareProfit"),
     autostart: $("sAutostart").checked, autorun_search: $("sAutostart").checked,
@@ -1894,6 +1903,7 @@ textarea.field.code{font:12px/18px var(--mono);word-break:break-all}
 .unit{position:relative;display:inline-flex}
 .unit .field{width:100%;padding-right:30px}
 .unit i{position:absolute;right:11px;top:6px;font-style:normal;color:var(--text-3);pointer-events:none}
+.unit.wide .field{padding-right:44px}
 .toggle{display:inline-flex;align-items:center;gap:12px;cursor:default;white-space:nowrap}
 .toggle input{position:absolute;opacity:0;width:0;height:0}
 .toggle .tr-st{color:var(--text);min-width:40px;text-align:right}
@@ -2228,6 +2238,7 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
 .tgstate.warn{background:var(--warn-bg);color:var(--text)}
 .tg-help{margin-top:10px}
 .srow .combo select:disabled{opacity:.5}
+.field:disabled{opacity:.5;cursor:default}
 
 /* ---------- журнал ---------- */
 .log{background:var(--card);border:1px solid var(--stroke);border-radius:8px;padding:8px 0;font-size:13px;line-height:20px}
@@ -2458,6 +2469,15 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
             <div class="group"><h2>Что считать находкой</h2>
               <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M5 15 15 5"/><circle cx="6" cy="6" r="2"/><circle cx="14" cy="14" r="2"/></svg><div class="tx"><div>Дешевле рынка минимум на</div><small>Лот дороже — не находка</small></div><div class="ctl"><span class="unit"><input class="field num" id="sDiscount" inputmode="numeric"><i>%</i></span></div></div>
               <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="5" width="15" height="10" rx="1.5"/><circle cx="10" cy="10" r="2.2"/></svg><div class="tx"><div>Минимальная прибыль</div><small>После комиссии аукциона 5%</small></div><div class="ctl"><span class="unit"><input class="field num" id="sMinProfit" inputmode="numeric"><i>₽</i></span></div></div>
+              <details class="sexp" id="bidExp">
+                <summary><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M5.5 2.5h9M5.5 17.5h9M6.5 2.5c0 4.5 7 4.5 7 7.5s-7 3-7 7.5M13.5 2.5c0 4.5-7 4.5-7 7.5s7 3 7 7.5"/></svg><div class="tx" style="flex:1;min-width:0"><div>Лоты со ставками</div><small class="muted" id="bidSum"></small></div><svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></summary>
+                <div class="inner">
+                  <div class="srow"><div class="tx"><div>Искать лоты со ставками</div><small>Торги скоро закончатся, а ставка намного ниже рынка. Ставку делаешь сам в игре</small></div><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sBids"><i></i></label></div>
+                  <div class="srow"><div class="tx"><div>Сообщать, если до конца торгов меньше</div><small>От 5 до 720 минут</small></div><span class="unit wide" style="width:130px"><input class="field num" id="sBidWindow" inputmode="numeric"><i>мин</i></span></div>
+                  <div class="srow"><div class="tx"><div>Но не меньше</div><small>Чтобы не приходило то, что уже не успеть</small></div><span class="unit wide" style="width:130px"><input class="field num" id="sBidMin" inputmode="numeric"><i>мин</i></span></div>
+                  <div class="small faint" style="margin-top:6px">Для ставок действует «Минимальная прибыль», а «Дешевле рынка» — нет. В сообщении о находке — предельная ставка: выше неё прибыль будет меньше минимальной.</div>
+                </div>
+              </details>
             </div>
 
             <div class="group"><h2>Вид</h2>
@@ -3677,6 +3697,10 @@ function fillForm() {
   setVal("sDemo", S.demo); setVal("sClientId", c.client_id || ""); setVal("sClientSecret", c.client_secret || "");
   if (document.activeElement !== $("sKeys") && !$("sKeys").dataset.bad) $("sKeys").value = (c.extra_keys || []).map((k) => `${k.id} ${"•".repeat(10)}`).join("\n");
   setVal("sDiscount", Math.round(c.discount * 100)); setVal("sMinProfit", rubN(c.min_profit));
+  const bidsOn = c.bids !== false, bw = c.bid_window_minutes ?? 60, bm = c.bid_min_left_minutes ?? 3;
+  setVal("sBids", bidsOn); setVal("sBidWindow", bw); setVal("sBidMin", bm);
+  $("sBidWindow").disabled = $("sBidMin").disabled = !bidsOn;
+  $("bidSum").textContent = bidsOn ? `Торги заканчиваются через ${bm}–${bw} мин, ставка ниже рынка` : "Выключено";
   setVal("sTgToken", c.telegram_token || ""); setVal("sTgChat", c.telegram_chat_id || "");
   setVal("sTgControl", c.tg_control !== false); setVal("sTgPhoto", c.tg_photo !== false); setVal("sTgQuiet", !!c.tg_quiet);
   setVal("sTgQFrom", String(c.tg_quiet_from ?? 0)); setVal("sTgQTo", String(c.tg_quiet_to ?? 8));
@@ -3709,6 +3733,9 @@ const num = (v) => String(v).replace(/\s/g, "").replace(",", ".");
 const onChange = (id, fn) => $(id).addEventListener("change", fn);
 onChange("sDiscount", () => saveSetting({discount_pct: num($("sDiscount").value)}, "Сохранено"));
 onChange("sMinProfit", () => saveSetting({min_profit: num($("sMinProfit").value)}, "Сохранено"));
+onChange("sBids", () => saveSetting({bids: $("sBids").checked}, $("sBids").checked ? "Ищу и лоты со ставками" : "Лоты со ставками больше не ищу"));
+onChange("sBidWindow", () => saveSetting({bid_window_minutes: num($("sBidWindow").value)}, "Сохранено", $("sBidWindow")));
+onChange("sBidMin", () => saveSetting({bid_min_left_minutes: num($("sBidMin").value)}, "Сохранено", $("sBidMin")));
 onChange("sDemo", () => saveSetting({demo: $("sDemo").checked}, $("sDemo").checked ? "Демо-режим включён" : "Демо-режим выключен"));
 onChange("sClientId", () => saveSetting({client_id: $("sClientId").value}, "Сохранено — поиск перезапустится с этим ключом"));
 onChange("sClientSecret", () => saveSetting({client_secret: $("sClientSecret").value}, "Сохранено — поиск перезапустится с этим ключом"));
