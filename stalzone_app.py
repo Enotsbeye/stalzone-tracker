@@ -57,7 +57,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.9"
+APP_VERSION = "2.10"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -152,7 +152,9 @@ DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # н�
                 tg_photo=True,             # картинка предмета в сообщении о находке
                 tg_quiet=False, tg_quiet_from=0, tg_quiet_to=8,   # тихие часы: без звука (особо редкие — со звуком)
                 tg_daily=True, tg_daily_hour=23, tg_daily_last="",   # итог дня
-                tg_muted_until=0)          # «тишина» до этого момента
+                tg_muted_until=0,          # «тишина» до этого момента
+                tg_weekly_last="",         # когда отправляли итог недели
+                targets={})                # свои цены: id предмета → «сообщи, если дешевле» (за шт)
 OPEN_LINKS = {
     "api_bot": "https://t.me/stalzone_api_bot",
     "docs": "https://eapi.stalzone.net/overview.html",
@@ -274,7 +276,7 @@ RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region",
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
               "server_url_override", "ui", "theme", "ui_scale", "sound_on", "sound", "sound_rare",
               "sound_volume", "tg_control", "tg_photo", "tg_quiet", "tg_quiet_from", "tg_quiet_to", "tg_daily",
-              "tg_daily_hour", "tg_daily_last", "tg_muted_until", "copy_finds", "hotkey")   # из-за них новый проход не начинаем — просто запомнить
+              "tg_daily_hour", "tg_daily_last", "tg_muted_until", "copy_finds", "hotkey", "tg_weekly_last")   # из-за них новый проход не начинаем — просто запомнить
 UI_MODES = ("new", "old")
 THEMES = ("system", "light", "dark")
 UI_SCALES = ("s", "m", "l")
@@ -311,6 +313,8 @@ def deal_value(rec, cfg):
 def meets_thresholds(rec, cfg, rare):
     """Подходит ли находка под свои пороги: «дешевле рынка на» и минимальная прибыль
     (у особо редких — свой порог прибыли)."""
+    if rec.get("target"):          # своя цена «сообщи, если дешевле» — без порогов скидки и прибыли
+        return True
     min_profit = float(cfg.get("min_profit", 0))
     if rare and cfg.get("rare_enabled", True):
         min_profit = min(min_profit, float(cfg.get("rare_min_profit", min_profit)))
@@ -1272,6 +1276,8 @@ class Worker(threading.Thread):
         self._predicted = set()            # какие лоты уже записаны в сверку прогнозов
         self._undercut = {}                # покупка → самый дешёвый конкурент, о котором уже сообщили
         self._own_seen = set()             # покупки, чей выставленный лот трекер видел на аукционе
+        self._missing, self._missing_said = {}, set()   # свой лот пропал без продажи: с какого момента
+        self._listed_at = {}
 
     def stop(self):
         self.stop_event.set()
@@ -1317,6 +1323,11 @@ class Worker(threading.Thread):
                 have.add(h["item_id"])
                 hold_ids.add(h["item_id"])
                 items.append((h["item_id"], names[h["item_id"]]))
+        for item_id in sorted(cfg.get("targets") or {}):   # предметы со своей ценой — тоже, даже не в списке
+            if item_id in names and item_id not in have:
+                have.add(item_id)
+                hold_ids.add(item_id)
+                items.append((item_id, names[item_id]))
         scan_cfg = dict(cfg)
         if cfg.get("rare_enabled", True):   # редкие ищем со своим (обычно меньшим) порогом прибыли
             scan_cfg["find_min_profit"] = min(cfg["min_profit"], float(cfg.get("rare_min_profit", cfg["min_profit"])))
@@ -1502,8 +1513,8 @@ class Worker(threading.Thread):
                             rare = is_rare(cfg, item_id, name, meta, g[0] if g else None)
                             key = ("bid|" if kind == "bid" else "") + eng.lot_key(item_id, d["lot"])
                             rec, text = self.record(item_id, name, d, kind, key, meta)
-                            if self.serving:
-                                self.emit("feed", rec)
+                            if self.serving:     # своя цена — только своя: подписчикам лот уходит без неё
+                                self.emit("feed", {k: v for k, v in rec.items() if k != "target"})
                             if not meets_thresholds(rec, cfg, rare):
                                 # нашлось по более низкому порогу — в находки не берём, но показываем,
                                 # что отсеяно и почему: «0 находок» не должно быть загадкой
@@ -1592,6 +1603,11 @@ class Worker(threading.Thread):
                 continue
             add = h.get("additional") or {}
             amount = int(h.get("amount", 1) or 1)
+            if self._listed_at.get(h["id"]) != h.get("listed_at"):   # перевыставил — следим за новым лотом
+                self._listed_at[h["id"]] = h.get("listed_at")
+                self._own_seen.discard(h["id"])
+                self._missing.pop(h["id"], None)
+                self._missing_said.discard(h["id"])
             listed = h.get("status") == "listed" and float(h.get("list_price") or 0) > 0
             state = eng.listing_state(lot_list, amount, float(h["list_price"]), add, total) if listed else None
             others = lot_list
@@ -1613,11 +1629,25 @@ class Worker(threading.Thread):
                                           float(h.get("listed_at") or 0) - 60):
                 self._own_seen.discard(h["id"])     # лот пропал, и в истории есть сделка ровно на него — продан
                 h["status"] = "sold"
+                self._missing.pop(h["id"], None)
                 self.emit("holding_sold", {"id": h["id"], "price": float(h["list_price"])})
                 continue
+            # свой лот пропал, а продажи нет: истёк или снят — напомнить перевыставить (не сразу: сделка
+            # в истории может появиться позже, чем лот пропал)
+            if listed and state and not state["own"] and h["id"] in self._own_seen \
+                    and float(h["list_price"]) / amount < cap:
+                gone_for = time.time() - self._missing.setdefault(h["id"], time.time())
+            else:
+                self._missing.pop(h["id"], None)
+                gone_for = 0
+            relist = gone_for > LIST_GONE_S and h["id"] not in self._missing_said
+            if relist:
+                self._missing_said.add(h["id"])
             found = eng.market_for(market, add)
             if not found:
                 self.emit("holding", {"id": h["id"], "market": None, "updated": time.time(), "list_state": state})
+                if relist:
+                    self.emit("holding_missing", {"id": h["id"], "options": []})
                 continue
             hist = found[0][0]
             fake = {"amount": amount, "buyoutPrice": 0, "additional": add}
@@ -1632,6 +1662,8 @@ class Worker(threading.Thread):
                                         rates_fn=lambda p, hist=hist: scanner.rates_for(item_id, p, hist)) if pairs else []
             self.emit("holding", {"id": h["id"], "market": resale, "hist": hist, "floor": floor,
                                   "chance": chance, "options": options, "list_state": state, "updated": time.time()})
+            if relist:
+                self.emit("holding_missing", {"id": h["id"], "options": options})
             if state and state["cheaper"]:
                 self.undercut_alert(h, name, state)
             else:
@@ -1712,6 +1744,9 @@ class Worker(threading.Thread):
             "listed": lot.get("startTime"), "ends": lot.get("endTime"),
             "max_bid": max_bid, "has_bids": d.get("has_bids"),
         }
+        if d.get("target"):
+            rec["target"] = d["target"]
+            text = f"🎯 Дешевле твоей цены {eng.fmt_rub(d['target'])}/шт\n" + text
         return rec, text
 
     def publish(self, rec, text, notify=True, rare=False):
@@ -1720,7 +1755,7 @@ class Worker(threading.Thread):
             text = "💎 ОСОБО РЕДКИЙ\n" + text
         chance = rec.get("chance_info")
         min_chance = float(self.cfg.get("notify_min_chance", 0) or 0) / 100
-        if notify and not rare and chance and chance["chance"] < min_chance:
+        if notify and not rare and not rec.get("target") and chance and chance["chance"] < min_chance:
             notify = False
         d = dict(rec, rare=bool(rare), text=text, notify=notify)
         self.emit("deal", d)          # программа присваивает находке номер — он нужен кнопке «Купил»
@@ -2402,7 +2437,10 @@ TG_COMMANDS = [("status", "Что с поиском сейчас"), ("finds", "�
                ("buys", "Что куплено и за сколько выставить"), ("stop", "Остановить поиск"), ("go", "Начать поиск"),
                ("mute", "Тишина на час (/mute 3 — на 3 часа)"), ("unmute", "Снова присылать находки"),
                ("min", "Минимальная прибыль: /min 20000"), ("radar", "Где ловить руками: бери, если дешевле…"),
+               ("target", "Своя цена: /target Морфин 2000"), ("week", "Итог недели: на чём заработал"),
                ("help", "Что умеет бот")]
+TARGETS_MAX = 50           # своих цен «сообщи, если дешевле»
+LIST_GONE_S = 20 * 60      # свой лот пропал без продажи столько времени — напомнить перевыставить
 RADAR_TTL = 600            # «Радар» пересчитывается раз в 10 минут
 RADAR_DAYS = 7             # по лотам за неделю
 TG_FATE = {"sold": "уже купили", "removed": "лот сняли", "expired": "время вышло"}
@@ -2669,6 +2707,8 @@ class TgBot:
             lines.append(head)
         lines.append(("🔨 " if bid else "🟢 ") + f"<b>{_h(d['name'])}</b>" + (f" · {_h(g)}" if g else "")
                      + (f" · {d['amount']} шт" if many else "") + f" · <b>{_signed(d['profit'])}</b>")
+        if d.get("target"):
+            lines.append(f"🎯 Дешевле твоей цены {_rub(d['target'])}/шт")
         lines.append(f"<code>{_h(d['name'])}</code> — нажми, чтобы скопировать")
         age = minutes_since(d.get("listed")) if not bid else None
         if age is not None and 0 <= age < 24 * 60 and not head:
@@ -2686,7 +2726,8 @@ class TgBot:
             lines.append(f"Купить: <b>{_rub(d['cost'])}</b>" + (f" ({_rub(d['unit'])}/шт)" if many else ""))
         lines.append(f"Продать: ~{_rub(d['resale'])}" + (f" ({_rub(d['market'])}/шт)" if many else "")
                      + f", дешевле рынка на {d.get('pct', 0):.0f}%")
-        lines.append(f"Прибыль: <b>{_signed(d['profit'])}</b> (+{d.get('roi', 0):.0f}% к вложенному)")
+        roi = float(d.get("roi") or 0)
+        lines.append(f"Прибыль: <b>{_signed(d['profit'])}</b> ({'+' if roi >= 0 else '−'}{abs(roi):.0f}% к вложенному)")
         c = d.get("chance")
         lines.append(f"Шанс продать за сутки: {c * 100:.0f}%" + (f", обычно за {_hours(d.get('sell_hours'))}" if d.get("sell_hours") else "")
                      if c is not None else "Шанс продать за сутки: не посчитан")
@@ -2791,6 +2832,9 @@ class TgBot:
             if now.hour == int(cfg.get("tg_daily_hour", 23)) and cfg.get("tg_daily_last") != today:
                 st.update_settings({"tg_daily_last": today})
                 self.send(self.daily_html(), silent=True)
+                if now.weekday() == 6 and cfg.get("tg_weekly_last") != today:     # в воскресенье — и итог недели
+                    st.update_settings({"tg_weekly_last": today})
+                    self.send(self.weekly_html(), silent=True)
 
     def suggest(self, p):
         opts = p.get("options") or []
@@ -2834,6 +2878,39 @@ class TgBot:
         if best:
             out.append(f"Лучшая сделка: {_h(best['name'])} {_signed(float(best.get('profit') or 0))}")
         return "\n".join(out)
+
+    def weekly_html(self):
+        st = self.state
+        now = time.time()
+        t0 = now - 7 * 86400
+        sold, total = self.stats(t0)
+        by = {}
+        for p in sold:
+            x = by.setdefault(p["name"], [0, 0.0])
+            x[0] += 1
+            x[1] += float(p.get("profit") or 0)
+        top = sorted(by.items(), key=lambda kv: -kv[1][1])
+        with st.lock:
+            finds = [dict(d) for d in st.deals if float(d.get("found") or 0) >= t0]
+        bought = [p for p in st.purchases if float(p.get("bought_at") or 0) >= t0]
+        missed = [d for d in finds if d.get("gone") and not d.get("bought")]
+        lines = [f"🗓 <b>Итог недели</b>: <b>{_signed(total)}</b> — {len(sold)} "
+                 f"{plural_ru(len(sold), ('продажа', 'продажи', 'продаж'))}"]
+        if top:
+            lines.append("Больше всего принесли:")
+            for name, (n, prof) in top[:3]:
+                lines.append(f"• {_h(name)}: {_signed(prof)} ({n} {plural_ru(n, ('продажа', 'продажи', 'продаж'))})")
+            worst = [kv for kv in top if kv[1][1] < 0]
+            if worst:
+                lines.append(f"В минус: {_h(worst[-1][0])} {_signed(worst[-1][1][1])} — может, его лучше не брать")
+        lines.append(f"Находок: {len(finds)}, куплено: {len(bought)}"
+                     + (f", ушло мимо: {len(missed)} на {_signed(sum(d.get('profit') or 0 for d in missed))}" if missed else ""))
+        if missed:
+            lines.append("Где такие лоты ловить раньше всех — /radar")
+        acc = st.status.get("accuracy")
+        if acc:
+            lines.append(f"Прогнозы трекера сбываются: {acc['hit'] * 100:.0f}%")
+        return "\n".join(lines)
 
     def daily_html(self):
         t0 = self.day_start()
@@ -3017,6 +3094,22 @@ class TgBot:
             return self.send(self.profit_html())
         if cmd == "radar":
             return self.send(self.radar_html())
+        if cmd == "week":
+            return self.send(self.weekly_html())
+        if cmd in ("target", "targets"):
+            m = re.match(r"^(.*?)\s+(\d[\d\s.,]*|off|нет|0)$", arg, re.I)
+            if not arg or not m:
+                lst = st.targets_list()
+                if not lst:
+                    return self.send("🎯 Своих цен пока нет. Пример: /target Морфин 2000 — сообщу о любом лоте дешевле "
+                                     "2 000 ₽ за шт, даже без скидки к рынку. Убрать: /target Морфин off")
+                return self.send("🎯 <b>Свои цены</b>\n" + "\n".join(
+                    f"<code>{_h(x['name'])}</code> — дешевле {_rub(x['price'])}/шт" for x in lst)
+                    + "\nУбрать: /target Название off")
+            raw = m.group(2).lower()
+            price = 0.0 if raw in ("off", "нет", "0") else float(re.sub(r"[\s ]", "", raw).replace(",", "."))
+            ok, msg = st.set_target(m.group(1), price)
+            return self.send(("" if ok else "⚠ ") + _h(msg))
         if cmd == "buys":
             open_ = [p for p in st.purchases if p.get("status") != "sold"]
             if not open_:
@@ -3268,6 +3361,7 @@ class State:
                         raise ValueError
                     p.update(list_price=price, listed_at=time.time(), status="listed")
                     p.pop("undercut", None)
+                    p.pop("list_missing", None)
                 if data.get("status") in ("holding", "listed", "sold"):
                     p["status"] = data["status"]
                     if data["status"] == "holding":
@@ -3547,7 +3641,7 @@ class State:
                 "Пороги — в «Настройках», такие лоты видно в «Почти находках»")
 
     def emit(self, kind, data):
-        quiet_line = sold_line = None
+        quiet_line = sold_line = missing = None
         with self.lock:
             if kind == "deal":
                 data["id"] = self.next_id
@@ -3667,6 +3761,11 @@ class State:
                         sold_line = (f"Продано: {p['name']} за {eng.fmt_rub(data['price'])} — прибыль "
                                      f"{'+' if p['profit'] >= 0 else '−'}{eng.fmt_rub(abs(p['profit']))} (по истории сделок; "
                                      "если это не ты — нажми «Вернуть» в «Моих покупках»)")
+            elif kind == "holding_missing":   # свой лот пропал с аукциона, а продажи нет
+                for p in self.purchases:
+                    if p["id"] == data["id"] and p.get("status") == "listed":
+                        p["list_missing"] = time.time()
+                        missing = dict(p, options=data.get("options") or p.get("options") or [])
             elif kind == "accuracy":
                 self.status["accuracy"] = data
             elif kind == "craft_progress":
@@ -3681,6 +3780,8 @@ class State:
             self.alert("💰 " + sold_line.split(" (по истории")[0]
                        + f"\nСегодня: {'+' if total_today >= 0 else '−'}{eng.fmt_rub(abs(total_today))}"
                        f" ({len(sold_today)} {plural_ru(len(sold_today), ('продажа', 'продажи', 'продаж'))})")
+        if missing:
+            self.relist_reminder(missing)
         if kind == "log":
             self.add_log(data)
         elif kind == "deal":
@@ -3879,6 +3980,68 @@ class State:
                 self._card_cache[item] = (now, lots)
                 out[item] = lots
         return out, err
+
+    def relist_reminder(self, p):
+        text = (f"🔁 Твой лот пропал с аукциона, а продажи в истории нет — похоже, истёк или снят: {p['name']}"
+                f" (выставлял за {eng.fmt_rub(p['list_price'])}). Перевыстави — или нажми «Продал», если продал.")
+        self.add_log(text.replace("🔁 ", ""))
+        opts = [o for o in p.get("options") or [] if o.get("total")]
+        names = {"fast": "⚡ Быстро", "best": "⭐ Выгодно", "slow": "💰 Дороже"}
+        buttons = [[(f"{names.get(o['key'], '')} {eng.fmt_rub(o['total'])}".strip(), f"list:{p['id']}:{round(o['total'])}")]
+                   for o in opts[:3]]
+        buttons.append([(f"Перевыставил за {eng.fmt_rub(p['list_price'])}", f"list:{p['id']}:{round(float(p['list_price']))}"),
+                        ("💰 Продал", f"sold:{p['id']}")])
+        if not self.cfg.get("alerts", True):
+            return
+        if self.tg.active():
+            self.tg.send_text(text, buttons)
+        else:
+            self.alert(text)
+
+    # --- свои цены «сообщи, если дешевле» ---
+    def find_item(self, q):
+        """Предмет по названию: (id, название) или (None, подсказка)."""
+        names = eng.load_listing(self.cfg.get("region", "ru"))
+        q = str(q or "").strip()
+        if q in names:
+            return q, names[q]
+        nq = eng.norm(q)
+        if len(nq) < 2:
+            return None, "Напиши название предмета"
+        exact = [i for i, n in names.items() if eng.norm(n) == nq]
+        if exact:
+            return exact[0], names[exact[0]]
+        starts = sorted({n: i for i, n in names.items() if eng.norm(n).startswith(nq)}.items())
+        if len(starts) == 1:
+            return starts[0][1], starts[0][0]
+        found = starts or sorted({n: i for i, n in names.items() if nq in eng.norm(n)}.items())
+        if not found:
+            return None, f"Не нашёл предмет «{q}» — напиши название как в игре"
+        return None, "Уточни название: " + ", ".join(n for n, _ in found[:6]) + ("…" if len(found) > 6 else "")
+
+    def set_target(self, q, price):
+        """Своя цена: price > 0 — «сообщи, если дешевле price за шт», 0 или None — убрать."""
+        item, name = self.find_item(q)
+        if not item:
+            return False, name
+        targets = dict(self.cfg.get("targets") or {})
+        if price:
+            targets[item] = float(price)
+        elif item in targets:
+            targets.pop(item)
+        else:
+            return False, f"Для «{name}» своей цены и так нет"
+        ok, msg = self.update_settings({"targets": targets})
+        if not ok:
+            return False, msg
+        if price:
+            return True, f"🎯 {name}: сообщу, если будет дешевле {eng.fmt_rub(price)} за шт — даже без скидки к рынку"
+        return True, f"Своя цена для «{name}» убрана"
+
+    def targets_list(self):
+        names = eng.load_listing(self.cfg.get("region", "ru"))
+        return [{"id": i, "name": names.get(i, i), "price": p}
+                for i, p in sorted((self.cfg.get("targets") or {}).items(), key=lambda kv: names.get(kv[0], kv[0]))]
 
     # --- быстрая покупка: буфер обмена, клавиша, мини-окно ---
     def copy_name(self, name, source, profit=None):
@@ -4461,6 +4624,19 @@ class State:
                 cfg["tg_muted_until"] = max(0.0, float(data["tg_muted_until"] or 0))
             if "tg_daily_last" in data:
                 cfg["tg_daily_last"] = str(data["tg_daily_last"])[:10]
+            if "tg_weekly_last" in data:
+                cfg["tg_weekly_last"] = str(data["tg_weekly_last"])[:10]
+            if "targets" in data:
+                raw = data["targets"] if isinstance(data["targets"], dict) else {}
+                targets = {}
+                for k, v in raw.items():
+                    if re.fullmatch(r"[a-z0-9]{2,16}", str(k)) and v not in (None, "", 0, "0"):
+                        price = float(str(v).replace(" ", "").replace(",", "."))
+                        if price > 0:
+                            targets[str(k)] = price
+                if len(targets) > TARGETS_MAX:
+                    return False, f"Своих цен — не больше {TARGETS_MAX}"
+                cfg["targets"] = targets
             if "update_repo" in data:
                 repo = str(data["update_repo"] or "").strip().strip("/")
                 repo = re.sub(r"^https?://github\.com/", "", repo).strip("/")   # можно вставить и ссылку
@@ -4698,6 +4874,15 @@ def make_handler(state, token):
             if path == "/api/purchases/remove":
                 ok, msg = state.remove_purchase(data.get("id"))
                 return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/target":
+                try:
+                    price = float(str(data.get("price") or 0).replace(" ", "").replace(",", "."))
+                except ValueError:
+                    return self.send_json({"ok": False, "message": "Цена — только цифры"})
+                ok, msg = state.set_target(data.get("item") or data.get("name"), price)
+                return self.send_json({"ok": ok, "message": msg, "targets": state.targets_list()})
+            if path == "/api/targets":
+                return self.send_json({"targets": state.targets_list()})
             if path == "/api/radar":
                 return self.send_json(state.radar(force=bool(data.get("force"))))
             if path == "/api/mini/open":

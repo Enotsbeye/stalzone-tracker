@@ -1630,11 +1630,13 @@ def lot_age_minutes(lot, now=None):
         return None
 
 
-def find_deals(lots, market, cfg, total=True):
+def find_deals(lots, market, cfg, total=True, target=None):
     """Лоты с выкупом заметно дешевле и прошлых сделок, и всех таких же лотов на аукционе.
-    total — buyoutPrice за весь лот (True) или за штуку."""
+    total — buyoutPrice за весь лот (True) или за штуку. target — своя цена за штуку («сообщи, если
+    дешевле»): такой лот — находка без порогов скидки и прибыли (помечен "target")."""
     lots = list(lots)
     deals = []
+    target = float(target) if target else None
     for lot in lots:
         amount, raw = int(_num(lot.get("amount"))), _num(lot.get("buyoutPrice"))
         if amount <= 0 or raw <= 0:
@@ -1644,22 +1646,23 @@ def find_deals(lots, market, cfg, total=True):
             continue
         (hist, n, per_day), b, window_h = found
         unit = raw / amount if total else raw
-        if unit > hist * (1 - cfg["discount"]):
+        mine = target is not None and unit <= target + 1e-6 and grade_of(lot.get("additional")) is None
+        if unit > hist * (1 - cfg["discount"]) and not mine:
             continue  # не дешевле прошлых сделок — дальше не считаем
         resale, floor = resale_price(lot, lots, hist, total)
         raw_resale = resale
         resale *= min(1.0, float(cfg.get("resale_factor") or 1.0))   # поправка по сверке прогнозов с фактом
-        if unit > resale * (1 - cfg["discount"]):
+        if unit > resale * (1 - cfg["discount"]) and not mine:
             continue  # рядом висят такие же почти по той же цене — это не скидка
         cost = unit * amount              # сколько заплатить за весь лот
         profit = resale * (1 - cfg["fee"]) * amount - cost
-        if profit < cfg["min_profit"]:
+        if profit < cfg["min_profit"] and not mine:
             continue
         deals.append({"lot": lot, "bucket": b, "grade": grade_of(lot.get("additional")),
                       "unit": unit, "market": resale, "market_raw": raw_resale, "hist": hist, "floor": floor, "n": n,
                       "per_day": per_day, "pct": (1 - unit / resale) * 100, "profit": profit,
                       "amount": amount, "buyout": cost, "cost": cost, "age": lot_age_minutes(lot),
-                      "window_h": window_h})
+                      "window_h": window_h, "target": target if mine else None})
     deals.sort(key=lambda d: -d["profit"])
     return deals
 
@@ -2375,7 +2378,8 @@ class Scanner:
             return lots, [], []
         # find_min_profit — порог пониже для особо редких (обычные находки приложение отсеет само)
         find_cfg = dict(cfg, min_profit=cfg["find_min_profit"]) if cfg.get("find_min_profit") is not None else cfg
-        deals = find_deals(lots.values(), market, find_cfg, total_lots)
+        target = (cfg.get("targets") or {}).get(item_id)       # своя цена «сообщи, если дешевле»
+        deals = find_deals(lots.values(), market, find_cfg, total_lots, target)
         if deals and cap < math.inf and any(d["floor"] is None for d in deals) and hasattr(self.api, "lots_all"):
             # редкий случай: у находки (обычно артефакт высокого качества) на первой странице нет лотов
             # не хуже неё — цену перепродажи не с чем сравнить. Докачиваем остальные страницы.
@@ -2383,7 +2387,7 @@ class Scanner:
             cap = lots_cap(raw)
             lots = {lot_key(item_id, lot): lot for lot in raw}
             lot_list = list(lots.values())
-            deals = find_deals(lots.values(), market, find_cfg, total_lots)
+            deals = find_deals(lots.values(), market, find_cfg, total_lots, target)
         self.last_cap[item_id] = cap
         bids = find_bid_deals(lots.values(), market, cfg, total=total_lots) if cfg.get("bids") else []
         if self.db is not None and (deals or bids):  # тренд: как цена изменилась за сутки
@@ -3074,6 +3078,11 @@ def selftest():
     mk_lot = lambda price, start_h=0.1: {"amount": 1, "buyoutPrice": price, "startTime": iso(now - timedelta(hours=start_h)),
                                          "endTime": iso(now + timedelta(hours=20))}
     mkt = market_prices([{"amount": 1, "price": 100000, "time": iso(now - timedelta(hours=i))} for i in range(10)], 5)
+    t_lots = [{"amount": 10, "buyoutPrice": 29000}, {"amount": 10, "buyoutPrice": 31000}]
+    t_mkt = market_prices([{"amount": 1, "price": 3000, "time": now.isoformat()}] * 20, 5, 48, True)
+    assert find_deals(t_lots, t_mkt, CONFIG) == []                       # 3% дешевле — не находка
+    t_d = find_deals(t_lots, t_mkt, CONFIG, target=2950)
+    assert len(t_d) == 1 and t_d[0]["target"] == 2950 and t_d[0]["unit"] == 2900   # своя цена — находка
     d1 = find_deals([mk_lot(80000)], mkt, dict(CONFIG, min_profit=10000))
     d2 = find_deals([mk_lot(80000)], mkt, dict(CONFIG, min_profit=10000, resale_factor=0.9))
     assert d1 and d1[0]["market"] == 100000 and not d2, (d1, d2)

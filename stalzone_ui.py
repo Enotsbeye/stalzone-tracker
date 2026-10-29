@@ -2192,6 +2192,10 @@ textarea.field.code{font:12px/18px var(--mono);word-break:break-all}
 .rtable .tr small{display:block;font-size:12px;color:var(--text-3);font-weight:400}
 .rtable .tr.peak{background:color-mix(in srgb,var(--warn) 7%,transparent)}
 .radar-lead .sub b{font-weight:600;color:var(--text)}
+.tgt-add{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.tgt-add > .field{flex:1;min-width:200px}
+.listrow.tgt{display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--divider)}
+.listrow.tgt .nm{flex:1;min-width:0;font-weight:600}
 .ctable .ingl{font-size:12px;line-height:16px;color:var(--text-2);white-space:normal}
 .ctable .ingl .np{color:var(--text-3)}
 .ctable .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
@@ -2460,6 +2464,12 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
             <div id="radarRows"></div>
           </div>
           <div class="small faint" style="margin-top:10px">Считается по лотам, которые видел поиск за неделю, раз в 10 минут. Чем дольше работает поиск, тем точнее. 🔥 — сейчас их время. «Бери, если дешевле» — с запасом под твой порог «дешевле рынка»; «от N шт» — меньше не даст минимальную прибыль.</div>
+          <div class="card" style="margin-top:16px">
+            <h2>Мои цены</h2>
+            <div class="sub">«Сообщи, если дешевле» — о любом лоте этого предмета ниже твоей цены за штуку, даже без скидки к рынку. Предмет проверяется, даже если его нет в списке.</div>
+            <div class="tgt-add"><input class="field" id="tgtName" list="tgtList" placeholder="Предмет, например Морфин" autocomplete="off" spellcheck="false"><datalist id="tgtList"></datalist><span class="unit" style="width:150px"><input class="field num" id="tgtPrice" inputmode="numeric" placeholder="Цена за шт"><i>₽</i></span><button class="btn accent" id="tgtAdd">Добавить</button></div>
+            <div id="tgtRows" style="margin-top:8px"></div>
+          </div>
         </div>
 
         <div class="view" id="view-craft">
@@ -2892,7 +2902,7 @@ function go(v) {
   if (v === "items" && CAT) renderCatalog(true);
   if (v === "items") loadYield();
   if (v === "craft") loadCraft();
-  if (v === "radar") loadRadar();
+  if (v === "radar") { loadRadar(); loadTargets(); }
   if (v === "log" && S) renderLog(true);
   if (v === "settings") loadSounds();
   syncDetail();
@@ -3295,6 +3305,30 @@ function renderRadar() {
   });
 }
 $("radarRefresh").onclick = () => loadRadar(true);
+
+// ---------- свои цены: «сообщи, если дешевле» ----------
+let TARGETS = [];
+async function loadTargets() { try { TARGETS = (await api("/api/targets", {})).targets; } catch (e) { return; } renderTargets(); }
+function renderTargets() {
+  $("tgtRows").innerHTML = TARGETS.length ? TARGETS.map((t) => `<div class="listrow tgt"><span class="nm">${esc(t.name)}</span><span class="num">дешевле <b>${rubN(t.price)} ₽</b>/шт</span><button class="ib" data-tdel="${esc(t.id)}" title="Убрать"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>`).join("")
+    : `<div class="small faint">Пока пусто. Например: Морфин — 2 000. Работает и командой /target в Telegram.</div>`;
+  document.querySelectorAll("[data-tdel]").forEach((b) => b.onclick = async () => {
+    const r = await api("/api/target", {item: b.dataset.tdel, price: 0}); toast(r.message, !r.ok); if (r.targets) { TARGETS = r.targets; renderTargets(); }
+  });
+}
+async function addTarget() {
+  const name = $("tgtName").value.trim(), price = num($("tgtPrice").value);
+  if (!name || !price) { toast("Впиши предмет и цену за штуку", true); return; }
+  const r = await api("/api/target", {name, price});
+  toast(r.message, !r.ok);
+  if (r.ok) { $("tgtName").value = ""; $("tgtPrice").value = ""; TARGETS = r.targets; renderTargets(); }
+}
+$("tgtAdd").onclick = addTarget;
+$("tgtPrice").addEventListener("keydown", (e) => { if (e.key === "Enter") addTarget(); });
+$("tgtName").addEventListener("input", async () => {
+  const q = $("tgtName").value.trim(); if (q.length < 2) return;
+  try { const r = await api("/api/suggest?q=" + encodeURIComponent(q)); $("tgtList").innerHTML = (r.items || []).slice(0, 12).map((n) => `<option value="${esc(n)}">`).join(""); } catch (e) {}
+});
 async function openMini() { const r = await api("/api/mini/open", {}); if (!r.ok) toast(r.message, true); }
 $("miniBtn").onclick = openMini; $("miniBtn2").onclick = openMini;
 
@@ -3520,7 +3554,9 @@ function sellHelp(p) {
   const parts = [];
   if (p.status === "listed" && p.list_price) {
     const mine = p.list_price / p.amount;
-    if (p.undercut || (ls && ls.cheaper)) {
+    if (p.list_missing) {
+      parts.push(`<div class="infobar warn">${IC.err}<div class="tx"><b>Лот пропал с аукциона, а продажи нет.</b>Похоже, истёк или снят — перевыставь ниже. Если продал — нажми «Продано» и впиши цену.</div></div>`);
+    } else if (p.undercut || (ls && ls.cheaper)) {
       const best = (p.undercut && p.undercut.best) || (ls && ls.best), sug = (p.undercut && p.undercut.suggest) || (ls && ls.suggest);
       parts.push(`<div class="infobar err">${IC.err}<div class="tx"><b>Твой лот перебили.</b>Есть такой же за ${per(best)}, у тебя ${per(mine)}.${sug ? ` Чтобы продать первым, выставь за ${per(sug)}.` : ""}</div>${sug ? `<button class="btn" data-relist="${p.id}" data-total="${Math.round(sug * p.amount)}">Перевыставил за ${rubN(sug * p.amount)}</button>` : ""}</div>`);
     } else if (ls && ls.own) parts.push(`<div class="infobar ok">${IC.ok}<div class="tx">Твой лот за ${per(mine)} — самый дешёвый среди таких же. Трекер скажет, если его перебьют или он продастся.</div></div>`);
