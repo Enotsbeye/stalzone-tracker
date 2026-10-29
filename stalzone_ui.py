@@ -3172,7 +3172,7 @@ function priceChart(series, d, sell, buy) {
     <path d="${area}" fill="var(--hover)"/><path d="${line}" fill="none" stroke="var(--text-2)" stroke-width="1.5" stroke-linejoin="round"/>
     ${lvl(sell, "var(--accent-t)", "продать", sell >= buy)}${lvl(buy, "var(--good)", "купить", buy > sell)}
     <text x="0" y="${H - 3}" fill="var(--text-3)" font-size="11">${day(xs[0])}</text><text x="${W}" y="${H - 3}" fill="var(--text-3)" font-size="11" text-anchor="end">сейчас</text>
-  </svg><div class="cap">Медиана сделок за штуку${d && isArtefact(d) ? " — того же качества и заточки" : ""}, по 12 часов</div>`;
+  </svg><div class="cap">Медиана сделок за штуку${d && isArtefact(d) ? " — того же качества и ступени заточки" : ""}, по 12 часов</div>`;
 }
 function hoursChart(hours) {
   const total = (hours || []).reduce((a, b) => a + b, 0);
@@ -3249,7 +3249,7 @@ function renderDealDetail(force) {
       ? "Перепродать дороже самого дешёвого такого же лота не выйдет, поэтому цена продажи — чуть ниже него, а не по прошлым сделкам."
       : d.floor ? "Цена продажи — по прошлым сделкам: такие же лоты на аукционе сейчас дороже."
       : "Такого же или лучше лота на аукционе сейчас нет — цена продажи только по прошлым сделкам, это менее надёжно."} Данные API запаздывают — проверь лот в игре перед покупкой.</div>
-    ${isArtefact(d) ? `<div class="note">Артефакт: цена зависит ещё от процента качества и доп. свойств — сравни лот в игре с другими того же качества и заточки.</div>` : ""}
+    ${isArtefact(d) ? `<div class="note">Артефакт: цена зависит ещё от процента качества и доп. свойств — сравни лот в игре с другими того же качества и заточки. Оценка — по сделкам той же ступени заточки: +0…+4 считаются как +0, +5…+9 — как +5, +10…+14 — как +10.</div>` : ""}
     ${["armor", "weapon"].includes(d.cat) ? `<div class="note">Цена брони и оружия сильно зависит от заточки и состояния — сравни лот в игре с такими же.</div>` : ""}
     <div class="actions"><button class="btn" id="dStar">${star ? "Убрать из особо редких" : "Отметить особо редким"}</button><button class="btn subtle" id="dHide">Скрыть находку</button></div>`;
   $("dClose").onclick = closeDetail;

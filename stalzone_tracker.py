@@ -172,7 +172,7 @@ def load_icons(region):
 
 
 def _grade_rows(con, region, item_id, grade, since):
-    """Сделки предмета с since: для артефакта — того же качества и заточки от −4 до той же (как market_for)."""
+    """Сделки предмета с since: для артефакта — того же качества и той же ступени заточки (как market_for)."""
     for ts, amount, price, qlt, ptn in con.execute(
             "SELECT ts, amount, price, qlt, ptn FROM sales WHERE region = ? AND item_id = ? AND ts >= ?",
             (region, item_id, since)):
@@ -181,7 +181,7 @@ def _grade_rows(con, region, item_id, grade, since):
         if grade is None:
             if qlt != -1:
                 continue
-        elif qlt != grade[0] or not grade[1] - 4 <= ptn <= grade[1]:
+        elif qlt != grade[0] or ptn != ptn_tier(grade[1]):
             continue
         yield ts, amount, price
 
@@ -1097,6 +1097,13 @@ def parse_time(s):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def ptn_tier(ptn):
+    """Заточка артефакта для оценки: +0…+4 стоят как +0, +5…+9 — как +5, +10…+14 — как +10, +15 — +15.
+    Покупатели платят за ступени, а не за каждую единицу: +3 продаётся по цене +0."""
+    p = int(ptn or 0)
+    return min(p - p % 5, 15)
+
+
 def bucket_of(additional):
     """Для артефактов цена зависит от качества и заточки — сравниваем внутри «корзины»."""
     if not isinstance(additional, dict):
@@ -1303,7 +1310,7 @@ def _market_for_one(market, additional):
     if not info:
         return None
     q, p = grade
-    pairs = [x for (gq, gp), lst in info["pairs"].items() if gq == q and p - 4 <= gp <= p for x in lst]
+    pairs = [x for (gq, gp), lst in info["pairs"].items() if gq == q and gp == ptn_tier(p) for x in lst]
     if len(pairs) < info["min_sales"]:
         return None
     per_day = sum(a for _, a in pairs) / max(info["window"], 1.0) * 24
@@ -1312,8 +1319,8 @@ def _market_for_one(market, additional):
 
 def market_for(market, additional):
     """Цена по сделкам для конкретного лота: ((цена, сделок, штук_в_сутки), корзина, окно_в_часах) или None.
-    Артефакт оцениваем только по сделкам того же качества и заточки не выше, чем у лота
-    (от −4 до той же): сделки с большей заточкой завысили бы цену. Если за обычное окно таких
+    Артефакт оцениваем по сделкам того же качества и той же ступени заточки: +0…+4 — по сделкам +0,
+    +5…+9 — по +5, +10…+14 — по +10, +15 — по +15 (покупатели платят за ступени, +3 стоит как +0). Если за обычное окно таких
     сделок мало — смотрим длинное окно из своей базы (FALLBACK). Мало и там — не оцениваем."""
     found = _market_for_one(market, additional)
     if found is None and market.get(FALLBACK):
@@ -1334,7 +1341,7 @@ def price_trend(sales, additional, total=True, min_sales=5, now=None):
         if grade is None:
             if g is not None:
                 continue
-        elif g is None or g[0] != grade[0] or not grade[1] - 4 <= g[1] <= grade[1]:
+        elif g is None or g[0] != grade[0] or g[1] != ptn_tier(grade[1]):
             continue
         amount, price = int(_num(s.get("amount"))), _num(s.get("price"))
         if amount <= 0 or price <= 0:
@@ -1347,7 +1354,7 @@ def price_trend(sales, additional, total=True, min_sales=5, now=None):
 
 def comparable_floor(lot, lots, total=True):
     """Самая низкая цена за штуку среди ДРУГИХ лотов, которые не хуже этого:
-    у артефактов — качество и заточка не ниже, у остальных предметов — любой лот.
+    у артефактов — качество не ниже и заточка не ниже ступени лота (+3 конкурирует и с +0), у остальных — любой лот.
     Дороже неё перепродать не выйдет: покупатель возьмёт тот лот. None — сравнить не с чем."""
     grade = grade_of(lot.get("additional"))
     best = None
@@ -1361,7 +1368,7 @@ def comparable_floor(lot, lots, total=True):
         if grade is None:
             if other_grade is not None:
                 continue
-        elif other_grade is None or other_grade[0] < grade[0] or other_grade[1] < grade[1]:
+        elif other_grade is None or other_grade[0] < grade[0] or other_grade[1] < ptn_tier(grade[1]):
             continue
         unit = raw / amount if total else raw
         best = unit if best is None else min(best, unit)
@@ -1376,7 +1383,7 @@ def _pairs_for_one(market, additional):
     if not info:
         return None
     q, p = grade
-    pairs = [x for (gq, gp), lst in info["pairs"].items() if gq == q and p - 4 <= gp <= p for x in lst]
+    pairs = [x for (gq, gp), lst in info["pairs"].items() if gq == q and gp == ptn_tier(p) for x in lst]
     return (pairs, info["window"]) if len(pairs) >= info["min_sales"] else None
 
 
@@ -1402,7 +1409,7 @@ def competitors(lot, lots, price, total=True, spread=0.05):
         if grade is None:
             if og is not None:
                 continue
-        elif og is None or og[0] < grade[0] or og[1] < grade[1]:
+        elif og is None or og[0] < grade[0] or og[1] < ptn_tier(grade[1]):
             continue
         if (raw / amount if total else raw) <= price * (1 + spread):
             n += 1
@@ -1613,7 +1620,7 @@ def listing_state(lots, amount, list_total, additional, total=True):
         if grade is None:
             if og is not None:
                 continue
-        elif og is None or og[0] < grade[0] or og[1] < grade[1]:
+        elif og is None or og[0] < grade[0] or og[1] < ptn_tier(grade[1]):
             continue
         unit = raw / a if total else raw
         if unit < list_unit - 0.5:
@@ -2059,7 +2066,7 @@ class MarketDB:
             if grade is None:
                 if qlt != -1:
                     continue
-            elif qlt != grade[0] or not grade[1] - 4 <= ptn <= grade[1]:
+            elif qlt != grade[0] or ptn != ptn_tier(grade[1]):
                 continue
             if ratio is None or ratio > max_ratio:
                 continue
@@ -2745,8 +2752,16 @@ def selftest():
     # пример со скрина: Змеиный глаз «особый» +2 за 190 000, рядом такие же по 185–246 тыс.,
     # по сделкам 230 000. Это не скидка — дороже 185 000 его не продать.
     eye = {"qlt": 2, "ptn": 2}
+    # +2 оцениваем по сделкам +0 той же ступени (+0…+4 стоят как +0)
     eye_market = market_prices([{"amount": 1, "price": 230000, "time": iso(now - timedelta(hours=i)),
-                                 "additional": eye} for i in range(8)], 5)
+                                 "additional": {"qlt": 2, "ptn": 0}} for i in range(8)], 5)
+    assert ptn_tier(3) == 0 and ptn_tier(8) == 5 and ptn_tier(14) == 10 and ptn_tier(15) == 15
+    t3 = market_prices([{"amount": 1, "price": 900000, "time": iso(now - timedelta(hours=i)),
+                         "additional": {"qlt": 2, "ptn": 3}} for i in range(8)], 5)
+    assert market_for(t3, {"qlt": 2, "ptn": 3}) is None          # сделки +3 для +3 не годятся — только +0
+    t5 = market_prices([{"amount": 1, "price": 500000, "time": iso(now - timedelta(hours=i)),
+                         "additional": {"qlt": 2, "ptn": 5 + i % 2 * 3}} for i in range(12)], 5)
+    assert market_for(t5, {"qlt": 2, "ptn": 8})[0][1] == 6      # +8 — по шести сделкам ровно +5
     eye_lots = [{"amount": 1, "buyoutPrice": p, "additional": eye}
                 for p in (185000, 190000, 200000, 200000, 210000, 220000, 230000, 245999)]
     assert find_deals(eye_lots, eye_market, dict(CONFIG, discount=0.08)) == []
@@ -2970,9 +2985,10 @@ def selftest():
         assert db.con.execute("SELECT COUNT(*) FROM sales WHERE item_id = 'old'").fetchone()[0] == 0
         assert db.stats()["sales"] > 1000
 
-        # редкий артефакт: за 48 ч всего 2 сделки по «редкий +7», за неделю — 8 → оценка по 7 дням
+        # редкий артефакт: за 48 ч всего 2 сделки по «редкий +5», за неделю — 8 → оценка по 7 дням
+        # (лот +7 — той же ступени, что +5)
         art = [{"amount": 1, "price": 1_000_000, "time": iso(now - timedelta(hours=h)),
-                "additional": {"qlt": 3, "ptn": 7}} for h in (5, 30, 60, 80, 100, 120, 140, 150)]
+                "additional": {"qlt": 3, "ptn": 5}} for h in (5, 30, 60, 80, 100, 120, 140, 150)]
         art += [{"amount": 1, "price": 900_000, "time": iso(now - timedelta(hours=h)),
                  "additional": {"qlt": 1, "ptn": 0}} for h in range(6)]   # ходовое качество — 6 за 48 ч
 
