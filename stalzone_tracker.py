@@ -640,6 +640,7 @@ class Api:
         for _ in range(6):
             self._wait_turn()
             headers = self._headers()
+            sent_at = time.time()
             try:
                 r = self.s.get(url, params=params, headers=headers, timeout=30)
             except requests.RequestException as e:
@@ -681,6 +682,8 @@ class Api:
                                + f" на запрос {path}")
             self._adapt_pace(r)
             self._ok_at, self._auth_retries = time.time(), 0
+            if r.headers.get("Date"):
+                note_server_time(r.headers.get("Date"), sent_at, self._ok_at)
             try:
                 return r.json()
             except ValueError:
@@ -1054,6 +1057,37 @@ class KeyPool(Api):
 _FRACTION_RE = re.compile(r"\.(\d+)")
 
 
+# Часы компьютера могут спешить или отставать — тогда «лот выставлен N мин назад», задержка API и время
+# до конца торгов врут. Сверяемся со временем сервера EXBO (заголовок Date в каждом ответе API).
+_SKEW = {"samples": deque(maxlen=21), "value": 0.0}
+
+
+def note_server_time(date_header, sent_at, got_at):
+    """Запомнить, насколько часы сервера впереди наших (секунды). Точность заголовка — 1 с."""
+    try:
+        from email.utils import parsedate_to_datetime
+        server = parsedate_to_datetime(date_header).timestamp()
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return
+    sample = server + 0.5 - (sent_at + got_at) / 2      # Date округлён вниз до секунды
+    with _SKEW_LOCK:
+        _SKEW["samples"].append(sample)
+        med = statistics.median(_SKEW["samples"])
+        _SKEW["value"] = med if abs(med) >= 5 else 0.0     # меньше 5 с — шум, не трогаем
+
+
+_SKEW_LOCK = threading.Lock()
+
+
+def clock_skew():
+    """Секунды: время сервера EXBO минус часы этого компьютера (0 — часы верные или ещё не сверяли)."""
+    return _SKEW["value"]
+
+
+def server_now():
+    return datetime.now(timezone.utc) + timedelta(seconds=_SKEW["value"])
+
+
 def parse_time(s):
     """Время из API → datetime с часовым поясом. Терпимо к любой длине долей секунды
     (старые версии Python понимают только 3 или 6 знаков) и к времени без пояса (считаем UTC)."""
@@ -1217,7 +1251,7 @@ def history_window(sales, hours, now=None):
             pass
     if not times:
         return float(hours)
-    now = now or datetime.now(timezone.utc)
+    now = now or server_now()
     span = (now - min(times)).total_seconds() / 3600
     return max(1.0, min(float(hours), span))
 
@@ -1590,7 +1624,7 @@ def listing_state(lots, amount, list_total, additional, total=True):
 
 def lot_age_minutes(lot, now=None):
     try:
-        now = now or datetime.now(timezone.utc)
+        now = now or server_now()
         return (now - parse_time(lot.get("startTime"))).total_seconds() / 60
     except (TypeError, ValueError):
         return None
@@ -1633,7 +1667,7 @@ def find_deals(lots, market, cfg, total=True):
 def find_bid_deals(lots, market, cfg, now=None, total=True):
     """Лоты со ставками: скоро закончатся, а текущая цена ставки сильно ниже рынка.
     total — цены лота за весь лот (True) или за штуку. Суммы в находке — за весь лот."""
-    now = now or datetime.now(timezone.utc)
+    now = now or server_now()
     lots = list(lots)
     deals = []
     for lot in lots:
@@ -1990,8 +2024,24 @@ class MarketDB:
         выгодные лоты появляются чаще, туда и смотреть чаще."""
         now = now or time.time()
         return {item: n / hours for item, n in self.con.execute(
-            "SELECT item_id, COUNT(*) FROM lots WHERE region = ? AND first_seen >= ? GROUP BY item_id",
+            "SELECT item_id, COUNT(*) + 4 * SUM(CASE WHEN ratio < 0.9 THEN 1 ELSE 0 END) FROM lots "
+            "WHERE region = ? AND first_seen >= ? GROUP BY item_id",
             (region, now - hours * 3600))}
+
+    def radar_rows(self, region, since, max_ratio):
+        """Для «Радара»: лоты дешевле рынка (ratio ≤ max_ratio), выставленные, пока трекер работал,
+        и сколько часов он работал. ([(item, qlt, ptn, start, first_seen, gone, outcome, ratio, amount)],
+        часов работы, {item: с какого момента его видели})."""
+        hours = {int(ts // 3600) for (ts,) in self.con.execute(
+            "SELECT first_seen FROM lots WHERE region = ? AND first_seen >= ?", (region, since))}
+        starts = dict(self.con.execute(
+            "SELECT item_id, MIN(first_seen) FROM lots WHERE region = ? AND first_seen >= ? GROUP BY item_id",
+            (region, since)))
+        rows = [r for r in self.con.execute(
+            "SELECT item_id, qlt, ptn, start_ts, first_seen, gone_ts, outcome, ratio, amount FROM lots "
+            "WHERE region = ? AND start_ts >= ? AND ratio IS NOT NULL AND ratio <= ?", (region, since, max_ratio))
+            if r[3] >= starts.get(r[0], math.inf) - 60]      # выставлен, когда за предметом уже следили
+        return rows, len(hours), starts
 
     def lot_outcomes(self, region, item_id, grade=None, now=None, days=7, max_ratio=1.05):
         """(продано за сутки, всего) среди лотов, выставленных не дороже рынка (до +5%), той же корзины.
@@ -2352,15 +2402,82 @@ class Scanner:
         return lots, deals, bids
 
 
-def pass_order(items, heat, share=0.25):
-    """Порядок проверки на один проход. Самые «горячие» предметы (новые лоты появляются чаще всего,
-    heat — новых лотов в час) идут первыми и проверяются ещё раз в середине прохода: новый лот у них
-    виден примерно вдвое быстрее. Остальные — по разу. Без данных о лотах — как в списке."""
+def _best_hours(hours, width=3):
+    """Самое «урожайное» окно в width часов: (с какого часа, по какой) — или None, если данных мало."""
+    if len(hours) < 6:
+        return None
+    count = [0] * 24
+    for h in hours:
+        count[h % 24] += 1
+    best = max(range(24), key=lambda a: (sum(count[(a + k) % 24] for k in range(width)), count[a]))
+    if sum(count[(best + k) % 24] for k in range(width)) < len(hours) * 0.4:
+        return None                 # дешёвые лоты бывают в любое время — окно ни о чём не говорит
+    return best, (best + width) % 24
+
+
+def radar(rows, active_hours, market_fn, discount, fee, min_profit, local_hour=None, top=15):
+    """«Радар»: где дешёвые лоты появляются чаще и выгоднее всего — туда стоит заглядывать на аукцион
+    самому (в игре лоты видны сразу, а в API — минут через 10). rows — из MarketDB.radar_rows;
+    market_fn(item_id, additional) → рынок за штуку сейчас или None. Для каждого предмета (у артефактов —
+    качества и заточки): «бери, если дешевле X за шт» (и от скольки штук это даёт минимальную прибыль),
+    сколько таких лотов в сутки, через сколько их обычно покупают и в какие часы их больше."""
+    groups = {}
+    for item, qlt, ptn, start, first, gone, outcome, ratio, amount in rows:
+        add = {"qlt": qlt, "ptn": ptn} if qlt is not None and qlt >= 0 else {}
+        groups.setdefault((item, bucket_of(add)), []).append((start, gone, ratio, int(amount or 1), add))
+    hours = max(1.0, float(active_hours or 0))
+    out = []
+    for (item, bucket), lots in groups.items():
+        add = lots[0][4]
+        unit = market_fn(item, add)
+        if not unit or unit <= 0:
+            continue
+        net = unit * (1 - fee)
+        profits = [(net - ratio * unit) * amount for _, _, ratio, amount, _ in lots]
+        good = [p for p in profits if p >= max(min_profit, 1)]
+        if not good:
+            continue
+        buy_below = _nice_price(unit * (1 - discount))
+        margin = net - buy_below
+        if margin <= 0:
+            continue
+        lives = [(g - st) / 60 for st, g, _, _, _ in lots if g and g > st]
+        local = [datetime.fromtimestamp(st).hour for st, _, _, _, _ in lots]
+        window = _best_hours(local)
+        per_day = len(good) / hours * 24
+        out.append({
+            "item_id": item, "additional": add, "bucket": bucket, "market": unit, "buy_below": buy_below,
+            "need": max(1, math.ceil(min_profit / margin)) if min_profit > 0 else 1,
+            "per_day": per_day, "n": len(good), "profit": statistics.median(good),
+            "life_min": statistics.median(lives) if len(lives) >= 3 else None,
+            "hours": window,
+            "peak": bool(window and local_hour is not None and (local_hour - window[0]) % 24 < 3),
+            "score": per_day * statistics.median(good),
+        })
+    out.sort(key=lambda r: (-(r["score"] * (1.5 if r["peak"] else 1.0)), -r["n"]))
+    return out[:top]
+
+
+def pass_order(items, heat, share=0.25, pass_no=0, keep=()):
+    """Порядок проверки на один проход. Самые «горячие» предметы (heat — новых лотов в час, дешёвые
+    считаются за несколько) идут первыми и проверяются ещё раз в середине прохода, а в длинном списке
+    (от 30 предметов) — ещё дважды, на трети и двух третях: новый лот у них виден в 2–3 раза быстрее.
+    В длинном списке (от 40) «холодные» — где за 6 часов не было ни одного нового лота — проверяются
+    через проход (не больше половины списка; keep — всегда). Без данных о лотах — как в списке."""
     items = list(items)
     if len(items) < 8 or not heat:
         return items
     base = sorted(items, key=lambda it: -heat.get(it[0], 0))
     hot = [it for it in base[:max(1, int(len(base) * share))] if heat.get(it[0], 0) > 0]
+    if len(base) >= 40 and pass_no % 2 == 1:
+        keep = set(keep)
+        cold = [it for it in base if heat.get(it[0], 0) <= 0 and it[0] not in keep][:len(base) // 2]
+        if cold:
+            drop = set(cold)
+            base = [it for it in base if it not in drop]
+    if len(items) >= 30 and hot:
+        a, b = len(base) // 3, 2 * len(base) // 3
+        return base[:a] + hot + base[a:b] + hot + base[b:]
     mid = len(base) // 2
     return base[:mid] + hot + base[mid:]
 
@@ -3046,6 +3163,23 @@ def selftest():
     order = pass_order(its, {"i5": 9.0, "i2": 1.0})
     assert order.count(("i5", "П5")) == 2 and order[0] == ("i5", "П5") and len(order) == 12
     assert pass_order(its, {}) == its
+    # --- радар: где дешёвые лоты бывают чаще и выгоднее ---
+    t_r = datetime(2026, 10, 20, 20, 0).timestamp()
+    r_rows = ([("a", -1, -1, t_r + i * 600, t_r + i * 600 + 610, t_r + i * 600 + 900, "sold", 0.7, 10) for i in range(8)]
+              + [("b", -1, -1, t_r + 3600 * i, t_r + 3600 * i + 610, None, None, 0.85, 1) for i in range(2)]
+              + [("c", 4, 15, t_r, t_r + 610, None, None, 0.6, 1)])
+    rad = radar(r_rows, 10, lambda item, add: {"a": 1000, "b": 50000, "c": 200000}[item], 0.15, 0.05, 1000,
+                local_hour=21)
+    by_r = {r["item_id"]: r for r in rad}
+    assert rad[0]["item_id"] in ("a", "c") and by_r["a"]["buy_below"] == 850 and by_r["a"]["need"] == 10
+    assert abs(by_r["a"]["per_day"] - 8 / 10 * 24) < 1e-9 and abs(by_r["a"]["life_min"] - 15) < 1e-9
+    assert by_r["a"]["hours"] == (20, 23) and by_r["a"]["peak"] and by_r["c"]["bucket"] == (4, 15)
+    assert by_r["b"]["profit"] == 50000 * 0.95 - 42500 and by_r["b"]["life_min"] is None
+    its40 = [(f"j{k}", f"Р{k}") for k in range(40)]
+    heat40 = {f"j{k}": (9.0 if k < 5 else 1.0 if k < 20 else 0) for k in range(40)}
+    o0, o1 = pass_order(its40, heat40, pass_no=0), pass_order(its40, heat40, pass_no=1, keep={"j39"})
+    assert o0.count(("j0", "Р0")) == 3 and set(o0) == set(its40)
+    assert ("j30", "Р30") not in o1 and ("j39", "Р39") in o1 and o1.count(("j0", "Р0")) == 3
     assert lots_cap([{"buyoutPrice": p} for p in range(1, 101)]) == 100 and lots_cap([{"buyoutPrice": 5}]) == math.inf
     # --- категории ---
     assert item_category({"data": "/items/other/x.json"}, "Дешевые запчасти") == "parts"

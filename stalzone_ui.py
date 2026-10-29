@@ -2185,6 +2185,13 @@ textarea.field.code{font:12px/18px var(--mono);word-break:break-all}
 .ctable .tr{min-height:56px;padding-top:6px;padding-bottom:6px;align-items:start;cursor:default}
 .ctable .tr > div{padding-top:4px}
 .ctable .tr.loss{color:var(--text-3)}
+.rtable .thead,.rtable .tr{grid-template-columns:minmax(0,1.4fr) 140px 120px 90px 110px 40px}
+.rtable .tr{min-height:52px;cursor:default}
+.rtable .tr .nm{display:flex;flex-direction:column;min-width:0}
+.rtable .tr .nm b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rtable .tr small{display:block;font-size:12px;color:var(--text-3);font-weight:400}
+.rtable .tr.peak{background:color-mix(in srgb,var(--warn) 7%,transparent)}
+.radar-lead .sub b{font-weight:600;color:var(--text)}
 .ctable .ingl{font-size:12px;line-height:16px;color:var(--text-2);white-space:normal}
 .ctable .ingl .np{color:var(--text-3)}
 .ctable .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
@@ -2292,6 +2299,7 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
     <div class="who"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAPJ0lEQVR42tWbeZRV1ZWHv33uGwpKCqhiclaQQVE72ixBEDUORFA0nazCKWo7a0ScWgUVi0LBEdRgOi5XjDNKFTZqVnc0ihTikKTFGdPIUqMyQxVCkar37r3n7P7jvvfq1UQx1EvgrnX/qLVe3Xt+39l7n733OVfYwUsVobrc0Hu9wInsHlcNbOijlFc7EbQgr9Cqck+ryj1282tHxxnr8IEVFQZAJlRaAP3y/JLGWnekiBkU+GE/azUJouYfLNRFoxMxJkgWeWs99Mt4Fz6TI+duylkqFSJS6bb1HOmIpkyotgAN7517gqheEjpO9kT2TSY9jHT4iH/EnKMKad8SOl1rhJqEMU/ER859s6WGHQKQ/cfN75w/OCH2PlU5KxE3NKRC/MAp4IQC+dsOI0AAk4gZ6dolRmgdKK8FVm/tdvyLn24LgrQd6Mo9kWpb//aEc4zIY4m4133z1rRTRQUxIv/0aW8vQKuiDpDueyVMELoG65hUcsK8J9qDIO2Jr3uzfGJxV29OQyokDDUU6The7E6XU7WeMV73bnG2bg1u63Hy/Huy2vJ/Z1qZvVTbHxb+fEJxFzOnvsG3QegcQkw1svc94lYQES+0Tjdt8cO9imMza//488tFqm3LFUKaZr7CQKVurikfIKofWnXFQaiIiEGVPfISwTnVeExcPGbC0NrhpScv+CTfHUyL32sQhA8lE6ab7zsHGHVuz5n5lrdziCB+aIl5krSWOaoIyw7TZhaQJVL71vhRHvF3GtPW5WZepKBRK0u+oO8QQVVtt64xL+27sWWnLngtq7lZYNPQXJUoMjSmQqcQASiU+UfmGQUiAwV1M1U0WrHVqv4SeI3yyApEFRFBN/7ptJKgLvFlzJO+oVXX0j06cc1GAOuU4iIPEWFrY4hnCruyqqKeJ6KqW4rjOqjbKb9fpxUVxlBdbgBMfdGRiZj0TQdWnapxqhTiRhU/tJSWJHj9T2t4ZfFKSksSBKFDC/ROpwqoBKF1RUlT0qgyDIBpX0gsqurAOTu4KBmjIR06gYIVPYF1lJYkefPPa7jhoaX4oSMRF8aP3pfazWliXmGqisgBcHFPTKpRhwD/Tc16ycUA32q/IjSTWhfGH8OM+IUfrOXq+/4XgKKEx6RZS1GF8aP3KSwEBXWK4vq1qgZtYBOqHqqFF//L+z9AHSQTkVDnhOtmLwWUM44rHITIAxXFJdoqh1VVCwIgtEppSYK3PljHNQ9E4ouSHlv+HqAKJcUxwHHd7A9RLRyELABUtA0AURDqbAD54ic+uBTnoEuRx7raNGefsh9FSY+n/+db+vRMgm+5/qGP8iD4xDzpdADOudYNEecy/tFJAAQIrFKWEX/trA9z4jdsSjN+9N7MuPoIYp4h5TuqFn5P755JSFtuePhjFDhj1N6dCiFnAW11hFwnWoBEQTUSv3R9K/FnjNqbWdf9C35gSaUt9159OIIyb+HKHIQbH/4YVDm9EyHkLEDbsABc7he7nOQEWbNfup5Jsz9qJv70UXvz4KQjCUOHtQ4QGlIhM646HICqhSvplYXwyCdoBkJdZ0BQopzAtdkT3HkL0BZm37MkzltL13PdQx83Fz+yHw9OPIIwdAShwxgBlNAqjSnl7iuHokB1HoSb5nwKwLiR/XIQdHv6ee0NVJX8RlazGJDNmmQXfL5nSZyapRuY9PCnaAvxD0w8gtBG4mOeYEymVvGEMHQRhCsOA1Wq31pFrx5J8B03zfkUVWXcsf2o29IEQXfSAmwmCNa0tIBdcYFIfIKaDzdw/cOfoU5z4seN7Mf9Ew/PiTdGKC7yuP3xL2hIWx685gganSO0jlSaCALkQVBufvSzCMLIDISdqR20ddHVfBXYSRcI88Tf8MhnuJx4PxJ/zdBmZl9c5DH9d/9H1cJVqEIyZph++aGoWoLQoqrR38D8DIS077jl158DMPbYvjsHQUHVRWI7KwZk1/nFH27ghl993iT+B59xx/bhvqsPayV+xlPLefoP31FakkAkmmlVmH75kDwIjumXDQGF+YsyEALlll9/jqoydkRf6up3EEJ2FWhzYyRnAW67w0tWfM1HG7mxhfixI/pw79WHtTL7GU8v55k/RBWgzfQDyronmL9oFaBMvywLIZqQ6ZcNBpT5i1ZHELDc+p/LQJXTdhRCdoLbWgZ3NA/IF3/TnM+bov0PPmNH9Obeqw7Nifcy4mc+8yXPvLaS0pJ4Tnz2WRGE1aBQedngZhAqLx0MkAfBcetvvkCBscN7U1sfbB+EjD7n2rMAOqgDM92T0Dp6douz+KON3PTospz4jT/4jB3em3uvjMSHoWIMdC3ymPnMCp59fSWl3ZqLbwVh8WqUSLRq9IxGtUy7ZBCqykuL19Cre5I0yuTffIHqoZw2vA+b6n08z9BRG6/l/DazAOcc6lz7DxDBZsS//XEdNz36Bc5FJe36ujRjj+3DPVcOIbCO0CqeEfbq4jHz2RU8+/qqdsU3g1CS4L8WrwWg8tJBpH0lsI7GtEYQgJcWraFXjwQ+yuTH/hoFxhG9qdsSRLmFc+1bgHM4bDubox1Yv7OOLkmP1/68ntsfX44gJBOG+saQn53QjzsvHogfOpxTREBEqHjiS+bXrOlQfPMVJc6Ct9eSDhx3XjQQI2CtoyHlmHbxQIoShpdq1lLcxUMwTH7srzSmQ8aO6ENjymYSrA53Vlu7gIvCJK793RZASaUtoVWSccnl18mEwTOQdi5nZuocDWm7w43f7E8bUhanDkEy8QmMQFHC5BI6YyBMK41pG409u4PTjgW4bRVDdOACJtPAPHNUH5Jxw5THlxPzDN26xnjhzdWkfUfFxYeQ8iMrMAIzLh9IIiYseHsdpSVxQrttK4h5Qt2WgJ8c04uZVwzGuiiQikBxlxj3PPcVz/1xFWWZVSSVdky7ZCA/O74vdfUBnmzbBXAODV0bW2PZRHCbW06RqI2bfU4dVsaMywZhrcMPld49kry8ZC3Tn1xBMi6IgB86GlOWqRcN4N9G96VuS7DNgiZf/N2XDyQILenAAVEH+f7nv2buG6vp1T0j3ndM/fcB/PS4Pmzc7GOkKZBv63a7Wg57Bmq3+Iw5pgxlIFN/u4I0UNY9yYIl61Fg6kUDcgFM08odF/VHgZeXrKNnSRzbwhKy4scc04u7LjskSp5sBLy4KMZ9c79m7htrclaU8i1TLzqEn47uQ222Puho7Dl9btdTYc9A7WafMcPKQJWpT3xFGkdZ9wQvL1kPwB0X9kfzIVx4MKC8vGQ9PfOCYswT6uoDxhxTxl2XDmgSbyLx97/wTSvxd1w4gLOO65XrFWzXuLNtcjopFc5awqnDSlGFqb/7ClpAuP2Cg5tBuP2Cg0GVl9/ZQM+SOALU1YeMGVbGXRc3ifcMFCdjPPDCN8x9c22eeMftF/TnrON6U7c5wNte8fmJkHZiMRRBCDh1WE+gP3c++TXpoAmCquYghBkIt11wMAr8/r2NAIwZVsr0S/oT2CbxXZMxHnjxb7zQSvzBGfH+jonPrPOa3xCp6aSGSBbCKf/aE9WDqXjym5w7vPLOBgBu+8VBpPMg3HHBQfiBo9F3kfjczAtdk4YH533bSvxtvziIM0eVUbfFxzOyE2PNWEBbDZFdbYnFDNTlIMC0p77Bx1HWPZ6DMOX8A0kHEYSUD5PPOxBVmlWLXZPCrHnf8cLCdS3EH8hZo8qo2xJE+4g7NU7NLYXtrgJuF3qCXg5CD+Agpj31t0y1F0FQ1QiCU/zA5jZE02EU7bsmDbOqvufFluLPP4Azj+1FbZ54t5NNwXYTIVxTprezO2OaB+Hko3ugeiCVT3+bg/Dqu5HPTznvAFK+5lYByYifXfU9Ly5qLn7K+Qcw/tgyarNl7y5t3EWlsLpOKIe3xxJOPrpHVNTkQ3hvIyhMPm9/Gv0obS4u8phdvZJ5izZQ2q1J/OTz9mf8iNJcubvrY2utL1bTLBN0nbYx4hmoqw846ajuqB7A9Ge+iyCUxHn1/VoUZfK5++MZYXb191TVbKS0W6xJ/LmdLT4vCLbfEDGdujXmSXMIdz2bhRDj1XdrKYobkgnDvEUbKMsz+1vP2Y8zRpRGuX2niW9jGWy7Jda5e4OewKb6gJOOKgHdn7ue/x4NoLR7nFfeqwVoZva3nLMfp48opa7e72TxHSyDTp10tgU0VZERhB8fVYKyH3c/txIh8n0gV9jccva+nD68J5vqA6LmTmePRTP7n1baaogEhdoez4dw0o9KUN2XGc+vQgAxkPIdN0/Yh3HNxBfkiES2Jxg0AchEwbin69Qp6lQKdWotFxN+VALAjOdXEfrKLWfvw+nDe+TEF+oIdq5QVtblAJw4tI8CBKGsUBxOMQYt2DHwfAiptCUdaEZ8mDkux04mOR13mRyYIHAYo8ubLKC82gGEW80nrjjYEPOkd2jRQp0Ij5IlyQVGIXKNbB+vUOCdop7BNKTtVjX6QVQLLXYxEbSqHG/0lM82vfurIYuK4lK+1VqrrrCnw0WEhlTULzRGmmVnBQLvknHPpH19d9S1y1drBUYqcVFLrLw8Mk/VxwLrRF10iEZVC3aaW1URojvb8CzMuzIanIKqqLjHABha3vx7l4oKTGUlbslDg97okjCnbG20Vozs9h9JbdfsO7Vdi4yXDvQva/b9cuSyZWhlZRRqck3RadlYofb6ILSNxiDOOdVM8bBH3upwzqkRxTkNPU+vnTABO/SLponPAZBKXFUVZvSNXy0LnU4sTooR1Gbb/Hvi7RwqqN2rq/Ea0+6WkZNW/EWryr0J1U1bQ60/manCkwnYxbMGTClOmpn1KYdzakX2MHdQtYiYHsVG/p6yM0bf+PUdiyqI/biSsK1NmGZXVRXehAnYmgcHXBH3eMQzFG1NucxXYmKQgp7w3+nlNUpfolKva9LznLrQWr31+P/4ZnZGk2u50rarIwth8ewBR3viHjAiJwlCynfYaL/K7WbijWfEFCVMdBxf3btgbj7uhq/eryqnmdlvF4B8CADvP9x/XBjqFaFyfNyjZ9zbvWwgdIof6JaYkXc8cb8dedO3C/JduqN9yPbpVmCYhmY/Sl48+4C9VeUoLENCZW+BBPJP+oBSEVQDY1gbE295POF/NOK6VSvzxy6VnWSpVVV4WoHZ3WNfRQWmqmr7v3eQnXnB0KFI72Un7FY+cOLQxTotL8HZ3uv/AQYWESZbCLZ4AAAAAElFTkSuQmCC" alt=""><div><b>STALZONE Трекер</b><small id="modeLbl">аукцион, сервер RU</small></div></div>
     <nav class="nav" aria-label="Разделы">
       <button data-view="deals" class="on"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="7" cy="7" r="4.6"/><path d="m10.4 10.4 3.6 3.6"/></svg><span class="lbl">Находки</span><span class="cnt hot" id="cntDeals"></span></button>
+      <button data-view="radar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="3"/><path d="M8 8l4.2-4.2"/><circle cx="8" cy="8" r=".6" fill="currentColor"/></svg><span class="lbl">Радар</span><span class="cnt" id="cntRadar"></span></button>
       <button data-view="items"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><path d="M11.5 9v5M9 11.5h5"/></svg><span class="lbl">Предметы</span><span class="cnt" id="cntItems"></span></button>
       <button data-view="buys"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2.8 5.2h10.4l-.9 8a1 1 0 0 1-1 .9H4.7a1 1 0 0 1-1-.9z"/><path d="M5.8 5.2V4.4a2.2 2.2 0 0 1 4.4 0v.8"/></svg><span class="lbl">Мои покупки</span><span class="cnt" id="cntBuys"></span></button>
       <button data-view="craft"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M6 1.8h4M6.6 1.8v4.3L2.9 12.6a1 1 0 0 0 .9 1.6h8.4a1 1 0 0 0 .9-1.6L9.4 6.1V1.8M4.6 10h6.8"/></svg><span class="lbl">Крафт</span></button>
@@ -2435,6 +2443,25 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
         </div>
 
         <!-- ============ КРАФТ ============ -->
+        <!-- ============ РАДАР ============ -->
+        <div class="view" id="view-radar">
+          <div class="card radar-lead">
+            <h2>Где ловить руками</h2>
+            <div class="sub">В игре новый лот виден сразу, а через API — у всех, и у сайтов тоже, — примерно через 10 минут. Загляни на аукцион сам: здесь предметы, где дешёвые лоты появляются чаще и выгоднее всего, и до какой цены их брать. <b id="radarKey"></b></div>
+          </div>
+          <div class="cmdbar" style="margin-top:12px">
+            <span class="small faint" id="radarInfo"></span>
+            <span class="grow"></span>
+            <button class="btn" id="miniBtn">Окно поверх игры</button>
+            <button class="btn" id="radarRefresh">Пересчитать</button>
+          </div>
+          <div class="table rtable" id="radarTable">
+            <div class="thead"><span>Предмет</span><span class="r">Бери, если дешевле</span><span class="r">Таких в сутки</span><span class="r">Уходят за</span><span>Когда чаще</span><span></span></div>
+            <div id="radarRows"></div>
+          </div>
+          <div class="small faint" style="margin-top:10px">Считается по лотам, которые видел поиск за неделю, раз в 10 минут. Чем дольше работает поиск, тем точнее. 🔥 — сейчас их время. «Бери, если дешевле» — с запасом под твой порог «дешевле рынка»; «от N шт» — меньше не даст минимальную прибыль.</div>
+        </div>
+
         <div class="view" id="view-craft">
           <div class="cols">
             <div class="card">
@@ -2500,6 +2527,12 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
                   <div class="linkrow"><button class="btn" data-open="api_bot">Получить доступ</button><button class="btn subtle" data-open="docs">Документация</button></div>
                 </div>
               </details>
+            </div>
+
+            <div class="group"><h2>Быстрая покупка</h2>
+              <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="5.5" y="3.5" width="9" height="13" rx="1.5"/><path d="M8 3.5V2.5h4v1M8 8h4M8 11h4"/></svg><div class="tx"><div>Копировать название новой находки</div><small>Сразу в буфер обмена — в игре вставь в поиск аукциона: Ctrl+V</small></div><div class="ctl"><label class="toggle"><span class="tr-st"></span><input type="checkbox" id="sCopyFinds"><i></i></label></div></div>
+              <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="5.5" width="15" height="9" rx="1.5"/><path d="M5.5 8.5h1M8.5 8.5h1M11.5 8.5h1M14.5 8.5h0M6.5 11.5h7"/></svg><div class="tx"><div>Клавиша «скопировать следующее»</div><small>Работает поверх игры: свежие находки, потом «Радар». Если клавиша нужна в игре — выбери другую</small></div><div class="ctl"><span class="combo" style="width:160px"><select id="sHotkey"><option value="F6">F6</option><option value="F7">F7</option><option value="F8">F8</option><option value="F9">F9</option><option value="off">Выключена</option></select><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m3 4.5 3 3 3-3"/></svg></span></div></div>
+              <div class="scard"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.5" y="3.5" width="15" height="13" rx="1.5"/><rect x="10" y="9" width="6" height="6" rx="1" fill="currentColor" fill-opacity=".15"/></svg><div class="tx"><div>Окно поверх игры</div><small>Маленькое окно: что в буфере и что скопирует клавиша. Видно, если игра в режиме «в окне без рамки»</small></div><div class="ctl"><button class="btn" id="miniBtn2">Открыть</button></div></div>
             </div>
 
             <div class="group"><h2>Уведомления</h2>
@@ -2653,7 +2686,7 @@ code{font:12px/18px var(--mono);background:var(--sel);padding:1px 5px;border-rad
 <script>
 const TOKEN = "__TOKEN__";
 const QN = ["обычный","необычный","особый","редкий","исключительный","легендарный"];
-const TITLES = {deals:"Находки", items:"Предметы", buys:"Мои покупки", craft:"Крафт в убежище", settings:"Настройки", access:"Доступ", log:"Журнал"};
+const TITLES = {deals:"Находки", radar:"Радар", items:"Предметы", buys:"Мои покупки", craft:"Крафт в убежище", settings:"Настройки", access:"Доступ", log:"Журнал"};
 const FILTER_CATS = ["artefact", "armor", "weapon", "parts", "tools"];
 const RANK_RU = {RANK_NEWBIE: "Новичок", RANK_STALKER: "Сталкер", RANK_VETERAN: "Ветеран", RANK_MASTER: "Мастер", RANK_LEGEND: "Легенда"};
 const RANK_Q = {RANK_NEWBIE: 1, RANK_STALKER: 2, RANK_VETERAN: 3, RANK_MASTER: 4, RANK_LEGEND: 5};
@@ -2859,6 +2892,7 @@ function go(v) {
   if (v === "items" && CAT) renderCatalog(true);
   if (v === "items") loadYield();
   if (v === "craft") loadCraft();
+  if (v === "radar") loadRadar();
   if (v === "log" && S) renderLog(true);
   if (v === "settings") loadSounds();
   syncDetail();
@@ -3045,7 +3079,8 @@ function renderLead() {
   if (subscriber) sub = !sv ? "Находки придут с сервера владельца после «Начать поиск»." : sv.ok ? `Сервер владельца на связи${sv.server_pass ? ", его последняя проверка " + agoTs(sv.server_pass, now) : ""}.` : (sv.error || "Сервер владельца не отвечает.");
   else if (run) {
     sub = `Проверяю ${items} ${plural(items, ["предмет", "предмета", "предметов"])} по кругу${st.took ? `, круг около ${Math.max(1, Math.round(st.took))} с` : ""}.`;
-    if (st.delay !== null && st.delay !== undefined) sub += ` Новые лоты попадают в API примерно через ${Math.max(1, Math.round(st.delay))} мин после выставления — так у всех, кто смотрит через API.`;
+    if (st.delay !== null && st.delay !== undefined) sub += ` Новые лоты попадают в API примерно через ${Math.max(1, Math.round(st.delay))} мин после выставления — так у всех, кто смотрит через API. Раньше их видно только в игре — смотри «Радар».`;
+    if (st.skew && Math.abs(st.skew) >= 60) sub += ` Часы компьютера ${st.skew > 0 ? "отстают" : "спешат"} на ${Math.round(Math.abs(st.skew) / 60)} мин — трекер это учитывает.`;
     const kl = keyLoad();
     if (kl) sub += ` Твоим ключом API пользуется ещё кто-то (~${kl.others} запр./мин) — поиск медленнее, подробнее во вкладке «Доступ».`;
   } else sub = active.length ? "Это находки с прошлого поиска. Нажми «Начать поиск», чтобы искать дальше." : "Нажми «Начать поиск» — трекер будет проверять аукцион без остановки и покажет здесь лоты дешевле рынка.";
@@ -3228,6 +3263,40 @@ function copyText(t, msg) {
   if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(t).then(done, fallback); else fallback();
   function fallback() { const a = document.createElement("textarea"); a.value = t; document.body.appendChild(a); a.select(); try { document.execCommand("copy"); done(); } catch (e) {} a.remove(); }
 }
+
+// ---------- радар: где ловить руками ----------
+let RADAR = null;
+async function loadRadar(force) {
+  try { RADAR = await api("/api/radar", force ? {force: true} : {}); } catch (e) { return; }
+  renderRadar();
+}
+function renderRadar() {
+  const r = RADAR; if (!r) return;
+  const hk = S && S.settings ? S.settings.hotkey : "F8";
+  $("radarKey").textContent = hk && hk !== "off" ? `${hk} — скопировать следующее название, даже поверх игры.` : "";
+  $("radarInfo").textContent = r.hours ? `По ${r.hours} ${plural(r.hours, ["часу", "часам", "часам"])} работы поиска за неделю` : "";
+  $("cntRadar").textContent = r.items.some((x) => x.peak) ? "🔥" : "";
+  if (!r.items.length) {
+    $("radarRows").innerHTML = `<div class="empty-state small faint" style="padding:16px 12px">${r.hours ? "Пока не видно, где дешёвые лоты бывают регулярно. Нужно ещё несколько часов работы поиска." : "Запусти поиск — через несколько часов здесь будет видно, где дешёвые лоты появляются чаще."}</div>`;
+    return;
+  }
+  $("radarRows").innerHTML = r.items.map((x, i) => `<div class="tr${x.peak ? " peak" : ""}">
+    <div class="nm"><b>${x.peak ? "🔥 " : ""}${esc(x.name)}</b>${x.grade ? `<small>${esc(x.grade)}</small>` : ""}</div>
+    <div class="r num"><b>${rubN(x.buy_below)} ₽</b><small>за шт${x.need > 1 ? `, от ${x.need} шт` : ""}</small></div>
+    <div class="r num">~${x.per_day >= 10 ? Math.round(x.per_day) : x.per_day.toFixed(1).replace(".", ",")}<small>в среднем +${rubN(x.profit)} ₽</small></div>
+    <div class="r num">${x.life_min ? "~" + Math.round(x.life_min) + " мин" : "<span class='faint'>—</span>"}</div>
+    <div>${x.hours ? `${String(x.hours[0]).padStart(2, "0")}:00–${String(x.hours[1]).padStart(2, "0")}:00` : "<span class='faint'>в любое время</span>"}</div>
+    <div><button class="ib" data-rcopy="${i}" title="Скопировать название"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="5" y="5" width="8.5" height="8.5" rx="1.2"/><path d="M3 10.5V3.6A1.1 1.1 0 0 1 4.1 2.5H10.5"/></svg></button></div>
+  </div>`).join("");
+  document.querySelectorAll("[data-rcopy]").forEach((b) => b.onclick = async () => {
+    const x = r.items[+b.dataset.rcopy];
+    const res = await api("/api/copy", {name: x.name});
+    if (res.ok) toast("Скопировано: " + x.name + " — вставь в поиск аукциона"); else copyText(x.name);
+  });
+}
+$("radarRefresh").onclick = () => loadRadar(true);
+async function openMini() { const r = await api("/api/mini/open", {}); if (!r.ok) toast(r.message, true); }
+$("miniBtn").onclick = openMini; $("miniBtn2").onclick = openMini;
 
 // ---------- предметы ----------
 function watch() { return S ? S.settings.watch.slice() : []; }
@@ -3702,6 +3771,7 @@ function fillForm() {
   $("sBidWindow").disabled = $("sBidMin").disabled = !bidsOn;
   $("bidSum").textContent = bidsOn ? `Торги заканчиваются через ${bm}–${bw} мин, ставка ниже рынка` : "Выключено";
   setVal("sTgToken", c.telegram_token || ""); setVal("sTgChat", c.telegram_chat_id || "");
+  setVal("sCopyFinds", c.copy_finds !== false); setVal("sHotkey", c.hotkey || "F8");
   setVal("sTgControl", c.tg_control !== false); setVal("sTgPhoto", c.tg_photo !== false); setVal("sTgQuiet", !!c.tg_quiet);
   setVal("sTgQFrom", String(c.tg_quiet_from ?? 0)); setVal("sTgQTo", String(c.tg_quiet_to ?? 8));
   setVal("sTgDaily", c.tg_daily !== false); setVal("sTgDailyH", String(c.tg_daily_hour ?? 23));
@@ -3743,6 +3813,8 @@ onChange("sKeys", () => saveSetting({extra_keys: $("sKeys").value.split("\n")}, 
 onChange("sTgToken", () => saveSetting({telegram_token: $("sTgToken").value}, "Сохранено"));
 onChange("sTgChat", () => saveSetting({telegram_chat_id: $("sTgChat").value}, "Сохранено"));
 onChange("sTgControl", () => saveSetting({tg_control: $("sTgControl").checked}));
+onChange("sCopyFinds", () => saveSetting({copy_finds: $("sCopyFinds").checked}));
+onChange("sHotkey", () => saveSetting({hotkey: $("sHotkey").value}, $("sHotkey").value === "off" ? "Клавиша выключена" : "Клавиша: " + $("sHotkey").value));
 onChange("sTgPhoto", () => saveSetting({tg_photo: $("sTgPhoto").checked}));
 onChange("sTgQuiet", () => saveSetting({tg_quiet: $("sTgQuiet").checked}));
 onChange("sTgQFrom", () => saveSetting({tg_quiet_from: $("sTgQFrom").value}, "Сохранено"));
@@ -3998,3 +4070,82 @@ refresh(); setInterval(refresh, 2000);
 </html>
 """
 # ==== НОВЫЙ ВИД: конец ====
+
+
+# ==== МИНИ-ОКНО: начало ====
+# Маленькое окно поверх игры (2.9): что в буфере обмена и что копирует клавиша. Сервер подставляет __TOKEN__ и __THEME__.
+UI_MINI_HTML = r"""<!doctype html>
+<html lang="ru" data-theme="__THEME__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STALZONE — поверх игры</title>
+<script>(function(){var r=document.documentElement,m=matchMedia("(prefers-color-scheme: dark)"),t=r.dataset.theme;function a(){r.classList.toggle("dark",t==="dark"||(t!=="light"&&m.matches))}a();try{m.addEventListener("change",a)}catch(e){}})()</script>
+<style>
+:root{--bg:#f3f3f3;--card:#fff;--text:#1b1b1b;--text-2:#5d5d5d;--text-3:#8a8a8a;--stroke:rgba(0,0,0,.08);--good:#0f7b0f;--accent:#005fb8;--sel:rgba(0,0,0,.05);--font:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif}
+:root.dark{--bg:#202020;--card:#2b2b2b;--text:#fff;--text-2:#cfcfcf;--text-3:#9a9a9a;--stroke:rgba(255,255,255,.08);--good:#6ccb5f;--accent:#60cdff;--sel:rgba(255,255,255,.06)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/18px var(--font);overflow:hidden;user-select:none}
+.wrap{display:flex;flex-direction:column;height:100%;padding:10px;gap:8px}
+.top{display:flex;align-items:center;gap:8px;color:var(--text-2);font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--text-3)}
+.dot.on{background:var(--good)}
+.top .key{margin-left:auto;border:1px solid var(--stroke);border-bottom-width:2px;border-radius:4px;padding:0 6px;font-weight:600;color:var(--text)}
+.copied{background:var(--card);border:1px solid var(--stroke);border-radius:8px;padding:10px 12px}
+.copied .lbl{font-size:12px;color:var(--text-3)}
+.copied .name{font-size:18px;line-height:24px;font-weight:600;margin:2px 0;word-break:break-word}
+.copied .hint{color:var(--text-2)}
+.copied.fresh{border-color:var(--accent)}
+.list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.row{display:flex;gap:8px;align-items:baseline;padding:5px 8px;border-radius:6px;cursor:pointer}
+.row:hover{background:var(--sel)}
+.row .n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .h{color:var(--text-3);font-size:12px;white-space:nowrap}
+.row.find .n::before{content:"●";color:var(--good);margin-right:6px;font-size:10px}
+.row.radar .n::before{content:"◎";color:var(--accent);margin-right:6px;font-size:10px}
+.empty{color:var(--text-3);padding:6px 8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><span class="dot" id="dot"></span><span id="state">…</span><span class="key" id="key" title="Скопировать следующее">F8</span></div>
+  <div class="copied" id="copied"><div class="lbl" id="lbl">В буфере обмена</div><div class="name" id="name">—</div><div class="hint" id="hint">Новая находка сама попадёт сюда. Вставь в поиск аукциона: Ctrl+V</div></div>
+  <div class="list" id="list"></div>
+</div>
+<script>
+const TOKEN = "__TOKEN__";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+async function api(path, body) {
+  const r = await fetch(path, body ? {method: "POST", headers: {"X-Token": TOKEN, "Content-Type": "application/json"}, body: JSON.stringify(body)} : {headers: {"X-Token": TOKEN}});
+  return r.json();
+}
+function ago(sec) { sec = Math.max(0, Math.round(sec)); return sec < 60 ? `${sec} с назад` : `${Math.round(sec / 60)} мин назад`; }
+let last = 0;
+async function tick() {
+  let d;
+  try { d = await api("/api/mini"); } catch (e) { $("state").textContent = "Нет связи с программой"; return; }
+  $("dot").classList.toggle("on", d.running);
+  $("state").textContent = d.running ? "Поиск идёт" : "Поиск остановлен";
+  $("key").textContent = d.hotkey === "off" ? "клавиша выкл." : d.hotkey;
+  const c = d.copied;
+  if (c && c.name) {
+    const src = c.source === "find" ? "Новая находка" : c.source === "radar" ? "Радар" : "Скопировано";
+    $("lbl").textContent = `${src} · ${c.ok ? "в буфере обмена" : "скопировать не вышло"} · ${ago(d.now - c.at)}` + (c.pos ? ` · ${c.pos} из ${c.of}` : "");
+    $("name").textContent = c.name;
+    $("hint").textContent = c.hint || "Вставь в поиск аукциона: Ctrl+V";
+    $("copied").classList.toggle("fresh", d.now - c.at < 10);
+  } else if (c && c.source === "empty") {
+    $("lbl").textContent = "Нечего копировать"; $("name").textContent = "—";
+    $("hint").textContent = "Находок пока нет, а «Радар» ещё не собрал данные";
+  }
+  $("list").innerHTML = d.hot.length ? d.hot.map((x, i) => `<div class="row ${x.source}" data-i="${i}" title="Нажми — скопировать"><span class="n">${esc(x.name)}</span><span class="h">${esc(x.hint)}</span></div>`).join("")
+    : `<div class="empty">Здесь будут находки и подсказки «Радара». ${esc(d.hotkey) !== "off" ? esc(d.hotkey) + " — скопировать следующее." : ""}</div>`;
+  document.querySelectorAll(".row").forEach((r) => r.onclick = async () => { await api("/api/copy", {name: d.hot[+r.dataset.i].name}); tick(); });
+}
+tick(); setInterval(tick, 1500);
+</script>
+</body>
+</html>
+"""
+# ==== МИНИ-ОКНО: конец ====

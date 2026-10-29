@@ -49,7 +49,7 @@ try:
     import requests
     import stalzone_tracker as eng
     import stalzone_fonts
-    from stalzone_ui import UI_HTML, UI_NEW_HTML
+    from stalzone_ui import UI_HTML, UI_MINI_HTML, UI_NEW_HTML
 except ImportError as e:
     print("Ошибка запуска:", e)
     print("Нужен модуль requests (pip install requests) и файлы stalzone_tracker.py, stalzone_ui.py, stalzone_fonts.py рядом.")
@@ -57,7 +57,7 @@ except ImportError as e:
     sys.exit(1)
 
 APP_NAME = "STALZONE Tracker"
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.9"
 # Откуда брать обновления: открытый репозиторий GitHub «владелец/имя» только с готовыми .exe
 # (код лежит в закрытом). В настройках можно указать другой. Пусто — обновления не проверяются.
 UPDATE_REPO = "Enotsbeye/stalzone-tracker-releases"
@@ -146,6 +146,8 @@ DEFAULTS = dict(eng.CONFIG, settings_version=SETTINGS_VERSION, watch=[],   # н�
                 sound="builtin:double",    # какой: builtin:… — встроенный, win:… — из звуков Windows, custom:… — свой файл
                 sound_rare="builtin:fanfare",   # для особо редких
                 sound_volume=70,           # громкость, %
+                copy_finds=True,           # название новой находки — сразу в буфер обмена (вставить в игре Ctrl+V)
+                hotkey="F8",               # клавиша: скопировать следующую находку или предмет из «Радара»
                 tg_control=True,           # Telegram: кнопки под сообщениями и команды (/status, /finds …)
                 tg_photo=True,             # картинка предмета в сообщении о находке
                 tg_quiet=False, tg_quiet_from=0, tg_quiet_to=8,   # тихие часы: без звука (особо редкие — со звуком)
@@ -272,7 +274,7 @@ RESTART_KEYS = ("client_id", "client_secret", "app_token", "base_url", "region",
 QUIET_KEYS = ("telegram_token", "telegram_chat_id", "update_repo", "server_url", "server_port",
               "server_url_override", "ui", "theme", "ui_scale", "sound_on", "sound", "sound_rare",
               "sound_volume", "tg_control", "tg_photo", "tg_quiet", "tg_quiet_from", "tg_quiet_to", "tg_daily",
-              "tg_daily_hour", "tg_daily_last", "tg_muted_until")   # из-за них новый проход не начинаем — просто запомнить
+              "tg_daily_hour", "tg_daily_last", "tg_muted_until", "copy_finds", "hotkey")   # из-за них новый проход не начинаем — просто запомнить
 UI_MODES = ("new", "old")
 THEMES = ("system", "light", "dark")
 UI_SCALES = ("s", "m", "l")
@@ -1224,7 +1226,7 @@ class Access:
 
 def minutes_since(iso):
     try:
-        return (datetime.now(timezone.utc) - eng.parse_time(iso)).total_seconds() / 60
+        return (eng.server_now() - eng.parse_time(iso)).total_seconds() / 60
     except (TypeError, ValueError):
         return None
 
@@ -1463,7 +1465,9 @@ class Worker(threading.Thread):
                         heat, heat_at = db.new_lot_rates(cfg["region"]), started
                     except Exception:
                         heat, heat_at = {}, started
-                order = eng.pass_order(items, heat)
+                pass_no = getattr(self, "_pass_no", 0)
+                self._pass_no = pass_no + 1
+                order = eng.pass_order(items, heat, pass_no=pass_no, keep=hold_ids)
 
                 def on_progress(i, item_id, name):
                     self.emit("progress", {"text": f"Проверяю {name}", "done": i, "total": len(order)})
@@ -1520,7 +1524,13 @@ class Worker(threading.Thread):
                 eng.save_seen(seen)
                 if first_pass and not self.stop_event.is_set() and scanner.summary():
                     self.emit("log", scanner.summary())
-                self.emit("pass", {"time": time.time(), "found": found[0], "took": time.time() - started,
+                skew = eng.clock_skew()
+                if abs(skew) >= 60 and abs(skew - getattr(self, "_skew_said", 0)) >= 60:
+                    self._skew_said = skew
+                    self.emit("log", f"Часы компьютера {'отстают' if skew > 0 else 'спешат'} на "
+                                     f"{abs(skew) / 60:.0f} мин — трекер считает по времени сервера EXBO. Поправить: "
+                                     "«Параметры Windows» → «Время и язык» → «Синхронизировать сейчас»")
+                self.emit("pass", {"skew": skew,"time": time.time(), "found": found[0], "took": time.time() - started,
                                    "key_others": getattr(api, "others_last", None), "key_limit": getattr(api, "key_limit", None),
                                    "keys": len(api.alive()) if hasattr(api, "alive") else 1,
                                    "keys_total": len(getattr(api, "members", [api])),
@@ -2042,6 +2052,110 @@ def funnel_open(port, exe=None, run=None):
     return False, f"Tailscale не открыл доступ{': ' + tail if tail else ''}", None
 
 
+# --- Быстрая покупка: буфер обмена и горячая клавиша (Windows). В игру ничего не нажимается и не
+# читается — как у любой программы с горячей клавишей (OBS, Discord). ---
+HOTKEYS = {"F6": 0x75, "F7": 0x76, "F8": 0x77, "F9": 0x78, "off": None}
+
+
+def set_clipboard(text):
+    """Положить текст в буфер обмена Windows. False — не вышло (не Windows или буфер занят)."""
+    if sys.platform != "win32" or not text:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    try:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.OpenClipboard.argtypes = [wintypes.HWND]
+        u32.OpenClipboard.restype = wintypes.BOOL
+        u32.EmptyClipboard.restype = wintypes.BOOL
+        u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        u32.SetClipboardData.restype = wintypes.HANDLE
+        u32.CloseClipboard.restype = wintypes.BOOL
+        k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        k32.GlobalAlloc.restype = wintypes.HGLOBAL
+        k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        k32.GlobalLock.restype = ctypes.c_void_p
+        k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        k32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        data = (str(text) + "\0").encode("utf-16-le")
+        for _ in range(10):                 # буфер может держать другая программа — пробуем полсекунды
+            if u32.OpenClipboard(None):
+                break
+            time.sleep(0.05)
+        else:
+            return False
+        try:
+            u32.EmptyClipboard()
+            h = k32.GlobalAlloc(0x0002, len(data))          # GMEM_MOVEABLE
+            if not h:
+                return False
+            ptr = k32.GlobalLock(h)
+            if not ptr:
+                k32.GlobalFree(h)
+                return False
+            ctypes.memmove(ptr, data, len(data))
+            k32.GlobalUnlock(h)
+            if not u32.SetClipboardData(13, h):              # CF_UNICODETEXT; память теперь у Windows
+                k32.GlobalFree(h)
+                return False
+            return True
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return False
+
+
+class Hotkeys:
+    """Одна глобальная клавиша (RegisterHotKey) в своём потоке. set("F8") — включить, set("off") — выключить."""
+
+    def __init__(self, on_press, on_error=None):
+        self.on_press, self.on_error = on_press, on_error
+        self.thread = self.thread_id = None
+        self.lock = threading.Lock()
+
+    def set(self, key):
+        if sys.platform != "win32":
+            return
+        with self.lock:
+            self._stop()
+            vk = HOTKEYS.get(key)
+            if vk:
+                ready = threading.Event()
+                self.thread = threading.Thread(target=self._loop, args=(key, vk, ready), daemon=True)
+                self.thread.start()
+                ready.wait(2)
+
+    def _stop(self):
+        if self.thread is not None and self.thread_id:
+            import ctypes
+            ctypes.WinDLL("user32").PostThreadMessageW(self.thread_id, 0x0012, 0, 0)    # WM_QUIT
+            self.thread.join(2)
+        self.thread = self.thread_id = None
+
+    def _loop(self, key, vk, ready):
+        import ctypes
+        from ctypes import wintypes
+        u32, k32 = ctypes.WinDLL("user32", use_last_error=True), ctypes.WinDLL("kernel32")
+        self.thread_id = k32.GetCurrentThreadId()
+        ok = u32.RegisterHotKey(None, 1, 0x4000, vk)       # MOD_NOREPEAT: зажатая клавиша — одно нажатие
+        ready.set()
+        if not ok:
+            if self.on_error:
+                self.on_error(f"Клавиша {key} уже занята другой программой — выбери другую в «Настройках» → «Быстрая покупка»")
+            return
+        msg = wintypes.MSG()
+        try:
+            while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312:                   # WM_HOTKEY
+                    try:
+                        self.on_press()
+                    except Exception:
+                        pass
+        finally:
+            u32.UnregisterHotKey(None, 1)
+
+
 def keep_awake():
     """Windows: сбросить таймер сна — пока поиск идёт, компьютер не уснёт (экран гаснуть может).
     Действует до следующего ухода в сон по таймеру, поэтому вызываем каждые 30 секунд."""
@@ -2075,6 +2189,7 @@ def set_autostart(on):
 
 
 # ------------------------- Окно как у обычной программы Windows -------------------------
+MINI_TITLE = "STALZONE — поверх игры"
 WINDOW_TITLE = "STALZONE Трекер"
 INSTANCE_MUTEX = "Local\\STALZONE-Tracker-single"
 _instance_handle = None        # держим, пока программа работает: по нему вторая копия видит первую
@@ -2286,7 +2401,10 @@ TG_API = "https://api.telegram.org/bot{token}/{method}"
 TG_COMMANDS = [("status", "Что с поиском сейчас"), ("finds", "Лучшие находки сейчас"), ("profit", "Сколько заработал"),
                ("buys", "Что куплено и за сколько выставить"), ("stop", "Остановить поиск"), ("go", "Начать поиск"),
                ("mute", "Тишина на час (/mute 3 — на 3 часа)"), ("unmute", "Снова присылать находки"),
-               ("min", "Минимальная прибыль: /min 20000"), ("help", "Что умеет бот")]
+               ("min", "Минимальная прибыль: /min 20000"), ("radar", "Где ловить руками: бери, если дешевле…"),
+               ("help", "Что умеет бот")]
+RADAR_TTL = 600            # «Радар» пересчитывается раз в 10 минут
+RADAR_DAYS = 7             # по лотам за неделю
 TG_FATE = {"sold": "уже купили", "removed": "лот сняли", "expired": "время вышло"}
 
 
@@ -2306,6 +2424,11 @@ def _hours(h):
     if h is None:
         return ""
     return "меньше часа" if h < 1 else f"~{h:.0f} ч" if h < 48 else f"~{h / 24:.0f} дн."
+
+
+def _ago(minutes):
+    m = max(0, round(minutes))
+    return "только что" if m < 1 else f"{m} мин назад" if m < 60 else f"{m // 60} ч {m % 60} мин назад"
 
 
 def grade_label(d):
@@ -2545,8 +2668,12 @@ class TgBot:
         if head:
             lines.append(head)
         lines.append(("🔨 " if bid else "🟢 ") + f"<b>{_h(d['name'])}</b>" + (f" · {_h(g)}" if g else "")
-                     + (f" · {d['amount']} шт" if many else ""))
+                     + (f" · {d['amount']} шт" if many else "") + f" · <b>{_signed(d['profit'])}</b>")
         lines.append(f"<code>{_h(d['name'])}</code> — нажми, чтобы скопировать")
+        age = minutes_since(d.get("listed")) if not bid else None
+        if age is not None and 0 <= age < 24 * 60 and not head:
+            life = d.get("life_min")
+            lines.append(f"⏱ Выставлен {_ago(age)}" + (f"; такие обычно уходят через ~{life:.0f} мин после выставления" if life else ""))
         if bid:
             ends = ""
             try:
@@ -2633,7 +2760,7 @@ class TgBot:
             d = deals.get(key)
             if d is None or m["state"] in ("gone", "bought", "hidden"):
                 continue
-            head, new = None, None
+            head, new, buttons = None, None, None
             if d.get("bought"):
                 p = next((x for x in purchases if x["id"] == d["bought"]), None)
                 head, new = "✅ <b>Куплено</b>" + (f" за {_rub(p['paid'])}" if p else "") + " — в «Моих покупках»", "bought"
@@ -2641,8 +2768,10 @@ class TgBot:
                 mins = max(1, round((time.time() - float(d.get("found") or time.time())) / 60))
                 head = f"⛔ <b>Ушло</b>: {TG_FATE.get(d.get('fate'), 'лота больше нет')} (через ~{mins} мин после находки)"
                 new = "gone"
+                if time.time() - m["at"] < 20 * 60 and d.get("fate") != "expired" and self.control():
+                    buttons = [[("✅ Это я купил", f"buy:{d['id']}")]]    # не вспоминать потом, что купил
             if new:
-                self.edit(m["id"], m["photo"], self.find_html(d, head=head), None)
+                self.edit(m["id"], m["photo"], self.find_html(d, head=head), buttons)
                 with self.lock:
                     if key in self.msgs:
                         self.msgs[key]["state"] = new
@@ -2742,6 +2871,25 @@ class TgBot:
         if self.muted():
             lines.append("🔕 Тишина до " + datetime.fromtimestamp(float(st.cfg["tg_muted_until"])).strftime("%H:%M"))
         lines.append(f"Мин. прибыль: {_rub(st.cfg.get('min_profit', 0))}, дешевле рынка от {st.cfg.get('discount', 0) * 100:.0f}%")
+        return "\n".join(lines)
+
+    def radar_html(self):
+        r = self.state.radar()
+        if not r["items"]:
+            return ("📡 <b>Радар</b> пока пуст: нужно несколько часов работы поиска, чтобы понять, где дешёвые лоты "
+                    "бывают чаще. Запусти поиск и загляни позже.")
+        lines = ["📡 <b>Радар — где ловить руками</b>",
+                 "В игре новый лот виден сразу, а через API у всех — минут через 10. Открой аукцион и проверь:"]
+        for x in r["items"][:8]:
+            many = f" (от {x['need']} шт)" if x["need"] > 1 else ""
+            when = f", чаще в {x['hours'][0]:02d}–{x['hours'][1]:02d}" if x.get("hours") else ""
+            life = f", уходят за ~{x['life_min']:.0f} мин" if x.get("life_min") else ""
+            lines.append(("🔥 " if x.get("peak") else "• ") + f"<code>{_h(x['name'])}</code>"
+                         + (f" {_h(x['grade'])}" if x.get("grade") else "")
+                         + f" — бери, если дешевле <b>{_rub(x['buy_below'])}</b>/шт{many}; "
+                         f"~{x['per_day']:.0f} в сутки{when}{life}")
+        lines.append(f"По {r['hours']} {plural_ru(r['hours'], ('часу', 'часам', 'часам'))} работы поиска за неделю — "
+                     "чем дольше он работает, тем точнее. 🔥 — сейчас их время.")
         return "\n".join(lines)
 
     def help_html(self):
@@ -2867,6 +3015,8 @@ class TgBot:
             return self.send("\n".join(lines), buttons)
         if cmd == "profit":
             return self.send(self.profit_html())
+        if cmd == "radar":
+            return self.send(self.radar_html())
         if cmd == "buys":
             open_ = [p for p in st.purchases if p.get("status") != "sold"]
             if not open_:
@@ -3028,6 +3178,11 @@ class State:
         self.exit_hook = None               # как закрыть окно программы (задаёт main)
         self.on_theme = None                # сменили тему — перекрасить рамку окна (задаёт main)
         self.tg = TgBot(self)               # бот в Telegram: находки с кнопками, команды, итог дня
+        self._radar = None                  # «Радар»: где ловить руками (считается раз в 10 минут)
+        self.hotkeys = Hotkeys(self.hotkey_pressed, self.add_log)   # F8: скопировать следующую находку
+        self.copied = None                  # что последним положили в буфер обмена (для мини-окна)
+        self._hot_i = -1
+        self.on_open_mini = None            # открыть мини-окно поверх игры (задаёт main)
         self._card_api, self._card_cache = None, {}   # карточка рецепта: свой ключ API и лоты за последние минуты
         logging.getLogger("tracker").addHandler(_LogHandler(self))
         logging.getLogger("tracker").setLevel(logging.INFO)
@@ -3187,6 +3342,11 @@ class State:
             running = st.get("running")
             if running and self.cfg.get("keep_awake", True):
                 keep_awake()
+            if running:
+                try:
+                    self.radar()        # раз в 10 минут: где ловить руками и сколько живут дешёвые лоты
+                except Exception:
+                    pass
             if gap > 150:      # часы прыгнули вперёд — компьютер спал
                 fmt = lambda t: datetime.fromtimestamp(t).strftime("%H:%M")
                 line = f"Компьютер спал с {fmt(now - gap)} до {fmt(now)} — поиск в это время не шёл"
@@ -3392,6 +3552,12 @@ class State:
             if kind == "deal":
                 data["id"] = self.next_id
                 data["found"] = time.time()
+                if self._radar and data.get("kind") != "bid":     # через сколько такие лоты обычно покупают
+                    b = eng.bucket_of(data.get("additional"))
+                    r = next((x for x in self._radar["items"] if x["item_id"] == data.get("item_id")
+                              and x["bucket"] == b), None)
+                    if r and r.get("life_min"):
+                        data["life_min"] = r["life_min"]
                 self.next_id += 1
                 self.deals.insert(0, data)
                 del self.deals[400:]
@@ -3413,7 +3579,7 @@ class State:
                 self.status.update(last_pass=data["time"], took=data["took"], progress=None, total=data.get("total"),
                                    key_others=data.get("key_others"), key_limit=data.get("key_limit"),
                                    keys=data.get("keys"), keys_total=data.get("keys_total"),
-                                   rate=data.get("rate"), max_rate=data.get("max_rate"))
+                                   rate=data.get("rate"), max_rate=data.get("max_rate"), skew=data.get("skew"))
                 quiet_line = self._quiet_summary(data["time"])
                 if data["delay"] is not None:
                     self.status.update(delay=data["delay"], delay_min=data.get("delay_min"),
@@ -3519,6 +3685,8 @@ class State:
             self.add_log(data)
         elif kind == "deal":
             self.add_log(f"Найдено: {data['name']} — прибыль ~{eng.fmt_rub(data['profit'])}")
+            if data.get("notify"):
+                self.on_new_find(data)
         elif kind == "error":
             self.add_log("ОШИБКА: " + data)
             self.alert("⚠ Трекер: " + data, dedupe=True)
@@ -3711,6 +3879,108 @@ class State:
                 self._card_cache[item] = (now, lots)
                 out[item] = lots
         return out, err
+
+    # --- быстрая покупка: буфер обмена, клавиша, мини-окно ---
+    def copy_name(self, name, source, profit=None):
+        ok = set_clipboard(name)
+        with self.lock:
+            self.copied = {"name": name, "source": source, "at": time.time(), "ok": ok, "profit": profit}
+        return ok
+
+    def on_new_find(self, d):
+        """Новая находка — название сразу в буфер обмена, если там не лежит находка выгоднее (меньше минуты)."""
+        if not self.cfg.get("copy_finds", True) or d.get("gone"):
+            return
+        c = self.copied
+        if (c and c.get("source") == "find" and time.time() - c["at"] < 60
+                and (c.get("profit") or 0) > (d.get("profit") or 0)):
+            return
+        threading.Thread(target=self.copy_name, args=(d["name"], "find", d.get("profit")), daemon=True).start()
+
+    def hot_list(self):
+        """Что копирует клавиша по кругу: свежие находки (новые первыми), потом «Радар»."""
+        with self.lock:
+            finds = [d for d in self.deals if not d.get("gone") and not d.get("bought")]
+            radar = list((self._radar or {}).get("items") or [])
+        finds.sort(key=lambda d: -float(d.get("found") or 0))
+        out = [{"name": d["name"], "source": "find", "profit": d.get("profit"), "id": d.get("id"),
+                "hint": f"{eng.fmt_rub(d['cost'])} → +{eng.fmt_rub(d['profit'])}"} for d in finds[:10]]
+        seen = {x["name"] for x in out}
+        for r in radar[:10]:
+            if r["name"] not in seen:
+                seen.add(r["name"])
+                out.append({"name": r["name"], "source": "radar", "profit": r.get("profit"),
+                            "hint": f"бери, если дешевле {eng.fmt_rub(r['buy_below'])}/шт"
+                                    + (f" (от {r['need']} шт)" if r.get("need", 1) > 1 else "")})
+        return out
+
+    def hotkey_pressed(self):
+        items = self.hot_list()
+        if not items:
+            with self.lock:
+                self.copied = {"name": "", "source": "empty", "at": time.time(), "ok": False}
+            return
+        self._hot_i = (self._hot_i + 1) % len(items)
+        x = items[self._hot_i]
+        self.copy_name(x["name"], x["source"], x.get("profit"))
+        with self.lock:
+            self.copied.update(hint=x.get("hint"), pos=self._hot_i + 1, of=len(items))
+
+    def mini(self):
+        """Данные для мини-окна поверх игры."""
+        with self.lock:
+            st = dict(self.status)
+            copied = dict(self.copied) if self.copied else None
+            hotkey = self.cfg.get("hotkey", "F8")
+        hot = self.hot_list()
+        return {"copied": copied, "hot": hot[:6], "hotkey": hotkey, "running": bool(st.get("running")),
+                "delay": st.get("delay"), "now": time.time(), "windows": sys.platform == "win32"}
+
+    def radar(self, force=False):
+        """«Радар»: где дешёвые лоты появляются чаще — туда заглядывать на аукцион самому. В игре лот виден
+        сразу, а в API у всех — минут через 10. Считается по своей базе лотов за неделю, раз в 10 минут."""
+        now = time.time()
+        with self.lock:
+            cached = self._radar
+            cfg = dict(self.cfg)
+            meta = dict(self.meta)
+        if cached and not force and now - cached["at"] < RADAR_TTL:
+            return cached
+        region = cfg.get("region", "ru")
+        discount, fee = float(cfg.get("discount", 0.15)), float(cfg.get("fee", 0.05))
+        out = {"at": now, "items": [], "hours": 0}
+        db = eng.MarketDB.reader()
+        if db:
+            markets = {}
+
+            def unit_price(item, add):
+                if item not in markets:
+                    markets[item] = self._db_market(db, region, item)[0]
+                found = eng.market_for(markets[item], add) if markets[item] else None
+                return found[0][0] if found else None
+            try:
+                rows, hours, _ = db.radar_rows(region, now - RADAR_DAYS * 86400, 1 - discount)
+                out["items"] = eng.radar(rows, hours, unit_price, discount, fee, float(cfg.get("min_profit", 0)),
+                                         local_hour=datetime.now().hour)
+                out["hours"] = hours
+            except sqlite3.Error:
+                pass
+            finally:
+                db.close()
+        for r in out["items"]:
+            r["name"] = (meta.get(r["item_id"]) or {}).get("name") or self._name_of(r["item_id"])
+            q, p = r["bucket"] or (None, None)
+            r["quality"], r["ptn"] = q, p
+            r["grade"] = grade_label({"cat": "artefact", "quality": q, "ptn": p}) if q is not None else ""
+        with self.lock:
+            self._radar = out
+        return out
+
+    def _name_of(self, item_id):
+        try:
+            return eng.load_listing(self.cfg.get("region", "ru")).get(item_id, item_id)
+        except Exception:
+            return item_id
 
     def _db_market(self, db, region, item_id):
         """Рынок предмета по своей базе — так же, как его считает проверка."""
@@ -4163,6 +4433,12 @@ class State:
                 cfg["theme"] = data["theme"] if data["theme"] in THEMES else "system"
             if "ui_scale" in data:
                 cfg["ui_scale"] = data["ui_scale"] if data["ui_scale"] in UI_SCALES else "m"
+            if "copy_finds" in data:
+                cfg["copy_finds"] = bool(data["copy_finds"])
+            if "hotkey" in data:
+                if data["hotkey"] not in HOTKEYS:
+                    return False, "Клавиша: F6, F7, F8, F9 или «выключено»"
+                cfg["hotkey"] = data["hotkey"]
             if "sound_on" in data:
                 cfg["sound_on"] = bool(data["sound_on"])
             for key in ("sound", "sound_rare"):
@@ -4214,6 +4490,8 @@ class State:
         if changed & {"telegram_token", "telegram_chat_id", "tg_control"}:
             self.tg.bad_token = None
             self.tg.ensure()
+        if "hotkey" in changed:
+            self.hotkeys.set(cfg["hotkey"])
         if "theme" in changed and self.on_theme:
             try:
                 self.on_theme(cfg["theme"])
@@ -4269,6 +4547,10 @@ def make_handler(state, token):
             html = html.replace("/*__ACCENT__*/", accent_css(windows_accent()))
         return html
 
+    def mini_page():
+        theme = state.cfg.get("theme", "system")
+        return UI_MINI_HTML.replace("__TOKEN__", token).replace("__THEME__", theme if theme in THEMES else "system")
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -4306,8 +4588,8 @@ def make_handler(state, token):
 
         def do_GET(self):
             url = urlparse(self.path)
-            if url.path in ("/", "/index.html"):
-                body = page_for(url.query).encode("utf-8")
+            if url.path in ("/", "/index.html", "/mini"):
+                body = (mini_page() if url.path == "/mini" else page_for(url.query)).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -4338,6 +4620,8 @@ def make_handler(state, token):
                 return self.send_file(FONT_FILES.get(url.path[6:-6]), "font/woff2")
             if not self.authorized():
                 return self.send_json({"error": "forbidden"}, 403)
+            if url.path == "/api/mini":
+                return self.send_json(state.mini())
             if url.path == "/api/state":
                 state.last_poll = time.time()
                 return self.send_json(state.snapshot())
@@ -4414,6 +4698,17 @@ def make_handler(state, token):
             if path == "/api/purchases/remove":
                 ok, msg = state.remove_purchase(data.get("id"))
                 return self.send_json({"ok": ok, "message": msg})
+            if path == "/api/radar":
+                return self.send_json(state.radar(force=bool(data.get("force"))))
+            if path == "/api/mini/open":
+                if state.on_open_mini is None:
+                    return self.send_json({"ok": False, "message": "Мини-окно открывается только в программе на Windows"})
+                state.on_open_mini()
+                return self.send_json({"ok": True})
+            if path == "/api/copy":
+                name = str(data.get("name") or "")[:120]
+                ok = state.copy_name(name, "click") if name else False
+                return self.send_json({"ok": ok})
             if path == "/api/telegram/find":
                 ok, chat_id, name = state.tg.find_chat(str(data.get("telegram_token") or ""))
                 if not ok:
@@ -4552,6 +4847,7 @@ def main():
     threading.Thread(target=boot, daemon=True).start()
     threading.Thread(target=state.watchdog, daemon=True).start()
     state.tg.ensure()          # бот в Telegram: кнопки и команды
+    state.hotkeys.set(state.cfg.get("hotkey", "F8"))   # клавиша «скопировать следующую находку»
     if state.cfg.get("autostart"):
         set_autostart(True)   # программу могли перенести в другую папку — обновим путь
     windowed = False
@@ -4580,6 +4876,33 @@ def main():
                 pass
         window.events.shown += on_shown
         state.on_theme = paint_frame
+        mini = {"w": None}
+
+        def open_mini():
+            """Маленькое окно поверх игры (игра — в режиме «в окне без рамки»): последняя находка и что
+            копирует клавиша."""
+            try:
+                if mini["w"] is not None:
+                    mini["w"].show()
+                    return
+                w = webview.create_window(MINI_TITLE, url + "mini", width=340, height=300, on_top=True,
+                                          min_size=(260, 160), background_color=window_background(state.cfg))
+
+                def closed():
+                    mini["w"] = None
+                w.events.closed += closed
+                mini["w"] = w
+            except Exception as e:
+                state.add_log(f"Мини-окно не открылось ({type(e).__name__})")
+
+        def main_closed():
+            if mini["w"] is not None:     # закрыли программу — мини-окно не должно остаться висеть
+                try:
+                    mini["w"].destroy()
+                except Exception:
+                    pass
+        window.events.closed += main_closed
+        state.on_open_mini = open_mini
         webview.start()
         windowed = True
     except Exception as e:  # нет pywebview или окно не открылось (например, нет WebView2) — откроем браузер
